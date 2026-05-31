@@ -197,7 +197,9 @@ class _Row:
     fmin: float = -math.inf
     fmax: float = math.inf
     sibling: int = -1
-    friction: float = 0.0
+    friction: float = 0.0          # μ_d (dynamic / kinetic)
+    friction_static: float = 0.0   # μ_s ≥ μ_d (AVBD Sec 3.3)
+    partner: int = -1              # other tangent row of the (t,b) pair
 
 
 def box_inertia_local(mass: float, hx: float, hy: float, hz: float) -> np.ndarray:
@@ -223,6 +225,16 @@ def box_inv_inertia_local(mass: float, hx: float, hy: float, hz: float) -> np.nd
     return np.linalg.inv(I).astype(np.float32)
 
 
+def box_inertia_local_or_zero(mass: float, hx: float, hy: float, hz: float) -> np.ndarray:
+    """Body-local inertia or zero for static bodies — mirror of
+    box_inv_inertia_local but for the un-inverted tensor. Used by the
+    optimized primal_update_6dof so the per-iter wp.inverse() can be
+    eliminated."""
+    if mass <= 0.0:
+        return np.zeros((3, 3), dtype=np.float32)
+    return box_inertia_local(mass, hx, hy, hz)
+
+
 class Solver6DOF:
     """6-DOF AVBD rigid body solver. Sibling of `Solver` for full SE(3) bodies."""
 
@@ -239,6 +251,7 @@ class Solver6DOF:
         max_linear_speed: float = 30.0,
         max_angular_speed: float = 50.0,
         substeps: int = 1,
+        friction_static_mult: float = 1.5,
     ):
         wp.init()
         self.device = device
@@ -257,6 +270,13 @@ class Solver6DOF:
         # smaller per-substep correction cuts the post-stab-snap impulse that
         # otherwise makes stacked boxes bounce.
         self.substeps = max(1, int(substeps))
+        # Static-vs-dynamic friction (AVBD Sec 3.3). Each tangent row carries
+        # both μ_d (kinetic) and μ_s ≥ μ_d (stiction); the update_static_
+        # friction_6dof kernel picks whichever is appropriate at substep
+        # start based on the previous frame's ||λ_tb||. 1.5× is a standard
+        # textbook ratio (e.g., dry steel-on-steel μ_s/μ_d ≈ 1.4–1.6); call
+        # set_friction_static_mult to override per scene.
+        self.friction_static_mult = max(1.0, float(friction_static_mult))
 
         # Per-body state (numpy buffers; flushed to Warp lazily).
         self._x: list[tuple[float, float, float]] = []
@@ -265,6 +285,7 @@ class Solver6DOF:
         self._omega: list[tuple[float, float, float]] = []
         self._mass: list[float] = []
         self._inv_I_local: list[np.ndarray] = []  # 3×3 each
+        self._I_local: list[np.ndarray] = []      # 3×3 each (forward, for primal opt)
         self._half_extents: list[tuple[float, float, float]] = []
         self._friction: list[float] = []
 
@@ -288,6 +309,7 @@ class Solver6DOF:
         self.x = self.q = self.v = self.omega = None
         self.prev_v = self.prev_omega = None
         self.mass = self.inv_inertia_local = self.inv_inertia_world = None
+        self.inertia_local = self.inertia_world = None
         self.x_initial = self.q_initial = None
         self.x_inertial = self.q_inertial = None
         self.body_color = None
@@ -297,8 +319,26 @@ class Solver6DOF:
         self.c_lambda = self.c_penalty = self.c_fmin = self.c_fmax = None
         self.c_alpha_C0 = self.c_active = self.c_fracture = None
         self.c_sibling = self.c_friction = None
+        self.c_friction_static = self.c_partner = self.c_was_static = None
         self.body_con_starts = self.body_con_indices = None
         self.num_colors = 0
+        # Broadphase scratch (AVBD Alg 1 line 1 — LBVH on device-side AABBs).
+        # See _rebuild_contact_pool for the per-step pipeline.
+        self._bp_half_extents = None    # wp.array(vec3) — body half-extents
+        self._bp_aabb_lo = None         # wp.array(vec3)
+        self._bp_aabb_hi = None
+        self._bp_pair_count = None      # wp.array(int, shape=1) atomic counter
+        self._bp_pair_a = None
+        self._bp_pair_b = None
+        self._bp_pair_overlap = None
+        self._bp_pair_sat_idx = None
+        self._bp_pair_n_hat = None
+        self._bp_pair_depth = None
+        self._bp_max_pairs = 0
+        self._bp_bvh = None             # wp.Bvh — rebuilt each call
+        # Tracks broadphase wall time (seconds) of the most recent rebuild
+        # so the viewer can surface it without polling internals.
+        self.broadphase_ms = 0.0
 
     # ---- Scene building -----------------------------------------------------
 
@@ -324,6 +364,7 @@ class Solver6DOF:
         hx, hy, hz = float(half_extents[0]), float(half_extents[1]), float(half_extents[2])
         self._half_extents.append((hx, hy, hz))
         self._inv_I_local.append(box_inv_inertia_local(mass, hx, hy, hz))
+        self._I_local.append(box_inertia_local_or_zero(mass, hx, hy, hz))
         self._friction.append(max(0.0, float(friction)))
         self._dirty = True
         return RigidBody(index=idx, half_extents=(hx, hy, hz))
@@ -361,18 +402,39 @@ class Solver6DOF:
                     normal_indices.append(n_idx)
                     if mu > 0.0:
                         # Two tangent rows per corner: along world x̂ and ẑ.
-                        for tvec in ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0)):
-                            self._rows.append(
-                                _Row(
-                                    type=CONTACT_TANGENT_6DOF,
-                                    body_a=body.index,
-                                    world_anchor=tvec,
-                                    off_a=off,
-                                    stiffness=stiffness,
-                                    sibling=n_idx,
-                                    friction=mu,
-                                )
+                        # Record them as a partner pair so update_static_
+                        # friction_6dof can compute the joint ||λ_tb|| from
+                        # (λ_t, λ_b) per AVBD Sec 3.3 instead of each row's
+                        # |λ| in isolation.
+                        mu_s = mu * self.friction_static_mult
+                        t_x_idx = len(self._rows)
+                        self._rows.append(
+                            _Row(
+                                type=CONTACT_TANGENT_6DOF,
+                                body_a=body.index,
+                                world_anchor=(1.0, 0.0, 0.0),
+                                off_a=off,
+                                stiffness=stiffness,
+                                sibling=n_idx,
+                                friction=mu,
+                                friction_static=mu_s,
                             )
+                        )
+                        t_z_idx = len(self._rows)
+                        self._rows.append(
+                            _Row(
+                                type=CONTACT_TANGENT_6DOF,
+                                body_a=body.index,
+                                world_anchor=(0.0, 0.0, 1.0),
+                                off_a=off,
+                                stiffness=stiffness,
+                                sibling=n_idx,
+                                friction=mu,
+                                friction_static=mu_s,
+                            )
+                        )
+                        self._rows[t_x_idx].partner = t_z_idx
+                        self._rows[t_z_idx].partner = t_x_idx
         self._dirty = True
         return normal_indices
 
@@ -417,9 +479,11 @@ class Solver6DOF:
 
     def _emit_obb_pair(self, i: int, j: int, positions: np.ndarray,
                        quats: np.ndarray) -> None:
-        """SAT + face-clip + emit. Edge-edge falls back to single-deepest-point
-        contact (closest-points-between-edges would be more accurate; left
-        for a follow-up)."""
+        """CPU fallback path: SAT + face-clip + emit. Used only by the legacy
+        brute-force broadphase (kept for parity tests). The hot path now goes
+        through `_emit_obb_pair_with_sat` after the Warp BVH broadphase + SAT
+        kernels have already computed the separating axis and contact normal.
+        """
         c_A, c_B = positions[i], positions[j]
         e_A = np.asarray(self._half_extents[i], dtype=np.float32)
         e_B = np.asarray(self._half_extents[j], dtype=np.float32)
@@ -429,6 +493,19 @@ class Solver6DOF:
         if sat is None:
             return
         sat_idx, n_hat, _overlap = sat
+        self._emit_obb_pair_with_sat(i, j, positions, quats,
+                                     sat_idx, n_hat, c_A, c_B,
+                                     e_A, e_B, R_A, R_B)
+
+    def _emit_obb_pair_with_sat(self, i: int, j: int,
+                                positions: np.ndarray, quats: np.ndarray,
+                                sat_idx: int, n_hat: np.ndarray,
+                                c_A: np.ndarray, c_B: np.ndarray,
+                                e_A: np.ndarray, e_B: np.ndarray,
+                                R_A: np.ndarray, R_B: np.ndarray) -> None:
+        """Face-clip + emit using precomputed SAT result. Pulled out of
+        `_emit_obb_pair` so the Warp-side parallel SAT kernel can feed it
+        directly."""
 
         # Identify reference vs incident body based on which axis won.
         if sat_idx < 3:
@@ -522,6 +599,7 @@ class Solver6DOF:
             ))
             t_idx, b_idx = -1, -1
             if mu > 0.0:
+                mu_s = mu * self.friction_static_mult
                 t_idx = len(self._rows)
                 self._rows.append(_Row(
                     type=CONTACT_TANGENT_6DOF,
@@ -530,6 +608,7 @@ class Solver6DOF:
                     off_a=(float(off_ref_local[0]), float(off_ref_local[1]), float(off_ref_local[2])),
                     off_b=(float(off_inc_local[0]), float(off_inc_local[1]), float(off_inc_local[2])),
                     stiffness=math.inf, sibling=normal_idx, friction=mu,
+                    friction_static=mu_s,
                 ))
                 b_idx = len(self._rows)
                 self._rows.append(_Row(
@@ -539,7 +618,10 @@ class Solver6DOF:
                     off_a=(float(off_ref_local[0]), float(off_ref_local[1]), float(off_ref_local[2])),
                     off_b=(float(off_inc_local[0]), float(off_inc_local[1]), float(off_inc_local[2])),
                     stiffness=math.inf, sibling=normal_idx, friction=mu,
+                    friction_static=mu_s,
                 ))
+                self._rows[t_idx].partner = b_idx
+                self._rows[b_idx].partner = t_idx
             # Cache key — quantize the body-local contact point on the
             # LOWER-INDEX body to a 5 mm grid. Using the lower-index body
             # (rather than "ref") keeps the key invariant to which side SAT
@@ -614,6 +696,7 @@ class Solver6DOF:
         ))
         t_idx, b_idx = -1, -1
         if mu > 0.0:
+            mu_s = mu * self.friction_static_mult
             t_idx = len(self._rows)
             self._rows.append(_Row(
                 type=CONTACT_TANGENT_6DOF, body_a=i, body_b=j,
@@ -621,6 +704,7 @@ class Solver6DOF:
                 off_a=(float(off_ref_local[0]), float(off_ref_local[1]), float(off_ref_local[2])),
                 off_b=(float(off_inc_local[0]), float(off_inc_local[1]), float(off_inc_local[2])),
                 stiffness=math.inf, sibling=normal_idx, friction=mu,
+                friction_static=mu_s,
             ))
             b_idx = len(self._rows)
             self._rows.append(_Row(
@@ -629,7 +713,10 @@ class Solver6DOF:
                 off_a=(float(off_ref_local[0]), float(off_ref_local[1]), float(off_ref_local[2])),
                 off_b=(float(off_inc_local[0]), float(off_inc_local[1]), float(off_inc_local[2])),
                 stiffness=math.inf, sibling=normal_idx, friction=mu,
+                friction_static=mu_s,
             ))
+            self._rows[t_idx].partner = b_idx
+            self._rows[b_idx].partner = t_idx
         qx = int(round(float(off_ref_local[0]) * 200))
         qy = int(round(float(off_ref_local[1]) * 200))
         qz = int(round(float(off_ref_local[2]) * 200))
@@ -658,6 +745,8 @@ class Solver6DOF:
         for r in kept:
             if r.type == CONTACT_TANGENT_6DOF and r.sibling >= 0:
                 r.sibling = old_to_new.get(r.sibling, -1)
+            if r.type == CONTACT_TANGENT_6DOF and r.partner >= 0:
+                r.partner = old_to_new.get(r.partner, -1)
         self._rows = kept
         self._contact_pool_start = len(self._rows)
         self._pool_pair_rows: list = []
@@ -667,21 +756,141 @@ class Solver6DOF:
         quats = (self.q.numpy().reshape(-1, 4) if self.q is not None
                  else np.array(self._q, dtype=np.float32).reshape(-1, 4))
         n = len(self._x)
-        # Coarse-reject via bounding sphere = sqrt(hx² + hy² + hz²).
-        radii = np.array([math.sqrt(h[0]**2 + h[1]**2 + h[2]**2)
-                          for h in self._half_extents], dtype=np.float32)
-        for i in range(n):
-            for j in range(i + 1, n):
-                # Static bodies don't drive contact (saves cost; their own
-                # floor contacts already keep them pinned).
-                if self._mass[i] <= 0.0 and self._mass[j] <= 0.0:
-                    continue
-                d2 = float(np.sum((positions[i] - positions[j]) ** 2))
-                r_sum = radii[i] + radii[j]
-                if d2 > r_sum * r_sum:
-                    continue
-                self._emit_obb_pair(i, j, positions, quats)
+        if n < 2:
+            self._dirty = True
+            return
+
+        import time as _t
+        t_bp0 = _t.perf_counter()
+        self._warp_broadphase_emit_contacts(n, positions, quats)
+        self.broadphase_ms = (_t.perf_counter() - t_bp0) * 1000.0
         self._dirty = True
+
+    def _warp_broadphase_emit_contacts(
+            self, n: int, positions: np.ndarray, quats: np.ndarray) -> None:
+        """AVBD Alg 1 line 1 broadphase. Build per-body world AABBs on the
+        Warp device, construct an LBVH over them, query for overlapping
+        pairs, run 15-axis SAT in parallel on candidate pairs, then run the
+        Python face-clip on confirmed-overlap pairs only.
+
+        The legacy O(N²) Python sphere-test + per-pair SAT loop dominated
+        ~56% of frame time in dense scenes (towers + dominoes); this path
+        moves both the broadphase and the SAT inner loop to Warp where they
+        execute in parallel across pairs."""
+        dev = self.device
+
+        # Margin matches the per-pair SAT margin used in _obb_sat (5 mm) —
+        # bodies within this margin still emit a contact so warm-start λ
+        # persists across brief separations during settle. The AABB margin
+        # must be at least this large or the broadphase silently drops
+        # those grazing pairs and we lose the persistence trick.
+        margin = 0.005
+
+        # 1. Half-extent buffer — only needs rebuild if body count changed.
+        he_np = np.asarray(self._half_extents, dtype=np.float32).reshape(-1, 3)
+        if (self._bp_half_extents is None
+                or self._bp_half_extents.shape[0] != n):
+            self._bp_half_extents = wp.array(he_np, dtype=wp.vec3, device=dev)
+            self._bp_aabb_lo = wp.zeros(n, dtype=wp.vec3, device=dev)
+            self._bp_aabb_hi = wp.zeros(n, dtype=wp.vec3, device=dev)
+        else:
+            # Half-extents are scene-static; only flush if user appended
+            # bodies after the initial _flush. Cheaper to just copy now
+            # than to track a dirty flag for this one buffer.
+            self._bp_half_extents.assign(he_np)
+
+        # 2. Pair-list buffer — generous fixed allocation. Realistic cap
+        # for dense rigid stacks: each body sees ≲ 12 neighbors (corner
+        # contacts on a cube grid), so 16*n is a safe upper bound. We
+        # detect overflow and grow next frame if needed.
+        cap_target = max(256, 16 * n)
+        if self._bp_max_pairs < cap_target:
+            self._bp_max_pairs = cap_target
+            self._bp_pair_a = wp.zeros(cap_target, dtype=int, device=dev)
+            self._bp_pair_b = wp.zeros(cap_target, dtype=int, device=dev)
+            self._bp_pair_overlap = wp.zeros(cap_target, dtype=int, device=dev)
+            self._bp_pair_sat_idx = wp.zeros(cap_target, dtype=int, device=dev)
+            self._bp_pair_n_hat = wp.zeros(cap_target, dtype=wp.vec3, device=dev)
+            self._bp_pair_depth = wp.zeros(cap_target, dtype=float, device=dev)
+        if self._bp_pair_count is None:
+            self._bp_pair_count = wp.zeros(1, dtype=int, device=dev)
+        else:
+            self._bp_pair_count.zero_()
+
+        # 3. World AABBs on device — needs self.x / self.q which _flush()
+        # populated upstream; we're in the post-_flush path of _step_one.
+        wp.launch(
+            K.compute_body_aabb_6dof, dim=n,
+            inputs=[self.x, self.q, self._bp_half_extents, margin],
+            outputs=[self._bp_aabb_lo, self._bp_aabb_hi],
+            device=dev,
+        )
+
+        # 4. Build the BVH. AVBD §4 specifies LBVH (Lauterbach 2009) but
+        # Warp 1.13 only ships the LBVH constructor for CUDA trees. On CPU
+        # the closest equivalent is SAH (Surface Area Heuristic, top-down)
+        # — same O(N log N) build, slightly different split quality, no
+        # behavioral difference for the broadphase.
+        constructor = "lbvh" if str(dev).startswith("cuda") else "sah"
+        self._bp_bvh = wp.Bvh(self._bp_aabb_lo, self._bp_aabb_hi,
+                              constructor=constructor)
+
+        # 5. Broadphase pair generation — each body queries the tree.
+        wp.launch(
+            K.bvh_broadphase_pairs, dim=n,
+            inputs=[self._bp_bvh.id, self._bp_aabb_lo, self._bp_aabb_hi,
+                    self.mass, self._bp_pair_count,
+                    self._bp_pair_a, self._bp_pair_b, self._bp_max_pairs],
+            device=dev,
+        )
+
+        n_pairs = int(self._bp_pair_count.numpy()[0])
+        if n_pairs == 0:
+            return
+        if n_pairs > self._bp_max_pairs:
+            # Overflow — grow buffer and retry next frame. Conservatively
+            # drop this frame's late pairs; the BVH will reissue them next
+            # substep with the resized buffer.
+            self._bp_max_pairs = max(2 * self._bp_max_pairs, n_pairs * 2)
+            n_pairs = self._bp_max_pairs
+
+        # 6. 15-axis SAT in parallel across candidate pairs.
+        wp.launch(
+            K.obb_sat_pairs, dim=n_pairs,
+            inputs=[self.x, self.q, self._bp_half_extents,
+                    self._bp_pair_a, self._bp_pair_b, n_pairs, margin],
+            outputs=[self._bp_pair_overlap, self._bp_pair_sat_idx,
+                     self._bp_pair_n_hat, self._bp_pair_depth],
+            device=dev,
+        )
+
+        # 7. Readback + Python face-clip on confirmed overlaps. We pay one
+        # GPU→CPU sync here for the SAT result arrays (4 small int/float
+        # buffers, ~50 entries on a tower scene). Face-clip variable output
+        # is awkward in Warp; keeping it on CPU is the residual cost. (A
+        # full Warp port with fixed-size polygon buffers is left as a
+        # follow-up — the broadphase + SAT move was the dominant share.)
+        a_np = self._bp_pair_a.numpy()[:n_pairs]
+        b_np = self._bp_pair_b.numpy()[:n_pairs]
+        ov_np = self._bp_pair_overlap.numpy()[:n_pairs]
+        si_np = self._bp_pair_sat_idx.numpy()[:n_pairs]
+        nh_np = self._bp_pair_n_hat.numpy().reshape(-1, 3)[:n_pairs]
+
+        for p in range(n_pairs):
+            if ov_np[p] == 0:
+                continue
+            i = int(a_np[p])
+            j = int(b_np[p])
+            sat_idx = int(si_np[p])
+            n_hat = nh_np[p].astype(np.float32)
+            c_A, c_B = positions[i], positions[j]
+            e_A = np.asarray(self._half_extents[i], dtype=np.float32)
+            e_B = np.asarray(self._half_extents[j], dtype=np.float32)
+            R_A = _q_to_R(quats[i])
+            R_B = _q_to_R(quats[j])
+            self._emit_obb_pair_with_sat(i, j, positions, quats,
+                                         sat_idx, n_hat,
+                                         c_A, c_B, e_A, e_B, R_A, R_B)
 
     # ---- Runtime perturbations ---------------------------------------------
 
@@ -762,6 +971,8 @@ class Solver6DOF:
         prev_w_np = np.zeros((n_b, 3), dtype=np.float32)
         inv_I_np = (np.stack(self._inv_I_local).astype(np.float32)
                     if n_b else np.zeros((0, 3, 3), dtype=np.float32))
+        I_np = (np.stack(self._I_local).astype(np.float32)
+                if n_b else np.zeros((0, 3, 3), dtype=np.float32))
 
         if n_b_prev > 0 and n_b_prev <= n_b:
             x_np[:n_b_prev] = cur_x[:n_b_prev]
@@ -781,11 +992,13 @@ class Solver6DOF:
         self.prev_omega = wp.array(prev_w_np, dtype=wp.vec3, device=dev)
         self.mass = wp.array(m_np, dtype=float, device=dev)
         self.inv_inertia_local = wp.array(inv_I_np, dtype=wp.mat33, device=dev)
+        self.inertia_local = wp.array(I_np, dtype=wp.mat33, device=dev)
         self.x_initial = wp.zeros(n_b, dtype=wp.vec3, device=dev)
         self.q_initial = wp.zeros(n_b, dtype=wp.quat, device=dev)
         self.x_inertial = wp.zeros(n_b, dtype=wp.vec3, device=dev)
         self.q_inertial = wp.zeros(n_b, dtype=wp.quat, device=dev)
         self.inv_inertia_world = wp.zeros(n_b, dtype=wp.mat33, device=dev)
+        self.inertia_world = wp.zeros(n_b, dtype=wp.mat33, device=dev)
 
         # Adjacency uses body indices only.
         body_a_list = [r.body_a for r in self._rows]
@@ -834,6 +1047,16 @@ class Solver6DOF:
         self.c_fracture = wp.array(f32([r.fracture for r in self._rows]), dtype=float, device=dev)
         self.c_sibling = wp.array(i32([r.sibling for r in self._rows]), dtype=int, device=dev)
         self.c_friction = wp.array(f32([r.friction for r in self._rows]), dtype=float, device=dev)
+        self.c_friction_static = wp.array(
+            f32([r.friction_static for r in self._rows]), dtype=float, device=dev)
+        self.c_partner = wp.array(
+            i32([r.partner for r in self._rows]), dtype=int, device=dev)
+        # c_was_static persists across substeps via the contact cache + the
+        # update_static_friction kernel. Seed to 0 on first build; subsequent
+        # _flush() calls only happen when scene topology changes (new rows
+        # appended) so we re-init to 0 there too — any in-flight contact will
+        # be re-evaluated on the very next substep.
+        self.c_was_static = wp.zeros(n_c, dtype=int, device=dev)
 
         starts, indices = self._build_adjacency()
         self.body_con_starts = wp.array(starts, dtype=int, device=dev)
@@ -870,15 +1093,18 @@ class Solver6DOF:
         if self._self_collide and self._pool_pair_rows:
             lam_np = self.c_lambda.numpy().copy()
             pen_np = self.c_penalty.numpy().copy()
+            was_np = self.c_was_static.numpy().copy()
             for pair, n_idx, t_idx, b_idx in self._pool_pair_rows:
                 cached = self._contact_cache.get(pair)
                 if cached is None:
                     continue
-                if not all(math.isfinite(v) for v in cached):
+                # Tuple layout: (λ_n, λ_t, λ_b, k_n, k_t, k_b, was_static)
+                if not all(math.isfinite(v) for v in cached[:6]):
                     continue
-                lam_n, lam_t, lam_b, k_n, k_t, k_b = cached
+                lam_n, lam_t, lam_b, k_n, k_t, k_b, was = cached
                 lam_np[n_idx] = lam_n
                 pen_np[n_idx] = k_n
+                was_np[n_idx] = int(was)
                 if t_idx >= 0:
                     lam_np[t_idx] = lam_t
                     pen_np[t_idx] = k_t
@@ -887,47 +1113,49 @@ class Solver6DOF:
                     pen_np[b_idx] = k_b
             self.c_lambda = wp.array(lam_np, dtype=float, device=self.device)
             self.c_penalty = wp.array(pen_np, dtype=float, device=self.device)
+            self.c_was_static = wp.array(was_np, dtype=int, device=self.device)
         n_b = len(self._x)
         n_c = len(self._rows)
         if n_b == 0:
             return
         dev = self.device
 
-        # 1. Inertial target + warm-started x⁰, q⁰; also cache R·I_inv·R^T.
+        # 1. Inertial target + warm-started x⁰, q⁰; cache BOTH R·I_inv·R^T
+        # AND R·I·R^T so primal_update_6dof never has to invert.
         wp.launch(
             K.predict_inertial_6dof, dim=n_b,
             inputs=[self.x, self.q, self.v, self.omega, self.prev_v,
-                    self.mass, self.inv_inertia_local,
+                    self.mass, self.inv_inertia_local, self.inertia_local,
                     self.dt, wp.vec3(*self.gravity)],
             outputs=[self.x_initial, self.q_initial,
                      self.x_inertial, self.q_inertial,
-                     self.inv_inertia_world, self.x, self.q],
+                     self.inv_inertia_world, self.inertia_world,
+                     self.x, self.q],
             device=dev,
         )
 
         if n_c > 0:
-            wp.launch(
-                K.warmstart_duals_6dof, dim=n_c,
-                inputs=[self.c_lambda, self.c_penalty, self.c_stiffness,
-                        self.c_type, self.alpha, self.gamma,
-                        1 if self.post_stabilize else 0],
-                device=dev,
-            )
-            # AVBD post-stabilize mode (2D ref solver.cpp:156-158): main-iter
-            # alpha is 1.0 (preserve initial constraint error, only resist NEW
-            # motion → contact decelerates the body correctly), then the
-            # post-stab iter uses alpha=0.0 to remove the remaining error in
-            # one shot. Passing self.alpha=0.99 here instead causes the body
-            # to leave 99% of initial penetration uncorrected each substep,
-            # so a falling box never decelerates and "wild velocity" results.
+            # Fused substep prelude — warmstart_duals + update_static_friction
+            # + cache_alpha_C0(main) in one launch. Each was previously ~95%
+            # launch-overhead-bound (~18 μs Python launch vs <1 μs compute);
+            # fusion cuts 2 launches per substep (= 16/step).
+            # AVBD post-stabilize mode: main-iter α=1.0 (preserve initial
+            # constraint error, only resist NEW motion → contact decelerates
+            # the body correctly), then a separate cache_alpha_C0 launch
+            # below uses α=0.0 for the final post-stab iter.
             main_alpha = 1.0 if self.post_stabilize else self.alpha
             wp.launch(
-                K.cache_alpha_C0_6dof, dim=n_c,
-                inputs=[self.x, self.q, self.x_initial, self.q_initial,
+                K.substep_prelude_6dof, dim=n_c,
+                inputs=[self.x_initial, self.q_initial,
                         self.c_type, self.c_body_a, self.c_body_b,
                         self.c_world_anchor, self.c_off_a, self.c_off_b,
-                        self.c_rest, self.c_active, main_alpha],
-                outputs=[self.c_alpha_C0],
+                        self.c_rest, self.c_stiffness,
+                        self.c_sibling, self.c_partner, self.c_friction_static,
+                        self.c_lambda, self.c_penalty, self.c_active,
+                        self.c_was_static, self.c_alpha_C0,
+                        self.alpha, self.gamma,
+                        1 if self.post_stabilize else 0,
+                        main_alpha],
                 device=dev,
             )
 
@@ -947,7 +1175,8 @@ class Solver6DOF:
             for color_id in range(self.num_colors):
                 wp.launch(
                     K.primal_update_6dof, dim=n_b,
-                    inputs=[self.x, self.q, self.mass, self.inv_inertia_world,
+                    inputs=[self.x, self.q, self.mass,
+                            self.inv_inertia_world, self.inertia_world,
                             self.x_inertial, self.q_inertial, self.body_color,
                             self.c_type, self.c_body_a, self.c_body_b,
                             self.c_world_anchor, self.c_off_a, self.c_off_b,
@@ -956,6 +1185,7 @@ class Solver6DOF:
                             self.c_fmin, self.c_fmax,
                             self.c_alpha_C0, self.c_active,
                             self.c_sibling, self.c_friction,
+                            self.c_friction_static, self.c_was_static,
                             self.body_con_starts, self.body_con_indices,
                             self.dt, color_id],
                     device=dev,
@@ -971,27 +1201,33 @@ class Solver6DOF:
                             self.c_lambda, self.c_penalty,
                             self.c_fmin, self.c_fmax,
                             self.c_alpha_C0, self.c_active, self.c_fracture,
-                            self.c_sibling, self.c_friction, self.beta],
+                            self.c_sibling, self.c_friction,
+                            self.c_friction_static, self.c_was_static,
+                            self.beta],
                     device=dev,
                 )
 
             if it == self.iterations - 1:
+                # Fused finalize + cap saves 1 launch per substep. Disabled
+                # cap (max_*=inf or ≤0) is folded into the kernel via the
+                # `sl > max_lin` test — wp.inf is never exceeded, so the
+                # cap branch is a no-op then.
+                if (self.max_linear_speed > 0.0
+                        and math.isfinite(self.max_linear_speed)
+                        and self.max_angular_speed > 0.0
+                        and math.isfinite(self.max_angular_speed)):
+                    max_lin = float(self.max_linear_speed)
+                    max_ang = float(self.max_angular_speed)
+                else:
+                    max_lin = math.inf
+                    max_ang = math.inf
                 wp.launch(
-                    K.finalize_velocity_6dof, dim=n_b,
+                    K.finalize_and_cap_6dof, dim=n_b,
                     inputs=[self.x, self.q, self.x_initial, self.q_initial,
-                            self.mass, self.dt],
+                            self.mass, self.dt, max_lin, max_ang],
                     outputs=[self.v, self.omega, self.prev_v, self.prev_omega],
                     device=dev,
                 )
-                if (self.max_linear_speed > 0.0 and math.isfinite(self.max_linear_speed)
-                        and self.max_angular_speed > 0.0
-                        and math.isfinite(self.max_angular_speed)):
-                    wp.launch(
-                        K.cap_velocity_6dof, dim=n_b,
-                        inputs=[self.v, self.omega,
-                                self.max_linear_speed, self.max_angular_speed],
-                        device=dev,
-                    )
 
         # Persist contact-pool λ + penalty for the next step. Drop pairs
         # whose contact became inactive (e.g., separated or fractured).
@@ -999,7 +1235,10 @@ class Solver6DOF:
             lam_np = self.c_lambda.numpy()
             pen_np = self.c_penalty.numpy()
             act_np = self.c_active.numpy()
-            new_cache: dict[tuple, tuple[float, float, float, float, float, float]] = {}
+            was_np = self.c_was_static.numpy()
+            new_cache: dict[
+                tuple, tuple[float, float, float, float, float, float, int]
+            ] = {}
             for pair, n_idx, t_idx, b_idx in self._pool_pair_rows:
                 if act_np[n_idx] == 0:
                     continue
@@ -1011,7 +1250,11 @@ class Solver6DOF:
                 k_b = float(pen_np[b_idx]) if b_idx >= 0 else 1.0
                 if not all(math.isfinite(v) for v in (lam_n, lam_t, lam_b, k_n, k_t, k_b)):
                     continue
-                new_cache[pair] = (lam_n, lam_t, lam_b, k_n, k_t, k_b)
+                # was_static is stored on the NORMAL row and is the
+                # "is this contact currently sticking" flag carried across
+                # frames so a settled stack doesn't have to re-discover it.
+                new_cache[pair] = (lam_n, lam_t, lam_b, k_n, k_t, k_b,
+                                   int(was_np[n_idx]))
             self._contact_cache = new_cache
 
     # ---- Read-back ----------------------------------------------------------

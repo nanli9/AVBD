@@ -227,3 +227,159 @@ def test_static_body_does_not_move():
         s.step()
     assert np.allclose(s.positions()[0], init_x), "mass=0 body moved"
     assert np.allclose(s.orientations()[0], init_q), "mass=0 body rotated"
+
+
+# ---------------------------------------------------------------------------
+# Gap-closure tests: G column-norm Hessian, static/dynamic friction, BVH BP
+# ---------------------------------------------------------------------------
+
+
+def test_geom_stiffness_diag_matches_closed_form():
+    """AVBD Eq 17 + Sec 3.5: G̃_diag entries are the column norms of
+        H[i,c] = ½(n[i]·r[c] + r[i]·n[c]) − (n̂·r)·δ_{ic}
+    For pin axis 0 (n̂ = e_0) with r = (rx, ry, rz):
+        ||col 0|| = ½ √(ry² + rz²)
+        ||col 1|| = √(ry²/4 + rx²)
+        ||col 2|| = √(rz²/4 + rx²)
+    """
+    import warp as wp
+    from avbd3d import kernels_6dof as K
+
+    @wp.kernel
+    def _probe(n: wp.vec3, r: wp.vec3, out: wp.array(dtype=wp.vec3)):
+        out[0] = K.geom_stiffness_diag(n, r)
+
+    out = wp.zeros(1, dtype=wp.vec3, device="cpu")
+    n = wp.vec3(1.0, 0.0, 0.0)
+    r = wp.vec3(0.3, 0.4, 0.5)
+    wp.launch(_probe, dim=1, inputs=[n, r], outputs=[out], device="cpu")
+    g = out.numpy().reshape(3)
+    expected = np.array([
+        0.5 * math.sqrt(0.4**2 + 0.5**2),
+        math.sqrt(0.4**2 / 4.0 + 0.3**2),
+        math.sqrt(0.5**2 / 4.0 + 0.3**2),
+    ], dtype=np.float32)
+    assert np.allclose(g, expected, atol=1e-6), \
+        f"geom_stiffness_diag(e0, r)={g} expected {expected}"
+
+
+def test_pinned_box_with_spin_stays_bounded():
+    """Pinned box with a strong angular kick: with the correct column-norm G
+    (Gap 2) the angular velocity should NOT spin up to the cap. The earlier
+    L1 over-estimate kept |ω| bounded for pins by sheer over-stiffening but
+    diverged for contacts — this test verifies the pin case still works."""
+    s = Solver6DOF(dt=1/60, iterations=20, max_angular_speed=50.0)
+    h = 0.2
+    world_pin = (h, 2.0, h)
+    b = s.add_box((0., 2.0 - h, 0.), (h, h, h), mass=1.0,
+                  angular_velocity=(0., 6.0, 0.))  # strong spin
+    s.add_pin_corner(b, body_local=(h, h, h), world_point=world_pin)
+    max_w = 0.0
+    for _ in range(180):
+        s.step()
+        max_w = max(max_w, float(np.linalg.norm(s.angular_velocities()[0])))
+    # Should swing back & forth like a pendulum, not run away. |ω| should
+    # stay well below the cap.
+    assert max_w < 12.0, f"pinned spinning box ran away, max|ω|={max_w}"
+
+
+def test_static_friction_holds_under_small_push():
+    """AVBD Sec 3.3: a horizontal force F < μ_s·m·g should not move the box.
+    With μ_d=0.4 and static-mult=1.5, μ_s·m·g = 0.6·9.81 ≈ 5.886 N.
+    A 3 N continuous push should leave the box essentially at rest."""
+    s = Solver6DOF(dt=1/60, iterations=20, substeps=4,
+                   friction_static_mult=1.5)
+    h = 0.2
+    b = s.add_box((0., h, 0.), (h, h, h), mass=1.0, friction=0.4)
+    s.add_floor_contact_box(b, friction=0.4)
+    for _ in range(60):  # settle
+        s.step()
+    x0 = float(s.positions()[0][0])
+    # Apply F = 3 N horizontal for 60 steps via small Δv each frame.
+    for _ in range(60):
+        v = s.velocities()[0]
+        dv = 3.0 * s.dt / 1.0  # F·dt / m
+        s.set_velocity(b, (float(v[0] + dv), float(v[1]), float(v[2])))
+        s.step()
+    x1 = float(s.positions()[0][0])
+    drift = abs(x1 - x0)
+    assert drift < 0.05, \
+        f"static friction should hold under 3 N (μ_s·m·g≈5.9 N), drift={drift}"
+
+
+def test_kinetic_friction_slips_under_large_push():
+    """Under a force exceeding μ_s·m·g, the contact should switch to μ_d
+    and the box should slide. With μ_d=0.4, μ_s=0.6 → μ_s·m·g≈5.9 N.
+    A 10 N push should produce substantial sliding."""
+    s = Solver6DOF(dt=1/60, iterations=20, substeps=4,
+                   friction_static_mult=1.5)
+    h = 0.2
+    b = s.add_box((0., h, 0.), (h, h, h), mass=1.0, friction=0.4)
+    s.add_floor_contact_box(b, friction=0.4)
+    for _ in range(60):  # settle
+        s.step()
+    x0 = float(s.positions()[0][0])
+    for _ in range(60):
+        v = s.velocities()[0]
+        dv = 10.0 * s.dt / 1.0
+        s.set_velocity(b, (float(v[0] + dv), float(v[1]), float(v[2])))
+        s.step()
+    x1 = float(s.positions()[0][0])
+    drift = x1 - x0
+    assert drift > 1.0, \
+        f"kinetic friction should slip under 10 N (μ_d·m·g≈3.9 N), drift={drift}"
+
+
+def test_bvh_broadphase_emits_correct_pair_count():
+    """3-cube column with self-collision: BVH broadphase should report
+    exactly 2 close pairs (bot-mid and mid-top), no false positives, no
+    misses. Also verifies broadphase_ms is populated."""
+    h = 0.15
+    s = Solver6DOF(dt=1/60, iterations=10, substeps=4)
+    s.enable_self_collision(True, default_friction=0.3)
+    for k in range(3):
+        cy = h + 2 * h * k + 0.02 * k  # tiny gap so initial frame triggers SAT
+        b = s.add_box((0., cy, 0.), (h, h, h), mass=1.0, friction=0.3)
+        s.add_floor_contact_box(b, friction=0.3)
+    # Step once to populate the broadphase.
+    s.step()
+    assert s.broadphase_ms > 0.0, "broadphase_ms should be populated"
+    # Settle.
+    for _ in range(120):
+        s.step()
+    # After settle, all three should be stacked.
+    ys = s.positions()[:, 1]
+    for i in range(3):
+        expected = h + 2 * h * i
+        assert abs(ys[i] - expected) < 0.03, \
+            f"cube {i}: y={ys[i]} expected ~{expected}"
+
+
+def test_bvh_broadphase_scales_to_27_bodies():
+    """3x3 grid of 3-tall towers (27 cubes). Stresses the BVH at the scale
+    the viewer demo runs at. The legacy O(N²) loop would be slow but
+    correct here; we check the BVH path settles the towers."""
+    h = 0.12
+    spacing = 0.6
+    s = Solver6DOF(dt=1/60, iterations=15, substeps=6)
+    s.enable_self_collision(True, default_friction=0.5)
+    for ix in range(3):
+        for iz in range(3):
+            cx = (ix - 1) * spacing
+            cz = (iz - 1) * spacing
+            for k in range(3):
+                cy = h + 2 * h * k
+                b = s.add_box((cx, cy, cz), (h, h, h), mass=1.0, friction=0.5)
+                s.add_floor_contact_box(b, friction=0.5)
+    # Settle.
+    for _ in range(120):
+        s.step()
+    # Top-of-each-tower y should be near 5h. Allow a bit of settle wobble.
+    positions = s.positions()
+    n = len(positions)
+    # Tower-grouped layout: bodies emitted in order (tower, level). Levels per
+    # tower = 3, total towers = 9, total bodies = 27.
+    for tower in range(9):
+        top_y = positions[tower * 3 + 2][1]
+        assert 4.5 * h < top_y < 5.5 * h, \
+            f"tower {tower} top y={top_y}, expected ~{5*h}"

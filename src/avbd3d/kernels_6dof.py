@@ -119,6 +119,7 @@ def predict_inertial_6dof(
     prev_v: wp.array(dtype=wp.vec3),
     mass: wp.array(dtype=float),
     inv_inertia_local: wp.array(dtype=wp.mat33),
+    inertia_local: wp.array(dtype=wp.mat33),
     dt: float,
     gravity: wp.vec3,
     # outputs
@@ -127,6 +128,7 @@ def predict_inertial_6dof(
     x_inertial: wp.array(dtype=wp.vec3),
     q_inertial: wp.array(dtype=wp.quat),
     inv_inertia_world: wp.array(dtype=wp.mat33),
+    inertia_world: wp.array(dtype=wp.mat33),
     x_warm: wp.array(dtype=wp.vec3),
     q_warm: wp.array(dtype=wp.quat),
 ):
@@ -135,10 +137,16 @@ def predict_inertial_6dof(
     # Save initial state for BDF1 velocity finalize.
     x_initial[i] = x[i]
     q_initial[i] = q[i]
-    # Cache R · I_local^{-1} · R^T — used by primal solve LHS. Identity for
-    # static bodies; arbitrary mat33 otherwise.
+    # Cache R · I_local^{-1} · R^T AND R · I_local · R^T — both used by the
+    # primal solve LHS. The previous version stored only the inverse and the
+    # primal called wp.inverse() on it every iteration. Storing both removes
+    # one 3×3 inverse per body per primal iteration (~10% of primal compute
+    # at small body counts; was wasted work since R · I^-1 · R^T inverts
+    # exactly to R · I · R^T).
     R = wp.quat_to_matrix(q[i])
-    inv_inertia_world[i] = R * inv_inertia_local[i] * wp.transpose(R)
+    Rt = wp.transpose(R)
+    inv_inertia_world[i] = R * inv_inertia_local[i] * Rt
+    inertia_world[i] = R * inertia_local[i] * Rt
 
     if m <= 0.0:
         # Static / kinematic body — no inertial prediction.
@@ -260,6 +268,45 @@ def eval_box_box_C(
     return wp.dot(n, r_a - r_b)
 
 
+@wp.func
+def geom_stiffness_diag(n: wp.vec3, r: wp.vec3) -> wp.vec3:
+    """Diagonal column-norm approximation of ∂²C/∂θ² for any C = n̂ · (x + R·off).
+    Returns vec3 of column norms (g₀, g₁, g₂) used by AVBD Eq 17:
+        G̃ = diag(||G_col_c||),   G_col_c = column c of (∂²C/∂θ²)
+
+    Derivation: for C(θ) = n̂ · R(θ)·off, with world-frame δθ:
+        δ²C = n̂ · (δθ × (δθ × r))
+            = (n̂·δθ)(δθ·r) − (n̂·r)|δθ|²
+    so the Hessian is
+        H[i,c] = ½(n[i]·r[c] + r[i]·n[c]) − (n̂·r)·δ_{ic}.
+
+    Multiplied by |λ⁺| outside, this becomes G_ij from Eq 17; the column-
+    norm diagonal is symmetric positive-definite by construction (Sec 3.5,
+    paragraph 2) so adding it to D never breaks the SPD guarantee on the
+    angular block — that's why the paper says "always use" the approximate
+    Hessian for rigid bodies. The earlier per-pin-only L1 estimate
+    `(|r_j| + |r_k|)/2` over-estimates by up to √2 and was wrong for two
+    of the three columns.
+    """
+    nr = wp.dot(n, r)
+    # Column 0
+    h00 = n[0] * r[0] - nr
+    h10 = 0.5 * (n[1] * r[0] + r[1] * n[0])
+    h20 = 0.5 * (n[2] * r[0] + r[2] * n[0])
+    g0 = wp.sqrt(h00 * h00 + h10 * h10 + h20 * h20)
+    # Column 1
+    h01 = 0.5 * (n[0] * r[1] + r[0] * n[1])
+    h11 = n[1] * r[1] - nr
+    h21 = 0.5 * (n[2] * r[1] + r[2] * n[1])
+    g1 = wp.sqrt(h01 * h01 + h11 * h11 + h21 * h21)
+    # Column 2
+    h02 = 0.5 * (n[0] * r[2] + r[0] * n[2])
+    h12 = 0.5 * (n[1] * r[2] + r[1] * n[2])
+    h22 = n[2] * r[2] - nr
+    g2 = wp.sqrt(h02 * h02 + h12 * h12 + h22 * h22)
+    return wp.vec3(g0, g1, g2)
+
+
 # -----------------------------------------------------------------------------
 # Primal update — 6×6 local SPD solve per body, Schur-complement on 3×3 blocks
 # -----------------------------------------------------------------------------
@@ -270,6 +317,7 @@ def primal_update_6dof(
     q: wp.array(dtype=wp.quat),
     mass: wp.array(dtype=float),
     inv_inertia_world: wp.array(dtype=wp.mat33),
+    inertia_world: wp.array(dtype=wp.mat33),
     x_inertial: wp.array(dtype=wp.vec3),
     q_inertial: wp.array(dtype=wp.quat),
     body_color: wp.array(dtype=int),
@@ -290,6 +338,8 @@ def primal_update_6dof(
     c_active: wp.array(dtype=int),
     c_sibling: wp.array(dtype=int),
     c_friction: wp.array(dtype=float),
+    c_friction_static: wp.array(dtype=float),
+    c_was_static: wp.array(dtype=int),
     # adjacency
     body_con_starts: wp.array(dtype=int),
     body_con_indices: wp.array(dtype=int),
@@ -305,10 +355,11 @@ def primal_update_6dof(
 
     inv_dt2 = 1.0 / (dt * dt)
 
-    # M_world block-inverse view (we need M_world, not its inverse, on the LHS).
-    # inv_inertia_world[i] = R · I_local^{-1} · R^T. The angular block of M is its
-    # matrix inverse. Rather than invert again, build I_world by inverting back:
-    I_world = wp.inverse(inv_inertia_world[i])
+    # M_world block view (we need M_world, not its inverse, on the LHS).
+    # Both inv_inertia_world[i] = R · I^{-1} · R^T and inertia_world[i] =
+    # R · I · R^T are precomputed once per substep in predict_inertial_6dof,
+    # eliminating a per-iteration wp.inverse(mat33) call (3 mul-acc savings).
+    I_world = inertia_world[i]
     # Linear A_lin = m/dt² · I3; angular D_ang = I_world/dt²; coupling B = 0
     # initially (mass matrix has no linear-angular coupling at the CoM).
     A = wp.mat33(m*inv_dt2, 0.0, 0.0, 0.0, m*inv_dt2, 0.0, 0.0, 0.0, m*inv_dt2)
@@ -330,122 +381,146 @@ def primal_update_6dof(
     dtheta_iner = quat_to_rotvec(dq_iner)
     r_ang = I_world * (dtheta_iner * inv_dt2)
 
+    # Cache q[i] once per body — vec3-build of (q[i], q[i], q[i], q[i]) was
+    # otherwise emitted on every quat_rotate. Same for x[i].
+    qi = q[i]
+    xi = x[i]
     start = body_con_starts[i]
     end = body_con_starts[i + 1]
     for k in range(start, end):
         cj = body_con_indices[k]
         if c_active[cj] == 0:
             continue
+        # Hoist all per-constraint reads to single registers — Warp's CPU
+        # backend re-loads the array slot on every reference otherwise.
         t = c_type[cj]
+        s = c_stiffness[cj]
+        k_p = c_penalty[cj]
+        off_a = c_off_a[cj]
+        anchor = c_world_anchor[cj]   # n̂ for BOX_BOX / TANGENT; floor pos / pin pos otherwise
 
         j_lin = wp.vec3(0.0, 0.0, 0.0)
         j_ang = wp.vec3(0.0, 0.0, 0.0)
         C = float(0.0)
+        # `r_self_w` = R(q[i]) · off (the body-LOCAL anchor on `i` rotated to
+        # world). Computed at most once per constraint and reused by the J
+        # calc, the C eval, and the G column-norm. Was being recomputed up to
+        # 4× per BOX_BOX iteration (eval_box_box_C + J + G).
+        r_self_w = wp.vec3(0.0, 0.0, 0.0)
+        n_for_G = wp.vec3(0.0, 0.0, 0.0)
+        have_G = False
+
         if t == FLOOR_CONTACT_6DOF:
-            floor_y = c_world_anchor[cj][1]
-            j_lin, j_ang = floor_J(q[i], c_off_a[cj])
-            C = eval_floor_C(x[i], q[i], c_off_a[cj], floor_y)
+            r_self_w = wp.quat_rotate(qi, off_a)
+            n_hat = wp.vec3(0.0, 1.0, 0.0)
+            j_lin = n_hat
+            j_ang = wp.cross(r_self_w, n_hat)
+            C = (xi[1] + r_self_w[1]) - anchor[1]   # floor_y = anchor.y
+            n_for_G = n_hat
+            have_G = True
         elif t == CONTACT_TANGENT_6DOF:
-            tangent = c_world_anchor[cj]
-            # Sibling-of-floor (single body) vs. sibling-of-box-box (two bodies)
-            # — c_body_b[cj] = -1 marks the floor-friction case.
+            tangent = anchor
             bb = c_body_b[cj]
             if bb < 0:
-                # Floor friction: C = t̂ · (x_a + R_a · off_a).
-                j_lin, j_ang = tangent_J(q[i], c_off_a[cj], tangent)
-                r_world = x[i] + wp.quat_rotate(q[i], c_off_a[cj])
-                C = wp.dot(tangent, r_world)
+                # Floor friction: single body, anchor on `i`.
+                r_self_w = wp.quat_rotate(qi, off_a)
+                j_lin = tangent
+                j_ang = wp.cross(r_self_w, tangent)
+                C = wp.dot(tangent, xi + r_self_w)
             else:
-                # Box-box friction: C = t̂ · (r_a − r_b). Per-body Jacobian
-                # flips sign on the linear component and uses each body's own
-                # body-local anchor for the torque arm.
                 ba = c_body_a[cj]
-                r_a = x[ba] + wp.quat_rotate(q[ba], c_off_a[cj])
-                r_b = x[bb] + wp.quat_rotate(q[bb], c_off_b[cj])
-                C = wp.dot(tangent, r_a - r_b)
+                off_b = c_off_b[cj]
+                # Both r_a_w and r_b_w needed for C; pick whichever is "self"
+                # for J + G.
                 if ba == i:
-                    j_lin, j_ang = tangent_J(q[i], c_off_a[cj], tangent)
+                    r_self_w = wp.quat_rotate(qi, off_a)
+                    r_other_w = wp.quat_rotate(q[bb], off_b)
+                    C = wp.dot(tangent,
+                               (xi + r_self_w) - (x[bb] + r_other_w))
+                    j_lin = tangent
+                    j_ang = wp.cross(r_self_w, tangent)
                 else:
+                    r_other_w = wp.quat_rotate(q[ba], off_a)
+                    r_self_w = wp.quat_rotate(qi, off_b)
+                    C = wp.dot(tangent,
+                               (x[ba] + r_other_w) - (xi + r_self_w))
                     j_lin = -tangent
-                    j_ang = -wp.cross(wp.quat_rotate(q[i], c_off_b[cj]), tangent)
+                    j_ang = -wp.cross(r_self_w, tangent)
+            n_for_G = tangent
+            have_G = True
         elif t == PIN_6DOF:
-            axis = c_body_b[cj]  # we encode the axis index here for PIN rows
-            j_lin, j_ang = pin_axis_J(q[i], c_off_a[cj], axis)
-            C = eval_pin_axis(x[i], q[i], c_off_a[cj], c_world_anchor[cj], axis)
+            axis = c_body_b[cj]
+            r_self_w = wp.quat_rotate(qi, off_a)
+            world_anchor_pt = xi + r_self_w
+            if axis == 0:
+                n_hat = wp.vec3(1.0, 0.0, 0.0)
+                C = world_anchor_pt[0] - anchor[0]
+            elif axis == 1:
+                n_hat = wp.vec3(0.0, 1.0, 0.0)
+                C = world_anchor_pt[1] - anchor[1]
+            else:
+                n_hat = wp.vec3(0.0, 0.0, 1.0)
+                C = world_anchor_pt[2] - anchor[2]
+            j_lin = n_hat
+            j_ang = wp.cross(r_self_w, n_hat)
+            n_for_G = n_hat
+            have_G = True
         elif t == BOX_BOX_CONTACT_6DOF:
-            # AVBD Eq. 15 normal row with body-local anchors:
-            #   C = n̂ · (x_a + R_a·off_a − x_b − R_b·off_b)
-            # n̂ is stored in c_world_anchor[cj] (held constant across the step,
-            # cached at frame start by the CPU-side SAT).
             ba = c_body_a[cj]
             bb = c_body_b[cj]
-            n_hat = c_world_anchor[cj]
-            C = eval_box_box_C(x[ba], q[ba], c_off_a[cj],
-                               x[bb], q[bb], c_off_b[cj], n_hat)
+            n_hat = anchor   # stored constant during step
+            off_b = c_off_b[cj]
             if ba == i:
+                r_self_w = wp.quat_rotate(qi, off_a)
+                r_other_w = wp.quat_rotate(q[bb], off_b)
+                C = wp.dot(n_hat,
+                           (xi + r_self_w) - (x[bb] + r_other_w))
                 j_lin = n_hat
-                j_ang = wp.cross(wp.quat_rotate(q[i], c_off_a[cj]), n_hat)
+                j_ang = wp.cross(r_self_w, n_hat)
             else:
+                r_other_w = wp.quat_rotate(q[ba], off_a)
+                r_self_w = wp.quat_rotate(qi, off_b)
+                C = wp.dot(n_hat,
+                           (x[ba] + r_other_w) - (xi + r_self_w))
                 j_lin = -n_hat
-                j_ang = -wp.cross(wp.quat_rotate(q[i], c_off_b[cj]), n_hat)
+                j_ang = -wp.cross(r_self_w, n_hat)
+            n_for_G = n_hat
+            have_G = True
 
         # Eq. 18 stabilized C for hard constraints.
-        s = c_stiffness[cj]
-        if s >= wp.inf:
+        hard = s >= wp.inf
+        if hard:
             C = C - c_alpha_C0[cj]
 
         lam_eff = c_lambda[cj]
-        if not (s >= wp.inf):
+        if not hard:
             lam_eff = 0.0
 
         # Force magnitude — clamp differs for tangent (friction cone) vs others.
         if t == CONTACT_TANGENT_6DOF:
             sib = c_sibling[cj]
             mu = c_friction[cj]
+            if c_was_static[sib] != 0:
+                mu = c_friction_static[cj]
             bound = mu * wp.abs(c_lambda[sib])
-            f = wp.clamp(c_penalty[cj] * C + lam_eff, -bound, bound)
+            f = wp.clamp(k_p * C + lam_eff, -bound, bound)
         else:
-            f = wp.clamp(c_penalty[cj] * C + lam_eff, c_fmin[cj], c_fmax[cj])
+            f = wp.clamp(k_p * C + lam_eff, c_fmin[cj], c_fmax[cj])
 
-        # Accumulate into LHS / RHS (6×6 outer J·k·J^T → split into the three
-        # 3×3 blocks A, B, D).
-        k_p = c_penalty[cj]
+        # LHS accumulation (J·k·J^T outer products split into A/B/D 3×3).
         A = A + outer3(j_lin, j_lin) * k_p
         B = B + outer3(j_ang, j_lin) * k_p
         D = D + outer3(j_ang, j_ang) * k_p
-        # Geometric stiffness (AVBD Eq. 17, 2D ref solver.cpp:188).
-        # For pin/floor/box-box rows, C is linear in x but quadratic-in-θ
-        # via R(q)·off. The second derivative ∂²C/∂θ² has magnitude ~|r|·|f|
-        # where r = R·off is the body-local offset rotated to world. Without
-        # this term the iteration is Gauss-Newton — it ignores the curvature
-        # of C in θ, so large angular updates overshoot, fail to converge,
-        # and pump energy into rotation each frame (a pinned cube spins up
-        # to the angular-speed cap within ~0.5 s). We use the 2D ref's
-        # diagonal-lumped approximation: add |r|·|f|·I to the D block.
-        # Skip tangent rows (the friction force already saturates at μ·|λ_n|
-        # so |f| stays bounded and G would add unnecessary stiffness).
-        # Geometric stiffness G — AVBD Eq. 17 / 2D ref solver.cpp:188.
-        # ONLY applied to PIN_6DOF. The 2D reference deliberately discards
-        # the second-order term for contact manifolds (manifold.cpp:75
-        # comment: "we discard the second order term, since it is
-        # insignificant for contacts"). For joints/pins it is essential —
-        # without it large angular motion produces a poor linearization
-        # and a free-rotation pin spins itself up to the cap within ~1 s.
-        # For contacts (floor / box-box) adding G actually injects energy
-        # via over-stiffening of the angular block under corner-contact
-        # with body spin; matches what we observed empirically.
-        if t == PIN_6DOF:
-            r_off = wp.quat_rotate(q[i], c_off_a[cj])
-            # Per-axis lumped diagonal of |f|·H_θθ. For pin row k
-            # (e_axis = e_k): H_ij = (1/2)(δ_ik off[j] + δ_jk off[i])
-            #                       − off[k] δ_ij. Column norms below.
-            f_mag = wp.abs(f)
-            gx = (wp.abs(r_off[1]) + wp.abs(r_off[2])) * 0.5 * f_mag
-            gy = (wp.abs(r_off[0]) + wp.abs(r_off[2])) * 0.5 * f_mag
-            gz = (wp.abs(r_off[0]) + wp.abs(r_off[1])) * 0.5 * f_mag
-            D = D + wp.mat33(gx, 0.0, 0.0,
-                             0.0, gy, 0.0,
-                             0.0, 0.0, gz)
+
+        # G column-norm diagonal (AVBD Eq 17 + Sec 3.5). r_self_w is the body-
+        # local anchor on `i` after rotation — already computed above, no
+        # extra quat_rotate here.
+        f_mag = wp.abs(f)
+        if f_mag > 0.0 and have_G:
+            g_diag = geom_stiffness_diag(n_for_G, r_self_w) * f_mag
+            D = D + wp.mat33(g_diag[0], 0.0, 0.0,
+                             0.0, g_diag[1], 0.0,
+                             0.0, 0.0, g_diag[2])
         r_lin = r_lin + j_lin * f
         r_ang = r_ang + j_ang * f
 
@@ -492,6 +567,8 @@ def dual_update_6dof(
     c_fracture: wp.array(dtype=float),
     c_sibling: wp.array(dtype=int),
     c_friction: wp.array(dtype=float),
+    c_friction_static: wp.array(dtype=float),
+    c_was_static: wp.array(dtype=int),
     beta: float,
 ):
     j = wp.tid()
@@ -530,8 +607,16 @@ def dual_update_6dof(
 
     lam_min = c_fmin[j]
     lam_max = c_fmax[j]
-    if t == CONTACT_TANGENT_6DOF:
-        bound = c_friction[j] * wp.abs(c_lambda[c_sibling[j]])
+    is_tangent = (t == CONTACT_TANGENT_6DOF)
+    sib = -1
+    used_static = False
+    if is_tangent:
+        sib = c_sibling[j]
+        mu = c_friction[j]
+        if c_was_static[sib] != 0:
+            mu = c_friction_static[j]
+            used_static = True
+        bound = mu * wp.abs(c_lambda[sib])
         lam_min = -bound
         lam_max = bound
     new_lam = wp.clamp(c_penalty[j] * C + lam_eff, lam_min, lam_max)
@@ -546,6 +631,190 @@ def dual_update_6dof(
     if new_lam > lam_min and new_lam < lam_max:
         upper = wp.min(PENALTY_MAX, s)
         c_penalty[j] = wp.min(c_penalty[j] + beta * wp.abs(C), upper)
+    elif is_tangent and used_static:
+        # Static-friction clamp activated → ||λ_tb|| would exceed μ_s·|λ_n|.
+        # AVBD Sec 3.3: "we immediately switch to dynamic friction using
+        # μ = μ_d." Write c_was_static = 0 on the SHARED normal-row slot so
+        # both tangent partners pick up the dynamic μ on subsequent iters /
+        # frames. Single-writer here (dual is the only one that writes
+        # c_was_static during the iter loop); partner-tangent dual launches
+        # may race but they all want to write 0 → idempotent.
+        c_was_static[sib] = 0
+
+
+# -----------------------------------------------------------------------------
+# Fused substep prelude — combines warmstart_duals + update_static_friction +
+# main-pass cache_alpha_C0 into a single dim=n_c launch.
+# -----------------------------------------------------------------------------
+# Profiling showed each of the three small kernels was ~95% launch-overhead
+# (~18 μs Python launch vs ~0.01 μs/constraint compute). Fusing into one
+# kernel saves 2 launches per substep × 8 substeps = 16 launches per step
+# (~320 μs at 20 μs launch overhead each).
+#
+# Ordering inside the kernel matches the unfused sequence:
+#   1. warmstart: decay λ by α·γ (or 0 for post-stab), grow k toward γ·k
+#   2. static friction: read decayed λ_t, λ_b, compare to μ_s·|λ_n|
+#   3. cache α·C0 for main iter (post-stab α=0 still uses the separate
+#      cache_alpha_C0_6dof launch — see _step_one).
+@wp.kernel
+def substep_prelude_6dof(
+    # state (read-only)
+    x_initial: wp.array(dtype=wp.vec3),
+    q_initial: wp.array(dtype=wp.quat),
+    # constraint structure
+    c_type: wp.array(dtype=int),
+    c_body_a: wp.array(dtype=int),
+    c_body_b: wp.array(dtype=int),
+    c_world_anchor: wp.array(dtype=wp.vec3),
+    c_off_a: wp.array(dtype=wp.vec3),
+    c_off_b: wp.array(dtype=wp.vec3),
+    c_rest: wp.array(dtype=float),
+    c_stiffness: wp.array(dtype=float),
+    c_sibling: wp.array(dtype=int),
+    c_partner: wp.array(dtype=int),
+    c_friction_static: wp.array(dtype=float),
+    # in/out
+    c_lambda: wp.array(dtype=float),
+    c_penalty: wp.array(dtype=float),
+    c_active: wp.array(dtype=int),
+    c_was_static: wp.array(dtype=int),
+    c_alpha_C0: wp.array(dtype=float),
+    # scalars
+    alpha: float,
+    gamma: float,
+    post_stabilize: int,
+    main_alpha: float,
+):
+    j = wp.tid()
+    # --- 1. warmstart decay (Eq 19) ---
+    k_floor = PENALTY_MIN
+    if c_type[j] == CONTACT_TANGENT_6DOF:
+        k_floor = PENALTY_MIN_TANGENT
+    p = wp.clamp(c_penalty[j] * gamma, k_floor, PENALTY_MAX)
+    if post_stabilize == 0:
+        c_lambda[j] = c_lambda[j] * alpha * gamma
+    s = c_stiffness[j]
+    if not wp.isnan(s) and s < wp.inf:
+        p = wp.min(p, s)
+    c_penalty[j] = p
+
+    # --- 2. static-friction check (Sec 3.3) — only on TANGENT rows ---
+    if c_type[j] == CONTACT_TANGENT_6DOF and c_active[j] != 0:
+        sib = c_sibling[j]
+        if sib >= 0 and c_active[sib] != 0:
+            partner = c_partner[j]
+            # Process each (t,b) pair once on the lower-index tangent.
+            if partner < 0 or partner >= j:
+                lam_n = wp.abs(c_lambda[sib])
+                if lam_n < 1.0e-9:
+                    c_was_static[sib] = 0
+                else:
+                    lam_t = c_lambda[j]
+                    lam_b = float(0.0)
+                    if partner >= 0:
+                        lam_b = c_lambda[partner]
+                    lam_tb = wp.sqrt(lam_t * lam_t + lam_b * lam_b)
+                    mu_s = c_friction_static[j]
+                    if lam_tb <= mu_s * lam_n:
+                        c_was_static[sib] = 1
+                    else:
+                        c_was_static[sib] = 0
+
+    # --- 3. cache α·C0 for main iter (Eq 18) ---
+    if c_active[j] == 0:
+        c_alpha_C0[j] = 0.0
+        return
+    t = c_type[j]
+    C0 = float(0.0)
+    unilateral = False
+    if t == FLOOR_CONTACT_6DOF:
+        floor_y = c_world_anchor[j][1]
+        C0 = eval_floor_C(x_initial[c_body_a[j]], q_initial[c_body_a[j]],
+                          c_off_a[j], floor_y)
+        unilateral = True
+    elif t == CONTACT_TANGENT_6DOF:
+        tangent = c_world_anchor[j]
+        bb = c_body_b[j]
+        if bb < 0:
+            r_world = x_initial[c_body_a[j]] + wp.quat_rotate(
+                q_initial[c_body_a[j]], c_off_a[j])
+            c_alpha_C0[j] = wp.dot(tangent, r_world)
+        else:
+            r_a = x_initial[c_body_a[j]] + wp.quat_rotate(
+                q_initial[c_body_a[j]], c_off_a[j])
+            r_b = x_initial[bb] + wp.quat_rotate(q_initial[bb], c_off_b[j])
+            c_alpha_C0[j] = wp.dot(tangent, r_a - r_b)
+        return
+    elif t == PIN_6DOF:
+        axis = c_body_b[j]
+        C0 = eval_pin_axis(x_initial[c_body_a[j]], q_initial[c_body_a[j]],
+                           c_off_a[j], c_world_anchor[j], axis)
+    elif t == BOX_BOX_CONTACT_6DOF:
+        n_hat = c_world_anchor[j]
+        C0 = eval_box_box_C(x_initial[c_body_a[j]], q_initial[c_body_a[j]],
+                            c_off_a[j],
+                            x_initial[c_body_b[j]], q_initial[c_body_b[j]],
+                            c_off_b[j], n_hat)
+        unilateral = True
+    if unilateral and C0 > 0.0:
+        c_alpha_C0[j] = 0.0
+    else:
+        c_alpha_C0[j] = main_alpha * C0
+
+
+# -----------------------------------------------------------------------------
+# Static-friction state update (AVBD Sec 3.3) — runs once per substep at start
+# -----------------------------------------------------------------------------
+# For each NORMAL contact row N with at least one tangent partner-pair (t,b)
+# pointing back at it via c_sibling, this kernel reads the previous frame's
+# (λ_t, λ_b) from those tangent rows and writes:
+#   c_was_static[N] = 1  if ||λ_tb|| ≤ μ_s · |λ_n|  (within bound → static OK)
+#   c_was_static[N] = 0  otherwise                  (was sliding → dynamic)
+#
+# The kernel is launched per-row, gated to TANGENT rows that own the
+# "lower" half of a partner pair (c_partner[j] > j), so each pair is
+# evaluated exactly once. If the row has no partner (1-D floor friction in
+# a single tangent direction — pre-OBB code), it falls back to checking
+# |λ_t| alone.
+@wp.kernel
+def update_static_friction_6dof(
+    c_type: wp.array(dtype=int),
+    c_lambda: wp.array(dtype=float),
+    c_sibling: wp.array(dtype=int),
+    c_partner: wp.array(dtype=int),
+    c_friction_static: wp.array(dtype=float),
+    c_active: wp.array(dtype=int),
+    c_was_static: wp.array(dtype=int),
+):
+    j = wp.tid()
+    if c_type[j] != CONTACT_TANGENT_6DOF:
+        return
+    if c_active[j] == 0:
+        return
+    sib = c_sibling[j]
+    if sib < 0:
+        return
+    if c_active[sib] == 0:
+        c_was_static[sib] = 0
+        return
+    partner = c_partner[j]
+    # Process each (t,b) pair once on the lower-index tangent.
+    if partner >= 0 and partner < j:
+        return
+    lam_n = wp.abs(c_lambda[sib])
+    if lam_n < 1.0e-9:
+        c_was_static[sib] = 0
+        return
+    lam_t = c_lambda[j]
+    lam_b = float(0.0)
+    if partner >= 0:
+        lam_b = c_lambda[partner]
+    lam_tb = wp.sqrt(lam_t * lam_t + lam_b * lam_b)
+    mu_s = c_friction_static[j]
+    if lam_tb <= mu_s * lam_n:
+        c_was_static[sib] = 1
+    else:
+        c_was_static[sib] = 0
 
 
 # -----------------------------------------------------------------------------
@@ -679,3 +948,265 @@ def cap_velocity_6dof(
     sa = wp.length(omega[i])
     if sa > max_ang:
         omega[i] = omega[i] * (max_ang / sa)
+
+
+# -----------------------------------------------------------------------------
+# Fused finalize_velocity + cap — saves 1 launch per substep (~15 μs CPU).
+# When max_lin/max_ang are set to wp.inf the cap branch is a no-op.
+# -----------------------------------------------------------------------------
+@wp.kernel
+def finalize_and_cap_6dof(
+    x: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.quat),
+    x_initial: wp.array(dtype=wp.vec3),
+    q_initial: wp.array(dtype=wp.quat),
+    mass: wp.array(dtype=float),
+    dt: float,
+    max_lin: float,
+    max_ang: float,
+    v: wp.array(dtype=wp.vec3),
+    omega: wp.array(dtype=wp.vec3),
+    prev_v: wp.array(dtype=wp.vec3),
+    prev_omega: wp.array(dtype=wp.vec3),
+):
+    i = wp.tid()
+    prev_v[i] = v[i]
+    prev_omega[i] = omega[i]
+    if mass[i] > 0.0:
+        new_v = (x[i] - x_initial[i]) / dt
+        dq = wp.mul(q[i], wp.quat_inverse(q_initial[i]))
+        new_w = quat_to_rotvec(dq) / dt
+        # Apply velocity cap inline.
+        sl = wp.length(new_v)
+        if sl > max_lin:
+            new_v = new_v * (max_lin / sl)
+        sa = wp.length(new_w)
+        if sa > max_ang:
+            new_w = new_w * (max_ang / sa)
+        v[i] = new_v
+        omega[i] = new_w
+
+
+# =============================================================================
+# Broadphase + parallel SAT  (AVBD Alg 1 line 1 — LBVH broadphase)
+# =============================================================================
+# Pipeline:
+#   1. compute_body_aabb_6dof   — per body, world-axis AABB from OBB+R
+#   2. wp.Bvh(...).rebuild()    — host-side LBVH build over those AABBs
+#   3. bvh_broadphase_pairs     — per body, query BVH, atomic-append candidate
+#                                 (i, j) pairs to a fixed-size buffer
+#   4. obb_sat_pairs            — per candidate pair, 15-axis SAT, write
+#                                 (overlap, sat_idx, n_hat, depth)
+#   5. CPU                      — for each overlapping pair, run Python
+#                                 Sutherland-Hodgman face-clip to emit up
+#                                 to 4 BOX_BOX_CONTACT_6DOF rows + tangents.
+#
+# Steps 1–4 replace the previous Python O(N²) loop. Face-clip stays in Python
+# because variable-length polygon output is awkward in Warp; it now runs on
+# ~25 confirmed pairs per substep (instead of all O(N²) sphere-passing pairs).
+
+@wp.kernel
+def compute_body_aabb_6dof(
+    x: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.quat),
+    half_extents: wp.array(dtype=wp.vec3),
+    margin: float,
+    aabb_lo: wp.array(dtype=wp.vec3),
+    aabb_hi: wp.array(dtype=wp.vec3),
+):
+    """World-axis AABB of an OBB. Each AABB half-extent along world axis k is
+    Σ_j |R[k,j]| · he[j] — the standard OBB→AABB projection. ``margin``
+    inflates the box on every side so the broadphase keeps grazing pairs
+    (the warm-start cache wants their λ to persist across brief separations)."""
+    i = wp.tid()
+    c = x[i]
+    he = half_extents[i]
+    R = wp.quat_to_matrix(q[i])
+    ex = wp.abs(R[0, 0]) * he[0] + wp.abs(R[0, 1]) * he[1] + wp.abs(R[0, 2]) * he[2] + margin
+    ey = wp.abs(R[1, 0]) * he[0] + wp.abs(R[1, 1]) * he[1] + wp.abs(R[1, 2]) * he[2] + margin
+    ez = wp.abs(R[2, 0]) * he[0] + wp.abs(R[2, 1]) * he[1] + wp.abs(R[2, 2]) * he[2] + margin
+    aabb_lo[i] = c - wp.vec3(ex, ey, ez)
+    aabb_hi[i] = c + wp.vec3(ex, ey, ez)
+
+
+@wp.kernel
+def bvh_broadphase_pairs(
+    bvh_id: wp.uint64,
+    aabb_lo: wp.array(dtype=wp.vec3),
+    aabb_hi: wp.array(dtype=wp.vec3),
+    mass: wp.array(dtype=float),
+    pair_count: wp.array(dtype=int),   # atomic counter, length 1
+    pair_a: wp.array(dtype=int),
+    pair_b: wp.array(dtype=int),
+    max_pairs: int,
+):
+    """Per body i, query the BVH for AABB overlaps. Emits each ordered pair
+    (i, j) with i < j exactly once into pair_a/pair_b via wp.atomic_add on
+    pair_count[0]. Pairs where both bodies are static are skipped (they were
+    already pre-pinned by their floor rows).
+
+    When pair_count[0] exceeds max_pairs the extras are simply dropped — the
+    Python caller checks and grows the buffer next frame."""
+    i = wp.tid()
+    lo = aabb_lo[i]
+    hi = aabb_hi[i]
+    m_i = mass[i]
+    query = wp.bvh_query_aabb(bvh_id, lo, hi)
+    j = int(0)
+    while wp.bvh_query_next(query, j):
+        if j <= i:
+            continue
+        if m_i <= 0.0 and mass[j] <= 0.0:
+            continue
+        slot = wp.atomic_add(pair_count, 0, 1)
+        if slot < max_pairs:
+            pair_a[slot] = i
+            pair_b[slot] = j
+
+
+@wp.func
+def obb_proj_radius3(L: wp.vec3, c0: wp.vec3, c1: wp.vec3, c2: wp.vec3, he: wp.vec3) -> float:
+    """Projection radius of an OBB onto axis L (|L|=1). Standard SAT term:
+    r = Σ_k he[k] · |L · R[:,k]|.
+
+    Takes R's columns as pre-extracted vec3s so callers that loop over
+    multiple SAT axes don't rebuild them 15 times per pair."""
+    return he[0] * wp.abs(wp.dot(L, c0)) + he[1] * wp.abs(wp.dot(L, c1)) + he[2] * wp.abs(wp.dot(L, c2))
+
+
+@wp.kernel
+def obb_sat_pairs(
+    x: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.quat),
+    half_extents: wp.array(dtype=wp.vec3),
+    pair_a: wp.array(dtype=int),
+    pair_b: wp.array(dtype=int),
+    n_pairs: int,
+    margin: float,
+    # outputs (one entry per pair)
+    pair_overlap: wp.array(dtype=int),    # 1 if within margin, 0 otherwise
+    pair_sat_idx: wp.array(dtype=int),    # 0–14 (3 face A, 3 face B, 9 edge×edge)
+    pair_n_hat: wp.array(dtype=wp.vec3),  # unit normal from B to A
+    pair_depth: wp.array(dtype=float),    # min overlap along best axis
+):
+    """Parallel 15-axis SAT over candidate pairs. Mirrors the CPU _obb_sat
+    in solver_6dof.py but vectorized across pairs. Output is fed into the
+    Python face-clip pipeline for the actual contact-point emission."""
+    p = wp.tid()
+    if p >= n_pairs:
+        return
+    i = pair_a[p]
+    j = pair_b[p]
+
+    c_A = x[i]
+    c_B = x[j]
+    e_A = half_extents[i]
+    e_B = half_extents[j]
+    R_A = wp.quat_to_matrix(q[i])
+    R_B = wp.quat_to_matrix(q[j])
+    t = c_B - c_A
+
+    # Pre-extract each rotation matrix's columns once. The SAT loop uses
+    # each column up to 15 times (in obb_proj_radius and the edge-edge
+    # cross-product loop); rebuilding the vec3 from R[i,k] on every call
+    # was 45 redundant mat33-element loads per pair.
+    A0 = wp.vec3(R_A[0, 0], R_A[1, 0], R_A[2, 0])
+    A1 = wp.vec3(R_A[0, 1], R_A[1, 1], R_A[2, 1])
+    A2 = wp.vec3(R_A[0, 2], R_A[1, 2], R_A[2, 2])
+    B0 = wp.vec3(R_B[0, 0], R_B[1, 0], R_B[2, 0])
+    B1 = wp.vec3(R_B[0, 1], R_B[1, 1], R_B[2, 1])
+    B2 = wp.vec3(R_B[0, 2], R_B[1, 2], R_B[2, 2])
+
+    eps = 1.0e-6
+    best_overlap = 1.0e20
+    best_idx = -1
+    best_axis = wp.vec3(0.0, 0.0, 0.0)
+
+    # 3 face axes from A — L is A's own column k, so projection radius rA = e_A[k].
+    for k in range(3):
+        if k == 0:
+            L = A0
+        elif k == 1:
+            L = A1
+        else:
+            L = A2
+        rA = e_A[k]
+        rB = obb_proj_radius3(L, B0, B1, B2, e_B)
+        t_dot_L = wp.dot(t, L)
+        sep = wp.abs(t_dot_L)
+        ov = rA + rB - sep
+        if ov < -margin:
+            pair_overlap[p] = 0
+            return
+        if ov < best_overlap:
+            best_overlap = ov
+            best_idx = k
+            if t_dot_L > 0.0:
+                best_axis = -L
+            else:
+                best_axis = L
+
+    # 3 face axes from B
+    for k in range(3):
+        if k == 0:
+            L = B0
+        elif k == 1:
+            L = B1
+        else:
+            L = B2
+        rA = obb_proj_radius3(L, A0, A1, A2, e_A)
+        rB = e_B[k]
+        t_dot_L = wp.dot(t, L)
+        sep = wp.abs(t_dot_L)
+        ov = rA + rB - sep
+        if ov < -margin:
+            pair_overlap[p] = 0
+            return
+        if ov < best_overlap:
+            best_overlap = ov
+            best_idx = 3 + k
+            if t_dot_L > 0.0:
+                best_axis = -L
+            else:
+                best_axis = L
+
+    # 9 edge × edge cross products
+    for i_e in range(3):
+        if i_e == 0:
+            A_col = A0
+        elif i_e == 1:
+            A_col = A1
+        else:
+            A_col = A2
+        for j_e in range(3):
+            if j_e == 0:
+                B_col = B0
+            elif j_e == 1:
+                B_col = B1
+            else:
+                B_col = B2
+            L = wp.cross(A_col, B_col)
+            n_len = wp.length(L)
+            if n_len < eps:
+                continue   # parallel edges — degenerate axis
+            L = L / n_len
+            rA = obb_proj_radius3(L, A0, A1, A2, e_A)
+            rB = obb_proj_radius3(L, B0, B1, B2, e_B)
+            t_dot_L = wp.dot(t, L)
+            sep = wp.abs(t_dot_L)
+            ov = rA + rB - sep
+            if ov < 0.0:
+                pair_overlap[p] = 0
+                return
+            if ov < best_overlap:
+                best_overlap = ov
+                best_idx = 6 + 3 * i_e + j_e
+                if t_dot_L > 0.0:
+                    best_axis = -L
+                else:
+                    best_axis = L
+
+    pair_overlap[p] = 1
+    pair_sat_idx[p] = best_idx
+    pair_n_hat[p] = best_axis
+    pair_depth[p] = best_overlap

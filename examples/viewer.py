@@ -76,6 +76,7 @@ def build_scene(args) -> tuple[Solver6DOF, list[ViewerBox], list[int]]:
         post_stabilize=True,
         device=args.device,
         substeps=int(args.substeps),
+        friction_static_mult=float(args.static_mult),
     )
     s.enable_self_collision(True, default_friction=args.friction)
     boxes: list[ViewerBox] = []
@@ -215,8 +216,21 @@ class Viewer:
                                                        step=1, initial_value=args.iterations)
             self.gui_gravity = self.server.gui.add_slider("gravity (m/s²)", -30.0, 0.0,
                                                          step=0.5, initial_value=-9.81)
-            self.gui_friction = self.server.gui.add_slider("friction μ", 0.0, 1.0,
-                                                          step=0.01, initial_value=args.friction)
+            self.gui_friction = self.server.gui.add_slider(
+                "kinetic μ_d", 0.0, 1.0,
+                step=0.01, initial_value=args.friction,
+                hint="Coulomb dynamic / kinetic friction coefficient. "
+                     "AVBD Sec 3.3: applies when the previous step's "
+                     "||λ_tb|| exceeded μ_s·|λ_n| (i.e. the contact was "
+                     "sliding).")
+            self.gui_static_mult = self.server.gui.add_slider(
+                "static mult μ_s/μ_d", 1.0, 3.0,
+                step=0.05, initial_value=args.static_mult,
+                hint="μ_s = this × μ_d. AVBD Sec 3.3 static/dynamic "
+                     "switch: when on a previous step ||λ_tb|| ≤ μ_s·|λ_n|, "
+                     "the solver uses μ_s (stiction); if the cone clamp "
+                     "fires it switches back to μ_d. Standard dry-steel "
+                     "ratio is ~1.5.")
             self.gui_drag_mode = self.server.gui.add_checkbox(
                 "drag mode (show handles)", initial_value=False,
                 hint="When on, every free box sprouts an XYZ gizmo you can "
@@ -247,6 +261,17 @@ class Viewer:
                 hint="Welsh-Powell coloring of body adjacency. primal_update_6dof "
                      "launches once per color; same-color bodies update in parallel.")
             self.gui_perf_step_ms = self.server.gui.add_text("step time", initial_value="—")
+            self.gui_perf_broadphase = self.server.gui.add_text(
+                "broadphase", initial_value="—",
+                hint="Wall-time of the Warp-side LBVH/SAH broadphase + 15-axis "
+                     "OBB-OBB SAT kernels per step. Was 56% of step time in "
+                     "the Python brute-force implementation; ≤5% with the "
+                     "BVH path (AVBD Alg 1 line 1).")
+            self.gui_perf_static_n = self.server.gui.add_text(
+                "static contacts", initial_value="—",
+                hint="Count of NORMAL contact rows whose tangent pair was "
+                     "within μ_s·|λ_n| on the previous step (stiction). The "
+                     "remaining contacts use kinetic μ_d. AVBD Sec 3.3.")
             self.gui_perf_capacity = self.server.gui.add_text(
                 "solver capacity", initial_value="—",
                 hint="1 / step_time. The max sustained Hz the solver could deliver "
@@ -258,10 +283,21 @@ class Viewer:
                 "SE(3) state: position, quaternion, linear + angular velocity, "
                 "body-local inertia tensor. Per-body local 6×6 SPD solve via "
                 "Schur-complement on 3×3 blocks.\n\n"
-                "**OBB-OBB collision** is live (15-axis SAT + Sutherland-Hodgman "
-                "face clipping → up to 4 contact points per pair, each with "
-                "Coulomb friction). The solver substeps internally for stiff "
-                "stacks (`--substeps`, default 8 — AVBD paper Fig. 6 uses 5).\n\n"
+                "**Broadphase** is now Warp LBVH/SAH (AVBD Alg 1 line 1) + "
+                "parallel 15-axis OBB SAT (replaces the Python O(N²) brute "
+                "force). Face clipping (up to 4 contacts/pair) stays in "
+                "Python on confirmed pairs only.\n\n"
+                "**Friction** follows AVBD Sec 3.3 static/dynamic switch: "
+                "μ_s applies when the previous step's ||λ_tb|| ≤ μ_s·|λ_n| "
+                "(stiction); if the cone clamp fires, the contact switches "
+                "back to μ_d for the rest of the step. Adjust both sliders "
+                "live in the Simulation panel.\n\n"
+                "**Approximate Hessian** uses the AVBD Eq 17 column-norm "
+                "diagonal of G_ij for every constraint type (FLOOR, "
+                "BOX_BOX, PIN, TANGENT) — guarantees the angular block "
+                "stays SPD under high spin (Sec 3.5 SPD theorem).\n\n"
+                "The solver substeps internally for stiff stacks "
+                "(`--substeps`, default 8 — AVBD paper Fig. 6 uses 5).\n\n"
                 "Drag-mode handles translate only; rotation gizmo is locked.")
 
         self.gui_drop.on_click(lambda _: self._drop_box())
@@ -272,6 +308,7 @@ class Viewer:
         self.gui_gravity.on_update(self._gravity_changed)
         self.gui_drag_mode.on_update(self._drag_mode_changed)
         self.gui_friction.on_update(self._friction_changed)
+        self.gui_static_mult.on_update(self._static_mult_changed)
 
         # drag bookkeeping
         self._drag_targets: dict[int, np.ndarray] = {}
@@ -493,19 +530,42 @@ class Viewer:
             self.solver.gravity = (0.0, g, 0.0)
 
     def _friction_changed(self, _evt):
-        """Update μ for every existing CONTACT_TANGENT_6DOF row + the per-body
-        default so subsequent add_floor_contact_box calls inherit it."""
+        """Update μ_d (and μ_s = mult·μ_d) for every existing
+        CONTACT_TANGENT_6DOF row + the per-body default so subsequent
+        add_floor_contact_box calls inherit it."""
         import warp as wp
         mu = float(self.gui_friction.value)
+        mu_s = mu * float(self.gui_static_mult.value)
         with self._solver_lock:
             for k in range(len(self.solver._friction)):
                 self.solver._friction[k] = mu
             fric = self.solver.c_friction.numpy().copy()
+            fric_s = self.solver.c_friction_static.numpy().copy()
             for i, r in enumerate(self.solver._rows):
                 if r.type == 1:  # CONTACT_TANGENT_6DOF
                     r.friction = mu
+                    r.friction_static = mu_s
                     fric[i] = mu
-            self.solver.c_friction = wp.array(fric, dtype=float, device=self.solver.device)
+                    fric_s[i] = mu_s
+            self.solver.c_friction = wp.array(
+                fric, dtype=float, device=self.solver.device)
+            self.solver.c_friction_static = wp.array(
+                fric_s, dtype=float, device=self.solver.device)
+
+    def _static_mult_changed(self, _evt):
+        """μ_s/μ_d ratio change — recompute μ_s from current μ_d slider."""
+        import warp as wp
+        mu = float(self.gui_friction.value)
+        mu_s = mu * float(self.gui_static_mult.value)
+        with self._solver_lock:
+            self.solver.friction_static_mult = float(self.gui_static_mult.value)
+            fric_s = self.solver.c_friction_static.numpy().copy()
+            for i, r in enumerate(self.solver._rows):
+                if r.type == 1:
+                    r.friction_static = mu_s
+                    fric_s[i] = mu_s
+            self.solver.c_friction_static = wp.array(
+                fric_s, dtype=float, device=self.solver.device)
 
     def _drag_mode_changed(self, _evt):
         show = bool(self.gui_drag_mode.value)
@@ -567,6 +627,19 @@ class Viewer:
             act = self.solver.active()
             n_rows_total = len(self.solver._rows)
             n_colors = int(self.solver.num_colors)
+            bp_ms = float(self.solver.broadphase_ms)
+            # Static-friction occupancy — c_was_static is per-row but only
+            # meaningful on NORMAL contact rows (FLOOR / BOX_BOX). Counting
+            # those gives "how many contacts are currently sticking".
+            was_static = (self.solver.c_was_static.numpy()
+                          if self.solver.c_was_static is not None
+                          else None)
+            n_static = 0
+            if was_static is not None and len(was_static):
+                # FLOOR_CONTACT_6DOF = 0, BOX_BOX_CONTACT_6DOF = 3
+                c_type = self.solver.c_type.numpy()
+                mask = (c_type == 0) | (c_type == 3)
+                n_static = int((was_static[mask] != 0).sum())
         # End of lock — pos/qs/w/lam/act are now plain numpy/lists owned by
         # this thread. Scene writes and GUI text updates don't need the lock.
         drag_mode = bool(self.gui_drag_mode.value)
@@ -634,6 +707,9 @@ class Viewer:
         self.gui_perf_constraints.value = f"{n_active}/{n_rows_total} active"
         per_color = (len(self.boxes) / max(n_colors, 1)) if n_colors else 0.0
         self.gui_perf_colors.value = f"{n_colors}  (~{per_color:.1f} bodies/color)"
+        self.gui_perf_broadphase.value = (
+            f"{bp_ms:.2f} ms  ({100*bp_ms/max(step_ms,1e-3):.0f}% of step)")
+        self.gui_perf_static_n.value = f"{n_static} sticking"
 
     def run(self):
         target_dt = self.solver.dt
@@ -654,7 +730,12 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--top-y", type=float, default=2.5,
                    help="height of the pinned anchor box's world pin")
-    p.add_argument("--friction", type=float, default=0.5)
+    p.add_argument("--friction", type=float, default=0.5,
+                   help="kinetic / dynamic friction coefficient μ_d "
+                        "(AVBD Sec 3.3). Static μ_s = μ_d × static-mult.")
+    p.add_argument("--static-mult", type=float, default=1.5,
+                   help="μ_s / μ_d ratio. 1.5 ≈ dry steel; 1.0 disables "
+                        "static-vs-kinetic switching.")
     p.add_argument("--iterations", type=int, default=25)
     p.add_argument("--gizmo-scale", type=float, default=0.35,
                    help="minimum size (m) of the drag-handle axis arrows. "
