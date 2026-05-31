@@ -65,7 +65,9 @@ def random_orientation(rng: np.random.Generator) -> tuple[float, float, float, f
 
 
 def build_scene(args) -> tuple[Solver6DOF, list[ViewerBox], list[int]]:
-    """Build a 6-DOF scene: floor + a few free rigid boxes + one pinned box.
+    """Build a 6-DOF scene: pinned anchor + a grid of cube towers + a row
+    of standing domino slabs. Stresses the OBB-OBB contact + persistent
+    augmented-Lagrangian warm-start that AVBD relies on for stable stacks.
     Returns solver, list of viewer boxes, list of pin-row indices."""
     s = Solver6DOF(
         dt=1.0 / 60.0,
@@ -79,54 +81,78 @@ def build_scene(args) -> tuple[Solver6DOF, list[ViewerBox], list[int]]:
     boxes: list[ViewerBox] = []
     rng = np.random.default_rng(seed=args.seed)
 
-    # 1. Pinned anchor box — hangs from one of its top corners pinned to a
-    #    fixed world point. Demonstrates the PIN_6DOF constraint.
-    h_anchor = (0.18, 0.18, 0.18)
-    anchor_world_pin = (0.0, args.top_y, 0.0)
-    # Place the anchor so its (h, h, h) corner sits at the world pin point.
+    def col(saturation=0.7, value=0.85):
+        h = float(rng.random())
+        # cheap HSV→RGB
+        i = int(h * 6); f = h * 6 - i
+        p = value * (1 - saturation)
+        q_v = value * (1 - f * saturation); t = value * (1 - (1 - f) * saturation)
+        return [(value, t, p), (q_v, value, p), (p, value, t),
+                (p, q_v, value), (t, p, value), (value, p, q_v)][i % 6]
+
+    # --- 1. Pinned anchor box (off to the side so it doesn't hit towers) ----
+    h_anchor = (0.16, 0.16, 0.16)
+    anchor_world_pin = (-2.0, args.top_y, -2.0)
     pos_anchor = (
         anchor_world_pin[0] - h_anchor[0],
         anchor_world_pin[1] - h_anchor[1],
         anchor_world_pin[2] - h_anchor[2],
     )
     anchor = s.add_box(pos_anchor, h_anchor, mass=1.0, friction=args.friction)
-    s.add_pin_corner(anchor, body_local=(h_anchor[0], h_anchor[1], h_anchor[2]),
-                     world_point=anchor_world_pin)
+    s.add_pin_corner(anchor, body_local=h_anchor, world_point=anchor_world_pin)
     s.add_floor_contact_box(anchor, friction=args.friction)
     boxes.append(ViewerBox(body=anchor, handle=None, tc=None,
-                           color=(0.9, 0.2, 0.2)))
+                           color=(0.9, 0.25, 0.25)))
 
-    # 2. A few free boxes scattered, with random initial spin + orientation.
-    palette = [(0.95, 0.85, 0.2), (0.3, 0.5, 0.9), (0.55, 0.85, 0.45),
-               (0.85, 0.55, 0.85)]
-    placements = [
-        ((1.2, 1.6, 0.6), (0.16, 0.16, 0.16)),
-        ((-1.1, 2.0, -0.5), (0.18, 0.18, 0.18)),
-        ((0.4, 1.2, 1.3), (0.14, 0.14, 0.14)),
-        ((-0.8, 1.4, 1.0), (0.20, 0.20, 0.20)),
-    ]
-    for i, (p, h) in enumerate(placements):
-        # Mild initial spin + small tilt — large random ICs excite the
-        # corner-on-floor contact without substepping (Fig.6 limit).
-        omega = tuple(float(v) for v in rng.uniform(-0.6, 0.6, size=3))
-        small_tilt = math.radians(15.0)
-        axis = rng.standard_normal(3)
-        axis = axis / (np.linalg.norm(axis) + 1e-9)
-        s_half = math.sin(small_tilt * float(rng.random()) / 2.0)
-        c_half = math.cos(small_tilt * float(rng.random()) / 2.0)
-        q_tilt = (float(axis[0] * s_half), float(axis[1] * s_half),
-                  float(axis[2] * s_half), float(c_half))
-        b = s.add_box(p, h, mass=1.0,
-                      orientation=q_tilt,
-                      angular_velocity=omega,
-                      friction=args.friction)
+    # --- 2. Grid of cube towers ---------------------------------------------
+    # 3×3 layout, each tower is `tower_height` cubes tall. Cube half-extent
+    # h=0.12 → full cube 24 cm. Tower spacing 0.55 m gives ~7 cm gap between
+    # towers, enough to keep them from crosstalking on the first substep but
+    # tight enough to look dense.
+    h_cube = 0.12
+    tower_height = 3
+    tower_spacing = 0.55
+    grid_n = 3
+    grid_origin = -(grid_n - 1) * tower_spacing * 0.5  # centered on origin
+    for ix in range(grid_n):
+        for iz in range(grid_n):
+            cx = grid_origin + ix * tower_spacing
+            cz = grid_origin + iz * tower_spacing
+            tower_color = col(saturation=0.55, value=0.92)
+            for k in range(tower_height):
+                # Tiny random xz offset (≤1 mm) so perfectly-aligned faces
+                # don't pin the SAT to a tiebreak axis on every frame.
+                jitter = rng.uniform(-1e-3, 1e-3, size=2)
+                cy = h_cube + 2.0 * h_cube * k  # y = h, 3h, 5h, …
+                b = s.add_box((cx + float(jitter[0]), cy, cz + float(jitter[1])),
+                              (h_cube, h_cube, h_cube),
+                              mass=1.0, friction=args.friction)
+                s.add_floor_contact_box(b, friction=args.friction)
+                # Slight per-level darkening so layers read visually.
+                shade = 1.0 - 0.06 * k
+                shaded = tuple(min(1.0, c * shade) for c in tower_color)
+                boxes.append(ViewerBox(body=b, handle=None, tc=None,
+                                       color=shaded))
+
+    # --- 3. Row of standing domino slabs ------------------------------------
+    # Thin in x (4 cm), tall in y (24 cm), medium in z (10 cm), spaced just
+    # over their height in x so toppling one cascades into the next.
+    domino_he = (0.025, 0.12, 0.06)  # half-extents → 5 × 24 × 12 cm slab
+    domino_spacing = 0.10            # x-gap between adjacent slabs
+    domino_count = 6
+    domino_z = 1.8                   # in front of the tower grid
+    domino_x0 = -(domino_count - 1) * domino_spacing * 0.5
+    for i in range(domino_count):
+        cx = domino_x0 + i * domino_spacing
+        cy = domino_he[1]            # bottom face on floor
+        b = s.add_box((cx, cy, domino_z), domino_he,
+                      mass=0.5, friction=args.friction)
         s.add_floor_contact_box(b, friction=args.friction)
-        boxes.append(ViewerBox(body=b, handle=None, tc=None,
-                               color=palette[i % len(palette)]))
+        # Alternating cool-warm palette so the row reads as dominoes.
+        c = (0.95, 0.55, 0.25) if i % 2 == 0 else (0.25, 0.55, 0.95)
+        boxes.append(ViewerBox(body=b, handle=None, tc=None, color=c))
 
-    # Stash the row indices that came from add_pin_corner so the GUI can
-    # display "anchor pinned" state. Returns 3 rows (PIN_6DOF).
-    pin_indices = []
+    pin_indices: list[int] = []
     return s, boxes, pin_indices
 
 
