@@ -1,23 +1,17 @@
-"""Interactive 3D AVBD viewer (viser, browser-based).
+"""Interactive 3D AVBD viewer — 6-DOF rigid body edition (viser, browser-based).
 
-Opens a viser server and a scene with:
-
-  - A ground plane at y=0 (with a real one-sided contact constraint).
-  - Sphere / cube / pillar primitives for each body (the solver still treats
-    them as point masses; rotations are next-iteration work).
-  - A pinned anchor rendered as a red pillar.
-  - **Transform-control gizmos** on every dynamic body so you can DRAG them
-    in 3D and the simulator follows in real time.
-  - GUI panel: pause, reset, kick all, drop a fresh cube, fracture threshold
-    slider, gravity / iterations sliders.
+Drives `Solver6DOF`. Each body is a full rigid box with orientation; the floor
+is the only collision target right now (body-body OBB-OBB contact is the next
+milestone). The pinned box hangs from a single body-local corner.
 
 Run:
 
     uv run python examples/viewer.py
     # open http://localhost:8080 in a browser (URL also printed on stdout)
 
-Drag a body's gizmo to pull it around; release to let it fall back. Lower the
-threshold slider to break the chain. Drop boxes on the chain to load it.
+Drag a body's gizmo to teleport it; release to let it fall. The orientation
+gizmo is rotation-locked — only translation is interactive. The particle
+chain demo lives in examples/viewer_particles.py.
 """
 
 from __future__ import annotations
@@ -30,103 +24,110 @@ from dataclasses import dataclass
 
 import numpy as np
 import viser
-from viser import transforms as vt
 
-from avbd3d import Body, Shape, Solver
+from avbd3d import Solver6DOF, RigidBody
 
 
 # -----------------------------------------------------------------------------
-# Scene description (separate from solver — viewer reads this each tick).
+# Scene description
 # -----------------------------------------------------------------------------
 @dataclass
-class ViewerBody:
-    body: Body
-    handle: object  # viser scene handle (Icosphere / Box / Cylinder)
-    tc: object | None  # transform-control gizmo, if interactive
-    bottom_offset: float = 0.0  # distance from body centre to its bottom (so the
-                                # visual primitive doesn't clip through the floor)
+class ViewerBox:
+    body: RigidBody
+    handle: object  # viser scene Box handle
+    tc: object | None
+    color: tuple[float, float, float]
+    is_static: bool = False  # mass=0; never moves
 
 
-def _bottom_offset(shape: Shape) -> float:
-    """Distance from body centre to its visual bottom. We raise the floor by
-    this amount per body so the primitive sits cleanly on y=0."""
-    if shape.kind == "sphere":
-        return float(shape.size[0])
-    if shape.kind == "cube":
-        return float(shape.size[1])  # half-extent on Y
-    if shape.kind == "pillar":
-        return float(shape.size[1])  # half-height on Y
-    return 0.0
+def warp_q_to_viser_wxyz(q_xyzw: np.ndarray) -> tuple[float, float, float, float]:
+    """Warp wp.quat is XYZW; viser's add_box `wxyz` is W-first. Convert."""
+    qx, qy, qz, qw = float(q_xyzw[0]), float(q_xyzw[1]), float(q_xyzw[2]), float(q_xyzw[3])
+    return (qw, qx, qy, qz)
 
 
-def build_scene(args) -> tuple[Solver, list[ViewerBody], list]:
-    """Build a chain + a couple of free cubes/spheres so the user has things to
-    play with. Returns solver, list of viewer bodies, list of distance handles."""
-    s = Solver(
+def random_orientation(rng: np.random.Generator) -> tuple[float, float, float, float]:
+    """Uniform random unit quaternion (XYZW) — Marsaglia's method."""
+    while True:
+        s1 = 2.0 * rng.random() - 1.0
+        s2 = 2.0 * rng.random() - 1.0
+        d1 = s1 * s1 + s2 * s2
+        if d1 < 1.0:
+            break
+    while True:
+        s3 = 2.0 * rng.random() - 1.0
+        s4 = 2.0 * rng.random() - 1.0
+        d2 = s3 * s3 + s4 * s4
+        if d2 < 1.0:
+            break
+    s = math.sqrt((1.0 - d1) / d2)
+    return (float(s1), float(s2), float(s3 * s), float(s4 * s))
+
+
+def build_scene(args) -> tuple[Solver6DOF, list[ViewerBox], list[int]]:
+    """Build a 6-DOF scene: floor + a few free rigid boxes + one pinned box.
+    Returns solver, list of viewer boxes, list of pin-row indices."""
+    s = Solver6DOF(
         dt=1.0 / 60.0,
         iterations=int(args.iterations),
         gravity=(0.0, -9.81, 0.0),
         post_stabilize=True,
-        device="cpu",
+        device=args.device,
+        substeps=int(args.substeps),
     )
-
-    bodies: list[ViewerBody] = []
-    link = args.link
-    top = (0.0, args.top_y, 0.0)
-
-    def _add(pos, mass, shape, collide=True):
-        bo = _bottom_offset(shape)
-        b = s.add_particle(pos, mass=mass, shape=shape, collide=collide,
-                           friction=args.friction)
-        # Each body's floor is shifted up by its bottom offset → visual sits on y=0
-        s.add_floor_contact(b, floor_y=bo, friction=args.friction)
-        bodies.append(ViewerBody(body=b, handle=None, tc=None, bottom_offset=bo))
-        return b
-
-    # Pinned anchor (red sphere). Mass = 0 marks it as a TRUE static body
-    # (AVBD 2D demo convention) — predict_inertial and primal_update both
-    # early-out on m ≤ 0, so x[anchor] never updates from any source. This
-    # is the right way to model "fixed point in world space"; the PIN
-    # constraint below is redundant in that regime but harmless.
-    # collide=False also removes it from the body-body broad phase so a
-    # dropped cube can't land on top of the anchor (which was causing the
-    # red ball to visibly jitter under contact forces with mass=1).
-    anchor = _add(top, 0.0, Shape("sphere", (0.12,), color=(0.9, 0.2, 0.2)),
-                  collide=False)
-    s.add_pin(anchor, world_point=top, stiffness=math.inf)
-
-    # Chain links: blue spheres. The FIRST link (anchor → chain[1]) is the
-    # "hook" — we mark it unbreakable so the chain stays attached to the
-    # anchor; only the rope below the hook can fracture.
-    prev = anchor
-    for i in range(1, args.n + 1):
-        pos = (top[0], top[1] - i * link, top[2])
-        b = _add(pos, 1.0, Shape("sphere", (0.10,), color=(0.3, 0.5, 0.9)))
-        frac = math.inf if i == 1 else args.threshold
-        s.add_distance(prev, b, rest=link, stiffness=math.inf, fracture=frac)
-        prev = b
-
-    # Heavy cube at the bottom (it's still a point mass; the cube is visual).
-    bottom = _add(
-        (top[0], top[1] - (args.n + 1) * link, top[2]),
-        args.heavy_mass,
-        Shape("cube", (0.18, 0.18, 0.18), color=(0.7, 0.4, 0.1)),
-    )
-    s.add_distance(prev, bottom, rest=link, stiffness=math.inf, fracture=args.threshold)
-
-    # A couple of free objects to drop on the chain.
-    _add((1.8, top[1] + 0.5, 0.4), 1.5,
-         Shape("sphere", (0.18,), color=(0.95, 0.85, 0.2)))
-    _add((-1.6, top[1] - 1.2, -0.4), 2.0,
-         Shape("pillar", (0.10, 0.35), color=(0.55, 0.85, 0.45)))
-
-    # Turn on dynamic sphere-sphere contacts BEFORE returning so step() picks
-    # up overlapping pairs (chain links connected by a distance constraint are
-    # auto-skipped by the broad phase). See VBD Eq.(12) / AVBD Eq.(15) for the
-    # contact constraint and Eq.(15) tangent rows for friction.
     s.enable_self_collision(True, default_friction=args.friction)
-    dist_constraints = [c for c in s._constraints if c.type == 3]  # DISTANCE
-    return s, bodies, dist_constraints
+    boxes: list[ViewerBox] = []
+    rng = np.random.default_rng(seed=args.seed)
+
+    # 1. Pinned anchor box — hangs from one of its top corners pinned to a
+    #    fixed world point. Demonstrates the PIN_6DOF constraint.
+    h_anchor = (0.18, 0.18, 0.18)
+    anchor_world_pin = (0.0, args.top_y, 0.0)
+    # Place the anchor so its (h, h, h) corner sits at the world pin point.
+    pos_anchor = (
+        anchor_world_pin[0] - h_anchor[0],
+        anchor_world_pin[1] - h_anchor[1],
+        anchor_world_pin[2] - h_anchor[2],
+    )
+    anchor = s.add_box(pos_anchor, h_anchor, mass=1.0, friction=args.friction)
+    s.add_pin_corner(anchor, body_local=(h_anchor[0], h_anchor[1], h_anchor[2]),
+                     world_point=anchor_world_pin)
+    s.add_floor_contact_box(anchor, friction=args.friction)
+    boxes.append(ViewerBox(body=anchor, handle=None, tc=None,
+                           color=(0.9, 0.2, 0.2)))
+
+    # 2. A few free boxes scattered, with random initial spin + orientation.
+    palette = [(0.95, 0.85, 0.2), (0.3, 0.5, 0.9), (0.55, 0.85, 0.45),
+               (0.85, 0.55, 0.85)]
+    placements = [
+        ((1.2, 1.6, 0.6), (0.16, 0.16, 0.16)),
+        ((-1.1, 2.0, -0.5), (0.18, 0.18, 0.18)),
+        ((0.4, 1.2, 1.3), (0.14, 0.14, 0.14)),
+        ((-0.8, 1.4, 1.0), (0.20, 0.20, 0.20)),
+    ]
+    for i, (p, h) in enumerate(placements):
+        # Mild initial spin + small tilt — large random ICs excite the
+        # corner-on-floor contact without substepping (Fig.6 limit).
+        omega = tuple(float(v) for v in rng.uniform(-0.6, 0.6, size=3))
+        small_tilt = math.radians(15.0)
+        axis = rng.standard_normal(3)
+        axis = axis / (np.linalg.norm(axis) + 1e-9)
+        s_half = math.sin(small_tilt * float(rng.random()) / 2.0)
+        c_half = math.cos(small_tilt * float(rng.random()) / 2.0)
+        q_tilt = (float(axis[0] * s_half), float(axis[1] * s_half),
+                  float(axis[2] * s_half), float(c_half))
+        b = s.add_box(p, h, mass=1.0,
+                      orientation=q_tilt,
+                      angular_velocity=omega,
+                      friction=args.friction)
+        s.add_floor_contact_box(b, friction=args.friction)
+        boxes.append(ViewerBox(body=b, handle=None, tc=None,
+                               color=palette[i % len(palette)]))
+
+    # Stash the row indices that came from add_pin_corner so the GUI can
+    # display "anchor pinned" state. Returns 3 rows (PIN_6DOF).
+    pin_indices = []
+    return s, boxes, pin_indices
 
 
 # -----------------------------------------------------------------------------
@@ -135,24 +136,21 @@ def build_scene(args) -> tuple[Solver, list[ViewerBody], list]:
 class Viewer:
     def __init__(self, args):
         self.args = args
+        # Solver mutation lock — create FIRST so any setup path that ends
+        # up calling _add_box_primitive (which acquires the lock) finds it.
+        # RLock so re-entrant calls (drop_box → _add_box_primitive) don't
+        # self-deadlock. See drop_box / tick comment for why we need this.
+        self._solver_lock = threading.RLock()
+
         self.server = viser.ViserServer(host="0.0.0.0", port=args.port)
-        # World convention: +Y is up, gravity points in -Y. Tell the browser
-        # explicitly so the camera puts +Y up on the user's monitor (otherwise
-        # viser's default puts +Z up, which makes things look like they're
-        # falling "into the screen").
         try:
             self.server.scene.set_up_direction("+y")
         except Exception:
             pass
-        # Aim the initial camera roughly toward the chain from a sensible angle.
-        try:
-            self.server.scene.set_global_scene_node_visibility(True)  # type: ignore
-        except Exception:
-            pass
 
-        self.solver, self.bodies, self.dist_rows = build_scene(args)
+        self.solver, self.boxes, self.pin_rows = build_scene(args)
 
-        # --- ground plane (a thin box that looks like a floor) ---
+        # ground plane
         self.server.scene.add_box(
             "/ground",
             dimensions=(8.0, 0.05, 8.0),
@@ -160,376 +158,335 @@ class Viewer:
             color=(0.85, 0.85, 0.85),
         )
         self.server.scene.add_grid(
-            "/grid",
-            width=8.0, height=8.0,
-            cell_size=0.5,
-            plane="xz",
+            "/grid", width=8.0, height=8.0, cell_size=0.5, plane="xz",
         )
 
-        # --- body primitives ---
-        for i, vb in enumerate(self.bodies):
-            self._add_body_primitive(vb, name=f"/bodies/{i}")
+        # body primitives
+        for i, vb in enumerate(self.boxes):
+            self._add_box_primitive(vb, name=f"/bodies/{i}")
 
-        # --- chain link rendering: one line-segments node, updated each tick ---
-        self._dist_pairs = [
-            (c.body_a, c.body_b) for c in self.solver._constraints if c.type == 3
-        ]
-        self._link_handle = self.server.scene.add_line_segments(
-            "/links",
-            points=self._compute_link_points(),
-            colors=np.array([60, 90, 200], dtype=np.uint8),
-            line_width=4.0,
-        )
-
-        # --- transform-control gizmos for DRAG ---
-        # Gizmos are HIDDEN by default — they create visual clutter
-        # (axis arrows + drift artifacts). The user toggles them on via the
-        # "drag mode" checkbox below. When toggled on we snap every gizmo
-        # to its body's current position; when off we hide them.
-        for i, vb in enumerate(self.bodies):
+        # transform controls — hidden by default (toggle via "drag mode")
+        for i, vb in enumerate(self.boxes):
             if i == 0:
-                continue  # skip the pinned anchor
+                continue  # pinned anchor isn't draggable
             tc = self.server.scene.add_transform_controls(
                 f"/drag/{i}",
                 position=tuple(self.solver.positions()[vb.body.index]),
-                scale=args.gizmo_scale,
+                scale=self._gizmo_scale_for(vb.body),
+                line_width=4.0,
                 disable_axes=False,
-                disable_sliders=True,
-                disable_rotations=True,
+                disable_sliders=False,   # plane handles for 2-axis drag
+                disable_rotations=True,  # translation-only
                 visible=False,
             )
             vb.tc = tc
-            self._wire_drag(vb, i)
+            self._wire_drag(vb)
 
-        # --- GUI panel ---
+        # GUI panel
         with self.server.gui.add_folder("Simulation"):
             self.gui_pause = self.server.gui.add_checkbox("pause", initial_value=False)
-            self.gui_iters = self.server.gui.add_slider("iterations", 1, 30,
-                                                        step=1, initial_value=args.iterations)
+            self.gui_iters = self.server.gui.add_slider("iterations", 1, 40,
+                                                       step=1, initial_value=args.iterations)
             self.gui_gravity = self.server.gui.add_slider("gravity (m/s²)", -30.0, 0.0,
-                                                          step=0.5, initial_value=-9.81)
-            self.gui_threshold = self.server.gui.add_slider("fracture threshold",
-                                                            1.0, 500.0, step=1.0,
-                                                            initial_value=args.threshold)
-            self.gui_friction = self.server.gui.add_slider("friction μ",
-                                                            0.0, 1.0, step=0.01,
-                                                            initial_value=args.friction,
-                                                            hint="Coulomb friction coefficient for floor + body-body "
-                                                                 "contacts (AVBD Sec. 3.3 cone clamp |λ_t| ≤ μ|λ_n|)")
+                                                         step=0.5, initial_value=-9.81)
+            self.gui_friction = self.server.gui.add_slider("friction μ", 0.0, 1.0,
+                                                          step=0.01, initial_value=args.friction)
             self.gui_drag_mode = self.server.gui.add_checkbox(
                 "drag mode (show handles)", initial_value=False,
-                hint="When on, every body sprouts an XYZ gizmo you can drag in 3D. "
-                     "Off by default to keep the scene clean.")
+                hint="When on, every free box sprouts an XYZ gizmo you can "
+                     "drag in 3D to teleport (orientation locked).")
         with self.server.gui.add_folder("Actions"):
-            self.gui_kick = self.server.gui.add_button("kick all bodies (random sideways)")
-            self.gui_drop = self.server.gui.add_button("drop a fresh cube")
+            self.gui_drop = self.server.gui.add_button("drop a fresh box")
+            self.gui_kick = self.server.gui.add_button("kick all (random impulse)")
             self.gui_snap = self.server.gui.add_button("snap drag handles to bodies")
             self.gui_reset = self.server.gui.add_button("reset scene")
         with self.server.gui.add_folder("Status"):
             self.gui_frame = self.server.gui.add_text("frame", initial_value="0")
             self.gui_time = self.server.gui.add_text("t (s)", initial_value="0.0")
-            self.gui_active = self.server.gui.add_text("active links",
-                                                       initial_value=str(len(self.dist_rows)))
+            self.gui_maxw = self.server.gui.add_text("max |ω| (rad/s)", initial_value="0.0")
             self.gui_maxlam = self.server.gui.add_text("max |λ|", initial_value="0.0")
         with self.server.gui.add_folder("Performance"):
-            # The whole solver runs on NVIDIA Warp (kernels.py — every AVBD
-            # equation is a wp.kernel). On Apple Silicon Warp falls back to
-            # CPU; flip `--device cuda:0` on an NVIDIA box for GPU.
             self.gui_perf_device = self.server.gui.add_text(
                 "device", initial_value=self.solver.device,
                 hint="Warp execution device. 'cpu' here because Apple Silicon "
-                     "has no CUDA; passes through to wp.launch unchanged.")
+                     "has no CUDA; pass --device cuda:0 on an NVIDIA host.")
             self.gui_perf_bodies = self.server.gui.add_text(
-                "bodies", initial_value=str(len(self.solver._bodies_x)))
+                "bodies", initial_value=str(len(self.boxes)))
             self.gui_perf_constraints = self.server.gui.add_text(
                 "constraints", initial_value="0",
-                hint="Total rows in the AVBD constraint pool, including the "
-                     "dynamic body-body contacts re-emitted every step.")
+                hint="Total rows in the AVBD constraint pool — per-body floor "
+                     "rows (8 corners × 3 = 24 per box) + pins + friction.")
             self.gui_perf_colors = self.server.gui.add_text(
                 "graph colors", initial_value="0",
-                hint="Welsh–Powell coloring of the body-adjacency graph. "
-                     "primal_update kernel launches once per color; bodies "
-                     "sharing a color update fully in parallel inside that "
-                     "launch.")
-            self.gui_perf_step_ms = self.server.gui.add_text(
-                "step time", initial_value="—",
-                hint="Wall-clock time for one solver.step() call (the AVBD "
-                     "iteration loop + broad phase). Lower is better.")
+                hint="Welsh-Powell coloring of body adjacency. primal_update_6dof "
+                     "launches once per color; same-color bodies update in parallel.")
+            self.gui_perf_step_ms = self.server.gui.add_text("step time", initial_value="—")
             self.gui_perf_capacity = self.server.gui.add_text(
                 "solver capacity", initial_value="—",
-                hint="1 / step_time. The maximum sustained Hz the solver "
-                     "could deliver if rendering took zero time. NOT the "
-                     "screen frame rate.")
-            self.gui_perf_wall = self.server.gui.add_text(
-                "wall tick", initial_value="—",
-                hint="Actual viewer tick rate (one frame = solver.step() + "
-                     "scene update + idle wait). Target is 1/dt = 60 Hz.")
+                hint="1 / step_time. The max sustained Hz the solver could deliver "
+                     "if rendering took zero time. NOT the screen frame rate.")
+            self.gui_perf_wall = self.server.gui.add_text("wall tick", initial_value="—")
+        with self.server.gui.add_folder("Notes"):
+            self.server.gui.add_markdown(
+                "**6-DOF rigid body solver** (Solver6DOF). Each box has full "
+                "SE(3) state: position, quaternion, linear + angular velocity, "
+                "body-local inertia tensor. Per-body local 6×6 SPD solve via "
+                "Schur-complement on 3×3 blocks.\n\n"
+                "**OBB-OBB collision** is live (15-axis SAT + Sutherland-Hodgman "
+                "face clipping → up to 4 contact points per pair, each with "
+                "Coulomb friction). The solver substeps internally for stiff "
+                "stacks (`--substeps`, default 8 — AVBD paper Fig. 6 uses 5).\n\n"
+                "Drag-mode handles translate only; rotation gizmo is locked.")
 
+        self.gui_drop.on_click(lambda _: self._drop_box())
         self.gui_kick.on_click(lambda _: self._kick_all())
-        self.gui_drop.on_click(lambda _: self._drop_cube())
         self.gui_snap.on_click(lambda _: self._snap_gizmos())
         self.gui_reset.on_click(lambda _: self._reset())
-        self.gui_threshold.on_update(self._threshold_changed)
         self.gui_iters.on_update(self._iters_changed)
         self.gui_gravity.on_update(self._gravity_changed)
         self.gui_drag_mode.on_update(self._drag_mode_changed)
         self.gui_friction.on_update(self._friction_changed)
 
-        # Dragging state per body
+        # drag bookkeeping
         self._drag_targets: dict[int, np.ndarray] = {}
-        # When True, on_update callbacks from programmatic gizmo moves are
-        # ignored (otherwise calling vb.tc.position = ... would feed itself
-        # back as a "user drag" and lock the body in place).
+        # Orientation captured at the start of each per-body drag. While a body
+        # is being dragged we re-apply this after every solver.step() so contact
+        # torques can't spin the box out from under the user's cursor.
+        self._drag_orientations: dict[int, np.ndarray] = {}
+        # Time of the most recent on_drag event per body. Lets us keep the
+        # body pinned across brief cursor pauses (user holding the gizmo
+        # without moving the mouse) and clean up ~250 ms after release.
+        self._drag_last_event: dict[int, float] = {}
         self._gizmo_suppress = False
-        # True while any gizmo is being yanked around — used to (a) keep
-        # gizmos pinned to bodies in tick(), (b) temporarily suppress
-        # fracture so the chain doesn't snap mid-drag.
-        self._fracture_suppressed = False
+        # Single-slot echo trap per body: (last_value, write_time). An incoming
+        # on_drag event is treated as an echo of tick's gizmo write only if it
+        # matches `last_value` within ~150 ms. Outside that window OR for a
+        # different value, the event is a real user drag. This replaces an
+        # earlier deque-based history that falsely rejected drag-back-and-forth
+        # (any position the body recently visited would be misread as echo).
+        self._gizmo_last_write: dict[int, tuple[np.ndarray, float]] = {}
+        # self._solver_lock created at top of __init__ before scene setup.
+
         self._frame = 0
         self._t0 = time.perf_counter()
-        # Rolling windows for solver step time and wall tick time, so the
-        # status panel shows a smoothed reading rather than per-frame noise.
         self._step_ms_window: list[float] = []
         self._wall_tick_ms_window: list[float] = []
         self._last_tick_t = time.perf_counter()
 
-    def _compute_link_points(self) -> np.ndarray:
-        """Return (N, 2, 3) array of link endpoints in world space, with
-        broken links collapsed to a degenerate (origin → origin) segment so
-        they vanish from the render."""
-        pos = self.solver.positions()
-        act = self.solver.active()
-        # walk constraints again (matches the order of self._dist_pairs).
-        dist_indices = [i for i, c in enumerate(self.solver._constraints) if c.type == 3]
-        out = np.zeros((max(1, len(self._dist_pairs)), 2, 3), dtype=np.float32)
-        for k, ((a, b), ci) in enumerate(zip(self._dist_pairs, dist_indices)):
-            if act[ci] == 0:
-                continue
-            out[k, 0] = pos[a]
-            out[k, 1] = pos[b]
-        return out
+    # ----- helpers --------------------------------------------------------
+    def _add_box_primitive(self, vb: ViewerBox, name: str):
+        with self._solver_lock:
+            self.solver._flush()
+            pos = tuple(self.solver.positions()[vb.body.index])
+            q = self.solver.orientations()[vb.body.index]
+        wxyz = warp_q_to_viser_wxyz(q)
+        ex = vb.body.half_extents
+        vb.handle = self.server.scene.add_box(
+            name, dimensions=(2 * ex[0], 2 * ex[1], 2 * ex[2]),
+            color=vb.color, position=pos, wxyz=wxyz,
+        )
 
-    def _add_body_primitive(self, vb: ViewerBody, name: str):
-        sh = vb.body.shape
-        # Flush so a freshly-added body has a slot in the Warp position array.
-        self.solver._flush()
-        pos = tuple(self.solver.positions()[vb.body.index])
-        if sh.kind == "sphere":
-            vb.handle = self.server.scene.add_icosphere(
-                name, radius=float(sh.size[0]), color=sh.color,
-                position=pos,
-            )
-        elif sh.kind == "cube":
-            ex = sh.size
-            vb.handle = self.server.scene.add_box(
-                name, dimensions=(2 * ex[0], 2 * ex[1], 2 * ex[2]),
-                color=sh.color, position=pos,
-            )
-        elif sh.kind == "pillar":
-            r, hh = sh.size
-            # viser doesn't have a primitive cylinder via Scene API in 1.0.29 in
-            # all builds; fall back to a thin box of the same bounding extent.
-            try:
-                vb.handle = self.server.scene.add_mesh_simple(
-                    name,
-                    vertices=_cylinder_mesh(r, hh)[0],
-                    faces=_cylinder_mesh(r, hh)[1],
-                    color=sh.color, position=pos,
-                )
-            except Exception:
-                vb.handle = self.server.scene.add_box(
-                    name, dimensions=(2 * r, 2 * hh, 2 * r),
-                    color=sh.color, position=pos,
-                )
-        else:
-            vb.handle = self.server.scene.add_icosphere(name, radius=0.1, color=sh.color, position=pos)
+    def _gizmo_scale_for(self, body: RigidBody) -> float:
+        """Per-body gizmo size: at least 2.5× the cube's largest half-extent
+        so the axis arrows extend well past every face and the clickable
+        arrow-tip targets are easy to grab. Without this the gizmo arms
+        could vanish inside larger cubes."""
+        h_max = max(body.half_extents)
+        return max(float(self.args.gizmo_scale), h_max * 2.5)
 
-    def _wire_drag(self, vb: ViewerBody, view_idx: int):
+    def _wire_drag(self, vb: ViewerBox):
         body_idx = vb.body.index
 
         @vb.tc.on_update
         def _on_drag(_evt):  # noqa: ANN001
-            # Ignore programmatic moves (snap, per-tick follow). Only a true
-            # user mouse drag should populate _drag_targets.
             if self._gizmo_suppress:
                 return
-            # Reject moves where the gizmo is already on the body (epsilon
-            # check guards against floating-point round-trips).
-            body_p = self.solver.positions()[body_idx]
             new_p = np.asarray(vb.tc.position, dtype=np.float32)
-            if np.linalg.norm(new_p - body_p) < 1e-4:
-                return
+            # Echo trap: tick writes the gizmo position every frame to follow
+            # the body, and viser may echo those writes back as on_update
+            # events 1–2 frames later. We only reject an event if it matches
+            # the LAST server-side write within a short time window — older
+            # writes are forgotten so the user can drag back to any position
+            # the body previously occupied.
+            last = self._gizmo_last_write.get(body_idx)
+            if last is not None:
+                ref_val, ref_t = last
+                if (time.perf_counter() - ref_t) < 0.15:
+                    if np.linalg.norm(new_p - ref_val) < 5.0e-4:  # 0.5 mm
+                        return  # echo
             self._drag_targets[body_idx] = new_p
+            self._drag_last_event[body_idx] = time.perf_counter()
+            # Immediate visual feedback: render the cube at the new drag
+            # position right away instead of waiting for the next tick.
+            # Without this, the cube lags behind the gizmo by ~tick_dt
+            # (16 ms at 60 Hz, more if solver.step() is expensive — at
+            # substeps=8 × iters=25 the step easily takes 10–20 ms).
+            # Tick skips writing handle.position/wxyz for any body in
+            # _drag_targets, so this write isn't immediately clobbered.
+            if vb.handle is not None:
+                try:
+                    vb.handle.position = (float(new_p[0]), float(new_p[1]), float(new_p[2]))
+                    # Also lock the rendered orientation to the captured one
+                    # so the cube doesn't visibly spin while being dragged.
+                    cap_q = self._drag_orientations.get(body_idx)
+                    if cap_q is not None:
+                        vb.handle.wxyz = warp_q_to_viser_wxyz(cap_q)
+                except (RuntimeError, AttributeError):
+                    pass
+
+    def _expire_stale_drags(self):
+        """Release any per-body drag pin whose last on_drag event is older
+        than 250 ms. Without this the body would stay godmoded forever after
+        the user releases the gizmo, because viser's on_update fires on pose
+        change (not on mouse release). 250 ms tolerates brief cursor pauses
+        mid-drag while still resuming physics quickly after release."""
+        EXPIRE_S = 0.25
+        now = time.perf_counter()
+        for body_idx in [k for k, t in self._drag_last_event.items()
+                         if (now - t) > EXPIRE_S]:
+            self._drag_targets.pop(body_idx, None)
+            self._drag_orientations.pop(body_idx, None)
+            self._drag_last_event.pop(body_idx, None)
+
+    def boxes_by_idx(self, body_idx: int) -> ViewerBox:
+        for vb in self.boxes:
+            if vb.body.index == body_idx:
+                return vb
+        raise KeyError(body_idx)
 
     # ----- GUI callbacks --------------------------------------------------
     def _snap_gizmos(self):
-        """One-shot teleport each gizmo back to its body's current position."""
-        pos = self.solver.positions()
+        with self._solver_lock:
+            pos = self.solver.positions()
         self._gizmo_suppress = True
+        now = time.perf_counter()
         try:
             with self.server.atomic():
-                for vb in self.bodies:
+                for vb in self.boxes:
                     if vb.tc is not None:
                         p = pos[vb.body.index]
-                        vb.tc.position = (float(p[0]), float(p[1]), float(p[2]))
+                        p_t = (float(p[0]), float(p[1]), float(p[2]))
+                        vb.tc.position = p_t
+                        self._gizmo_last_write[vb.body.index] = (
+                            np.asarray(p_t, dtype=np.float32), now,
+                        )
         finally:
             self._gizmo_suppress = False
 
-    def _set_all_fractures(self, val: float):
-        """Override every breakable distance constraint's fracture threshold.
-        `inf` disables fracture entirely (use while dragging)."""
-        import warp as wp
-        fracs = self.solver.c_fracture.numpy().copy()
-        for i, c in enumerate(self.solver._constraints):
-            if c.type == 3 and np.isfinite(c.fracture):
-                fracs[i] = val
-        self.solver.c_fracture = wp.array(fracs, dtype=float, device=self.solver.device)
-
     def _kick_all(self):
         rng = np.random.default_rng()
-        for vb in self.bodies[1:]:
-            dv = (float(rng.uniform(-3.5, 3.5)),
-                  float(rng.uniform(0.5, 3.0)),
-                  float(rng.uniform(-3.5, 3.5)))
-            self.solver.add_impulse(vb.body, dv)
+        with self._solver_lock:
+            for vb in self.boxes[1:]:
+                dv = tuple(float(rng.uniform(-2.5, 2.5)) for _ in range(3))
+                dw = tuple(float(rng.uniform(-3.0, 3.0)) for _ in range(3))
+                v_now = self.solver.velocities()[vb.body.index]
+                w_now = self.solver.angular_velocities()[vb.body.index]
+                self.solver.set_velocity(vb.body,
+                                         (float(v_now[0] + dv[0]),
+                                          float(v_now[1] + dv[1]),
+                                          float(v_now[2] + dv[2])))
+                self.solver.set_angular_velocity(vb.body,
+                                                 (float(w_now[0] + dw[0]),
+                                                  float(w_now[1] + dw[1]),
+                                                  float(w_now[2] + dw[2])))
 
-    def _drop_cube(self):
+    def _drop_box(self):
         rng = np.random.default_rng()
-        # Rejection-sample an XZ that isn't on top of an existing body
-        # (point-mass solver lacks body-body contact, so spawning inside
-        # something would leave it visually clipped forever).
-        existing = self.solver.positions()
-        target_x = target_z = 0.0
-        for _ in range(20):
-            cx = float(rng.uniform(-2.0, 2.0))
-            cz = float(rng.uniform(-2.0, 2.0))
-            ok = True
-            for p in existing:
-                if (p[0] - cx) ** 2 + (p[2] - cz) ** 2 < 0.35 ** 2:
-                    ok = False
-                    break
-            if ok:
-                target_x, target_z = cx, cz
-                break
-        # No initial velocity; spawn ~1 m above the existing scene so impact
-        # velocity stays modest (a higher drop means the cube has more KE to
-        # discharge through one AVBD frame's contact, which the inscribed
-        # sphere + penalty-min combo handles well but never perfectly).
-        pos = (target_x, self.args.top_y + 0.6, target_z)
-        vel = (0.0, 0.0, 0.0)
-        shape = Shape("cube", (0.12, 0.12, 0.12), color=(0.2, 0.85, 0.85))
-        bo = _bottom_offset(shape)
+        h = float(rng.uniform(0.12, 0.18))
+        pos = (float(rng.uniform(-1.5, 1.5)),
+               self.args.top_y + 0.6,
+               float(rng.uniform(-1.5, 1.5)))
+        q = random_orientation(rng)
+        omega = tuple(float(rng.uniform(-2.0, 2.0)) for _ in range(3))
         mu = float(self.gui_friction.value)
-        new_b = self.solver.add_particle(pos, mass=1.0, velocity=vel,
-                                         shape=shape, collide=True,
-                                         friction=mu)
-        self.solver.add_floor_contact(new_b, floor_y=bo, friction=mu)
-        # Flush so positions array is sized for the new body before we read it.
-        self.solver._flush()
-        vb = ViewerBody(body=new_b, handle=None, tc=None, bottom_offset=bo)
-        idx = len(self.bodies)
-        self.bodies.append(vb)
-        self._add_body_primitive(vb, f"/bodies/{idx}")
+        color = (float(rng.uniform(0.3, 0.95)),
+                 float(rng.uniform(0.3, 0.95)),
+                 float(rng.uniform(0.3, 0.95)))
+        with self._solver_lock:
+            b = self.solver.add_box(pos, (h, h, h), mass=1.0,
+                                    orientation=q, angular_velocity=omega,
+                                    friction=mu)
+            self.solver.add_floor_contact_box(b, friction=mu)
+            self.solver._flush()
+            vb = ViewerBox(body=b, handle=None, tc=None, color=color)
+            idx = len(self.boxes)
+            self.boxes.append(vb)
+        # Scene/gizmo creation goes through viser but doesn't touch solver
+        # state — safe to do outside the lock so we don't block tick().
+        self._add_box_primitive(vb, f"/bodies/{idx}")
         tc = self.server.scene.add_transform_controls(
-            f"/drag/{idx}", position=pos, scale=self.args.gizmo_scale,
-            disable_sliders=True, disable_rotations=True,
+            f"/drag/{idx}", position=pos, scale=self._gizmo_scale_for(vb.body),
+            line_width=4.0,
+            disable_sliders=False, disable_rotations=True,
             visible=bool(self.gui_drag_mode.value),
         )
         vb.tc = tc
-        self._wire_drag(vb, idx)
+        self._wire_drag(vb)
 
     def _reset(self):
-        # Remove all scene nodes and rebuild from scratch.
-        for vb in self.bodies:
+        for vb in self.boxes:
             if vb.handle is not None:
-                try:
-                    vb.handle.remove()
-                except Exception:
-                    pass
+                try: vb.handle.remove()
+                except Exception: pass
             if vb.tc is not None:
-                try:
-                    vb.tc.remove()
-                except Exception:
-                    pass
-        try:
-            self._link_handle.remove()
-        except Exception:
-            pass
-        self._drag_targets.clear()
-        self.solver, self.bodies, self.dist_rows = build_scene(self.args)
-        for i, vb in enumerate(self.bodies):
-            self._add_body_primitive(vb, f"/bodies/{i}")
-        # rebuild link line-segments
-        self._dist_pairs = [
-            (c.body_a, c.body_b) for c in self.solver._constraints if c.type == 3
-        ]
-        self._link_handle = self.server.scene.add_line_segments(
-            "/links",
-            points=self._compute_link_points(),
-            colors=np.array([60, 90, 200], dtype=np.uint8),
-            line_width=4.0,
-        )
-        for i, vb in enumerate(self.bodies):
+                try: vb.tc.remove()
+                except Exception: pass
+        with self._solver_lock:
+            self._drag_targets.clear()
+            self._drag_orientations.clear()
+            self._drag_last_event.clear()
+            self._gizmo_last_write.clear()
+            self.solver, self.boxes, self.pin_rows = build_scene(self.args)
+            positions_after_build = self.solver.positions().copy()
+        for i, vb in enumerate(self.boxes):
+            self._add_box_primitive(vb, f"/bodies/{i}")
+        for i, vb in enumerate(self.boxes):
             if i == 0:
                 continue
             tc = self.server.scene.add_transform_controls(
                 f"/drag/{i}",
-                position=tuple(self.solver.positions()[vb.body.index]),
-                scale=self.args.gizmo_scale,
-                disable_sliders=True, disable_rotations=True,
+                position=tuple(positions_after_build[vb.body.index]),
+                scale=self._gizmo_scale_for(vb.body),
+                line_width=4.0,
+                disable_sliders=False, disable_rotations=True,
                 visible=bool(self.gui_drag_mode.value),
             )
             vb.tc = tc
-            self._wire_drag(vb, i)
-        # Re-apply GUI-controlled threshold / iters / gravity
-        self._threshold_changed(None)
+            self._wire_drag(vb)
         self._iters_changed(None)
         self._gravity_changed(None)
         self._frame = 0
 
-    def _threshold_changed(self, _evt):
-        import warp as wp
-        new_thr = float(self.gui_threshold.value)
-        fracs = self.solver.c_fracture.numpy().copy()
-        for i, c in enumerate(self.solver._constraints):
-            if c.type == 3 and np.isfinite(c.fracture):
-                fracs[i] = new_thr
-        self.solver.c_fracture = wp.array(fracs, dtype=float, device=self.solver.device)
-
     def _iters_changed(self, _evt):
-        self.solver.iterations = int(self.gui_iters.value)
+        with self._solver_lock:
+            self.solver.iterations = int(self.gui_iters.value)
 
     def _gravity_changed(self, _evt):
         g = float(self.gui_gravity.value)
-        self.solver.gravity = (0.0, g, 0.0)
+        with self._solver_lock:
+            self.solver.gravity = (0.0, g, 0.0)
 
     def _friction_changed(self, _evt):
-        """Update μ for all FLOOR_CONTACT tangent rows and for newly-generated
-        sphere-sphere contacts. The dynamic pool is rebuilt every step, so a
-        slider change shows up in the next frame."""
+        """Update μ for every existing CONTACT_TANGENT_6DOF row + the per-body
+        default so subsequent add_floor_contact_box calls inherit it."""
         import warp as wp
         mu = float(self.gui_friction.value)
-        # 1) Update each body's stored friction (used by future broad-phase
-        #    pairs and by add_floor_contact rows added after this point).
-        for i in range(len(self.solver._bodies_friction)):
-            self.solver._bodies_friction[i] = mu
-        self.solver._default_friction = mu
-        # 2) Rewrite the static tangent rows already in the constraint list
-        #    (floor friction for existing bodies) and push to the Warp array.
-        fric = self.solver.c_friction.numpy().copy()
-        for i, c in enumerate(self.solver._constraints):
-            if c.type == 6:  # CONTACT_TANGENT
-                c.friction = mu
-                fric[i] = mu
-        self.solver.c_friction = wp.array(fric, dtype=float, device=self.solver.device)
+        with self._solver_lock:
+            for k in range(len(self.solver._friction)):
+                self.solver._friction[k] = mu
+            fric = self.solver.c_friction.numpy().copy()
+            for i, r in enumerate(self.solver._rows):
+                if r.type == 1:  # CONTACT_TANGENT_6DOF
+                    r.friction = mu
+                    fric[i] = mu
+            self.solver.c_friction = wp.array(fric, dtype=float, device=self.solver.device)
 
     def _drag_mode_changed(self, _evt):
         show = bool(self.gui_drag_mode.value)
         if show:
-            # Snap every gizmo to its body, then make it visible.
             self._snap_gizmos()
         with self.server.atomic():
-            for vb in self.bodies:
+            for vb in self.boxes:
                 if vb.tc is not None:
                     vb.tc.visible = show
 
@@ -538,75 +495,100 @@ class Viewer:
         if self.gui_pause.value:
             return
 
-        # --- drag handling ---
-        # While the user is yanking a body, the distance constraint to its
-        # neighbour develops a huge C (= ‖p_neighbour − p_dragged‖ − rest),
-        # which makes |λ| explode and trip the fracture threshold. So while
-        # ANY body is being dragged, suppress fracture entirely; restore the
-        # slider value on release.
-        dragging = len(self._drag_targets) > 0
-        if dragging and not self._fracture_suppressed:
-            self._set_all_fractures(float("inf"))
-            self._fracture_suppressed = True
-        elif not dragging and self._fracture_suppressed:
-            self._set_all_fractures(float(self.gui_threshold.value))
-            self._fracture_suppressed = False
+        with self._solver_lock:
+            # ----- pre-step: pin any actively-dragged body to its target -----
+            # set_position teleports; we also capture the body's orientation on
+            # the FIRST frame of each drag so we can lock it (contact torques
+            # would otherwise spin the cube while the user is dragging it).
+            for body_idx, target in list(self._drag_targets.items()):
+                vb = self.boxes_by_idx(body_idx)
+                if body_idx not in self._drag_orientations:
+                    self._drag_orientations[body_idx] = \
+                        self.solver.orientations()[body_idx].copy()
+                cap_q = self._drag_orientations[body_idx]
+                self.solver.set_position(vb.body, tuple(target))
+                self.solver.set_orientation(vb.body,
+                                            (float(cap_q[0]), float(cap_q[1]),
+                                             float(cap_q[2]), float(cap_q[3])))
+                self.solver.set_velocity(vb.body, (0.0, 0.0, 0.0))
+                self.solver.set_angular_velocity(vb.body, (0.0, 0.0, 0.0))
 
-        for body_idx, target in list(self._drag_targets.items()):
-            self.solver.set_position(self.bodies_by_idx(body_idx).body, tuple(target))
-            self.solver.set_velocity(self.bodies_by_idx(body_idx).body, (0.0, 0.0, 0.0))
-        self._drag_targets.clear()
+            t0 = time.perf_counter()
+            self.solver.step()
+            dt = time.perf_counter() - t0
 
-        t0 = time.perf_counter()
-        self.solver.step()
-        dt = time.perf_counter() - t0
+            # ----- post-step: re-pin dragged bodies ---------------------------
+            # The solver's constraint pass may have nudged the body off-target
+            # (floor pushes up, contact pushes sideways, friction torques the
+            # orientation). Override its final state so the user sees their
+            # drag honored exactly. Position+orientation are godmoded during
+            # drag; physics resumes the frame after release.
+            for body_idx, target in list(self._drag_targets.items()):
+                vb = self.boxes_by_idx(body_idx)
+                cap_q = self._drag_orientations.get(body_idx)
+                self.solver.set_position(vb.body, tuple(target))
+                if cap_q is not None:
+                    self.solver.set_orientation(
+                        vb.body, (float(cap_q[0]), float(cap_q[1]),
+                                  float(cap_q[2]), float(cap_q[3])))
+                self.solver.set_velocity(vb.body, (0.0, 0.0, 0.0))
+                self.solver.set_angular_velocity(vb.body, (0.0, 0.0, 0.0))
 
-        # Batch every scene mutation into one websocket frame so 60 Hz worth
-        # of position updates arrives as one packet instead of dozens — this
-        # is what kept the camera rotation from flickering before.
-        pos = self.solver.positions()
+            pos = self.solver.positions()
+            qs = self.solver.orientations()
+            w = self.solver.angular_velocities()
+            lam = self.solver.lambdas()
+            act = self.solver.active()
+            n_rows_total = len(self.solver._rows)
+            n_colors = int(self.solver.num_colors)
+        # End of lock — pos/qs/w/lam/act are now plain numpy/lists owned by
+        # this thread. Scene writes and GUI text updates don't need the lock.
         drag_mode = bool(self.gui_drag_mode.value)
         self._gizmo_suppress = True
+        now = time.perf_counter()
         try:
             with self.server.atomic():
-                for vb in self.bodies:
-                    p_solver = pos[vb.body.index]
+                for vb in self.boxes:
+                    i = vb.body.index
+                    p_solver = pos[i]
                     p_render = (float(p_solver[0]), float(p_solver[1]), float(p_solver[2]))
-                    # Defensive: a scene reset (or drop_cube rebuild) can
-                    # remove a handle between ticks; the next position write
-                    # would otherwise crash the entire tick. Skip removed
-                    # handles and clear the stale reference.
-                    if vb.handle is not None:
+                    wxyz = warp_q_to_viser_wxyz(qs[i])
+                    # While a body is being dragged, the on_drag callback owns
+                    # the rendered position + orientation. Skip our writes so
+                    # we don't ping-pong against the user's drag.
+                    being_dragged = i in self._drag_targets
+                    if vb.handle is not None and not being_dragged:
                         try:
                             vb.handle.position = p_render
+                            vb.handle.wxyz = wxyz
                         except RuntimeError:
                             vb.handle = None
-                    if drag_mode and vb.tc is not None:
+                    if drag_mode and vb.tc is not None and not being_dragged:
                         try:
                             vb.tc.position = p_render
+                            self._gizmo_last_write[i] = (
+                                np.asarray(p_render, dtype=np.float32), now,
+                            )
                         except RuntimeError:
                             vb.tc = None
-                try:
-                    self._link_handle.points = self._compute_link_points()
-                except RuntimeError:
-                    pass
         finally:
             self._gizmo_suppress = False
+        # NOTE: do NOT clear _drag_targets or _drag_orientations here. They are
+        # cleared lazily: each on_drag event overwrites the target; an entry
+        # only "ends" when on_drag has been silent for ~150 ms (drag released).
+        # See _expire_stale_drags below.
+        self._expire_stale_drags()
 
         # HUD
         self._frame += 1
         self.gui_frame.value = str(self._frame)
         self.gui_time.value = f"{self._frame * self.solver.dt:.2f}"
-        act = self.solver.active()
-        n_alive = sum(1 for c, a in zip(self.solver._constraints, act)
-                      if c.type == 3 and a == 1)
-        self.gui_active.value = f"{n_alive}/{len(self.dist_rows)}"
-        max_lam = float(np.abs(self.solver.lambdas()).max()) if len(self.solver._constraints) else 0.0
+        max_w = float(np.linalg.norm(w, axis=1).max()) if len(w) else 0.0
+        self.gui_maxw.value = f"{max_w:.2f}"
+        max_lam = float(np.abs(lam).max()) if len(lam) else 0.0
         self.gui_maxlam.value = f"{max_lam:.1f}"
 
-        # Performance metrics. Solver-step time is the AVBD work proper;
-        # wall-tick time also includes the scene-update payload and the
-        # idle wait that pads us to dt. Both rolling-averaged.
+        # Performance
         self._step_ms_window.append(dt * 1000.0)
         if len(self._step_ms_window) > 30:
             self._step_ms_window.pop(0)
@@ -621,27 +603,15 @@ class Viewer:
         self.gui_perf_step_ms.value = f"{step_ms:.2f} ms"
         self.gui_perf_capacity.value = f"{1000.0/max(step_ms, 1e-3):.0f} Hz"
         self.gui_perf_wall.value = f"{1000.0/max(wall_ms, 1e-3):.0f} Hz"
-        # Body and constraint counts are cheap; refresh every tick.
-        self.gui_perf_bodies.value = str(len(self.solver._bodies_x))
-        n_total = len(self.solver._constraints)
+        self.gui_perf_bodies.value = str(len(self.boxes))
         n_active = int(act.sum()) if len(act) else 0
-        self.gui_perf_constraints.value = f"{n_active}/{n_total} active"
-        n_colors = int(self.solver.num_colors)
-        n_bodies = len(self.solver._bodies_x)
-        per_color = (n_bodies / max(n_colors, 1)) if n_colors else 0.0
-        self.gui_perf_colors.value = (
-            f"{n_colors}  (~{per_color:.1f} bodies/color)"
-        )
-
-    def bodies_by_idx(self, body_idx: int) -> ViewerBody:
-        for vb in self.bodies:
-            if vb.body.index == body_idx:
-                return vb
-        raise KeyError(body_idx)
+        self.gui_perf_constraints.value = f"{n_active}/{n_rows_total} active"
+        per_color = (len(self.boxes) / max(n_colors, 1)) if n_colors else 0.0
+        self.gui_perf_colors.value = f"{n_colors}  (~{per_color:.1f} bodies/color)"
 
     def run(self):
         target_dt = self.solver.dt
-        print(f"\nviser server running. open the URL above in a browser to interact.\n")
+        print("\nviser server running. open the URL above in a browser to interact.\n")
         try:
             while True:
                 t = time.perf_counter()
@@ -654,48 +624,26 @@ class Viewer:
 
 
 # -----------------------------------------------------------------------------
-# Geometry helpers
-# -----------------------------------------------------------------------------
-def _cylinder_mesh(radius: float, half_height: float, sides: int = 24):
-    angles = np.linspace(0, 2 * np.pi, sides, endpoint=False, dtype=np.float32)
-    cs, sn = np.cos(angles), np.sin(angles)
-    top = np.stack([radius * cs, np.full_like(cs, half_height), radius * sn], axis=1)
-    bot = np.stack([radius * cs, np.full_like(cs, -half_height), radius * sn], axis=1)
-    centre_top = np.array([[0.0, half_height, 0.0]], dtype=np.float32)
-    centre_bot = np.array([[0.0, -half_height, 0.0]], dtype=np.float32)
-    verts = np.vstack([top, bot, centre_top, centre_bot]).astype(np.float32)
-    n = sides
-    ct = 2 * n
-    cb = 2 * n + 1
-    faces = []
-    for i in range(n):
-        j = (i + 1) % n
-        # side quads (two triangles)
-        faces.append([i, j, n + i])
-        faces.append([j, n + j, n + i])
-        # top fan
-        faces.append([ct, j, i])
-        # bottom fan
-        faces.append([cb, n + i, n + j])
-    return verts, np.array(faces, dtype=np.int32)
-
-
-# -----------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--n", type=int, default=6, help="chain links")
-    p.add_argument("--link", type=float, default=0.4)
-    p.add_argument("--top-y", type=float, default=3.5)
-    p.add_argument("--heavy-mass", type=float, default=4.0)
-    p.add_argument("--threshold", type=float, default=120.0)
-    p.add_argument("--friction", type=float, default=0.5,
-                   help="Coulomb μ for floor and body-body contact "
-                        "(AVBD §3.3 friction-cone clamp |λ_t| ≤ μ|λ_n|)")
-    p.add_argument("--iterations", type=int, default=25,
-                   help="AVBD iterations per step; more = less penetration but slower")
-    p.add_argument("--gizmo-scale", type=float, default=0.18,
-                   help="size of the drag handles (smaller = less visual clutter)")
+    p.add_argument("--top-y", type=float, default=2.5,
+                   help="height of the pinned anchor box's world pin")
+    p.add_argument("--friction", type=float, default=0.5)
+    p.add_argument("--iterations", type=int, default=25)
+    p.add_argument("--gizmo-scale", type=float, default=0.35,
+                   help="minimum size (m) of the drag-handle axis arrows. "
+                        "Per-body actual scale is max(this, 2.5·half_extent) "
+                        "so larger cubes get larger gizmos automatically.")
     p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", type=str, default="cpu",
+                   help="Warp device: 'cpu' (default; only option on Apple "
+                        "Silicon since Warp's CUDA backend isn't built for "
+                        "macOS) or 'cuda:0' on an NVIDIA host.")
+    p.add_argument("--substeps", type=int, default=8,
+                   help="Number of inner sub-steps per solver.step(). Stiff "
+                        "stacking needs ≥8 to converge without bouncing "
+                        "(AVBD paper Fig. 6 uses 5).")
     args = p.parse_args()
     Viewer(args).run()
 
