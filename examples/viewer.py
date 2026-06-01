@@ -7,7 +7,8 @@ milestone). The pinned box hangs from a single body-local corner.
 Run:
 
     uv run python examples/viewer.py
-    # open http://localhost:8080 in a browser (URL also printed on stdout)
+    # open http://localhost:8181 in a browser (URL also printed on stdout)
+    # (override with --port if 8181 is also taken on your machine)
 
 Drag a body's gizmo to teleport it; release to let it fall. The orientation
 gizmo is rotation-locked — only translation is interactive. The particle
@@ -1084,7 +1085,11 @@ def main():
                    help="minimum size (m) of the drag-handle axis arrows. "
                         "Per-body actual scale is max(this, 2.5·half_extent) "
                         "so larger cubes get larger gizmos automatically.")
-    p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--port", type=int, default=8181,
+                   help="HTTP/WS port for the viser server. 8080 (viser "
+                        "default) commonly clashes with MCP / Tomcat / dev "
+                        "servers; 8090 clashes with Unity. 8181 is a safer "
+                        "default — override with --port if it's also taken.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cpu",
                    help="Warp device: 'cpu' (default; only option on Apple "
