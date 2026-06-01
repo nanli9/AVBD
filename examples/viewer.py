@@ -25,7 +25,7 @@ from dataclasses import dataclass
 import numpy as np
 import viser
 
-from avbd3d import Solver6DOF, RigidBody
+from avbd3d import Solver, Solver6DOF, RigidBody, make_bunny
 
 
 # -----------------------------------------------------------------------------
@@ -620,24 +620,27 @@ class Viewer:
                 self.solver.set_velocity(vb.body, (0.0, 0.0, 0.0))
                 self.solver.set_angular_velocity(vb.body, (0.0, 0.0, 0.0))
 
-            pos = self.solver.positions()
-            qs = self.solver.orientations()
-            w = self.solver.angular_velocities()
-            lam = self.solver.lambdas()
-            act = self.solver.active()
+            # Batched readback — see Solver6DOF.read_state_batched.
+            # AVBD_PERFORMANCE_GAP §6: this cuts the per-tick stream syncs
+            # from ~7 to 2 by packing everything the HUD + scene update
+            # needs into two pre-allocated Warp buffers.
+            state = self.solver.read_state_batched()
+            pos = state["positions"]
+            qs = state["orientations"]
+            w = state["angular_velocities"]
+            lam = state["lambdas"]
+            act = state["active"]
+            was_static = state["was_static"]
+            c_type = state["c_type"]
             n_rows_total = len(self.solver._rows)
             n_colors = int(self.solver.num_colors)
             bp_ms = float(self.solver.broadphase_ms)
             # Static-friction occupancy — c_was_static is per-row but only
             # meaningful on NORMAL contact rows (FLOOR / BOX_BOX). Counting
             # those gives "how many contacts are currently sticking".
-            was_static = (self.solver.c_was_static.numpy()
-                          if self.solver.c_was_static is not None
-                          else None)
             n_static = 0
             if was_static is not None and len(was_static):
                 # FLOOR_CONTACT_6DOF = 0, BOX_BOX_CONTACT_6DOF = 3
-                c_type = self.solver.c_type.numpy()
                 mask = (c_type == 0) | (c_type == 3)
                 n_static = int((was_static[mask] != 0).sum())
         # End of lock — pos/qs/w/lam/act are now plain numpy/lists owned by
@@ -725,6 +728,346 @@ class Viewer:
             print("\nstopping...")
 
 
+# =============================================================================
+# Deformable bunny viewer
+# =============================================================================
+# Drives the 3-DOF particle `Solver` (not Solver6DOF) with one particle per
+# tet vertex + one DISTANCE constraint per tet edge. This is a v1 mass-spring
+# stand-in for proper co-rotated FEM (which AVBD/VBD use for deformables).
+# Per-vertex rendering shows the actual simulation DOFs; the deformed surface
+# mesh is the tet-boundary triangulation re-emitted each frame.
+# =============================================================================
+class DeformableViewer:
+    def __init__(self, args):
+        self.args = args
+        self._solver_lock = threading.RLock()
+
+        self.server = viser.ViserServer(host="0.0.0.0", port=args.port)
+        try:
+            self.server.scene.set_up_direction("+y")
+        except Exception:
+            pass
+
+        # Deformable mode needs more iters than the rigid scene for the
+        # stiff tet network to converge. We default to 25 if the user
+        # hasn't overridden via --iterations, but always honour --iterations.
+        bunny_iters = int(args.iterations) if args.iterations != 25 else 25
+        # 25 here is the same as the default for rigid mode; user can bump
+        # via --iterations 35 if they crank resolution way up.
+        self.solver = Solver(
+            dt=1.0 / 60.0,
+            iterations=bunny_iters,
+            gravity=(0.0, -9.81, 0.0),
+            post_stabilize=True,
+            device=args.device,
+        )
+        print(f"[viewer] building tet bunny at resolution={args.bunny_resolution} ...")
+        t0 = time.perf_counter()
+        self.deform = make_bunny(
+            self.solver,
+            resolution=int(args.bunny_resolution),
+            scale=float(args.bunny_scale),
+            center=(0.0, float(args.bunny_drop_y), 0.0),
+            edge_stiffness=float(args.edge_stiffness),
+            volume_stiffness=float(args.volume_stiffness),
+            friction=float(args.friction),
+            floor_y=0.0,
+            surface_collide=False,
+        )
+        # Cache initial state for reset.
+        self._initial_positions = self.solver.positions().copy()
+        self._initial_velocities = self.solver.velocities().copy()
+        print(f"[viewer] bunny built in {time.perf_counter()-t0:.2f}s  "
+              f"verts={len(self.deform.bodies)}  "
+              f"edges={len(self.deform.edge_constraints)}  "
+              f"surface_tris={len(self.deform.tet.surface_tris)}")
+
+        # Static scene: ground + grid
+        self.server.scene.add_box(
+            "/ground",
+            dimensions=(8.0, 0.05, 8.0),
+            position=(0.0, -0.025, 0.0),
+            color=(0.85, 0.85, 0.85),
+        )
+        self.server.scene.add_grid(
+            "/grid", width=8.0, height=8.0, cell_size=0.5, plane="xz",
+        )
+
+        # First render: surface mesh + vertex point cloud
+        self._mesh_handle = None
+        self._points_handle = None
+        self._refresh_mesh()
+
+        # GUI panel
+        with self.server.gui.add_folder("Simulation"):
+            self.gui_pause = self.server.gui.add_checkbox(
+                "pause", initial_value=False)
+            self.gui_iters = self.server.gui.add_slider(
+                "iterations", 1, 40, step=1,
+                initial_value=int(args.iterations))
+            self.gui_gravity = self.server.gui.add_slider(
+                "gravity (m/s²)", -30.0, 0.0, step=0.5,
+                initial_value=-9.81)
+            self.gui_edge_k = self.server.gui.add_slider(
+                "edge stiffness (×1e4)", 0.1, 50.0, step=0.1,
+                initial_value=float(args.edge_stiffness) / 1e4,
+                hint="Per-tet-edge DISTANCE constraint stiffness. AVBD "
+                     "clamps each constraint's penalty to this ceiling. "
+                     "Higher = stiffer body, more iterations needed to "
+                     "converge.")
+        with self.server.gui.add_folder("Rendering"):
+            self.gui_show_mesh = self.server.gui.add_checkbox(
+                "show bunny mesh (high-res, skinned)",
+                initial_value=True)
+            self.gui_show_points = self.server.gui.add_checkbox(
+                "show tet vertices (sim DOFs)",
+                initial_value=False,
+                hint="The actual AVBD 3-DOF blocks: red on the surface, "
+                     "blue interior. The high-res bunny is barycentrically "
+                     "skinned to these.")
+            self.gui_wireframe = self.server.gui.add_checkbox(
+                "wireframe", initial_value=False)
+            self.gui_point_size = self.server.gui.add_slider(
+                "tet point size (mm)", 1.0, 25.0, step=0.5,
+                initial_value=6.0)
+        with self.server.gui.add_folder("Actions"):
+            self.gui_shake = self.server.gui.add_button("shake (random impulse)")
+            self.gui_squish = self.server.gui.add_button("squish (-y push, all verts)")
+            self.gui_lift = self.server.gui.add_button("lift (+y push, all verts)")
+            self.gui_reset = self.server.gui.add_button("reset bunny")
+        with self.server.gui.add_folder("Status"):
+            self.gui_frame = self.server.gui.add_text("frame", initial_value="0")
+            self.gui_time = self.server.gui.add_text("t (s)", initial_value="0.0")
+            self.gui_step_ms = self.server.gui.add_text("step time", initial_value="—")
+            self.gui_capacity = self.server.gui.add_text(
+                "solver capacity", initial_value="—",
+                hint="1 / step_time. Max sustained Hz the solver could deliver "
+                     "if rendering took zero time.")
+            self.gui_verts_text = self.server.gui.add_text(
+                "vertices (= 3-DOF blocks)",
+                initial_value=str(len(self.deform.bodies)))
+            self.gui_edges_text = self.server.gui.add_text(
+                "tet edges (= DISTANCE rows)",
+                initial_value=str(len(self.deform.edge_constraints)))
+            self.gui_tets_text = self.server.gui.add_text(
+                "tets",
+                initial_value=str(len(self.deform.tet.tets)))
+            self.gui_max_disp = self.server.gui.add_text(
+                "max |Δx| (mm)", initial_value="0.0",
+                hint="Max per-vertex displacement from the initial rest pose, "
+                     "in millimetres. A useful proxy for how deformed the bunny is.")
+        with self.server.gui.add_folder("Notes"):
+            self.server.gui.add_markdown(
+                "**Deformable bunny** — 3-DOF particle Solver. Each tet "
+                "vertex is one particle. Each tet edge is one AVBD "
+                "`DISTANCE` constraint; each tet is one `TET_VOLUME` "
+                "constraint (`C = V/V₀ − 1`) for soft volume "
+                "preservation.\n\n"
+                "**What you see:** the high-res Stanford bunny surface "
+                "(~35k verts, 69k tris) **skinned** to the tet pool via "
+                "per-vertex barycentric coordinates pre-computed at "
+                "startup. Each frame: `render_vert = Σ b_k · "
+                "tet_vert[v_k]` for the 4 vertices of the containing "
+                "tet. This is why it looks like a bunny instead of a "
+                "pile of voxels — the rendered surface is decoupled "
+                "from the (coarse) sim mesh.\n\n"
+                "Self-collision is OFF (`surface_collide=False`): zero "
+                "SPHERE_CONTACT rows exist in the pool. Any visible "
+                "surface 'collision' is just the high-res skin "
+                "following its underlying tets through deformation.\n\n"
+                "**Next milestone:** per-tet co-rotated linear FEM "
+                "(Neo-Hookean / StVK) for shear stiffness — currently "
+                "edges + volume preservation only.")
+
+        self.gui_shake.on_click(lambda _: self._shake())
+        self.gui_squish.on_click(lambda _: self._impulse_all((0.0, -2.0, 0.0)))
+        self.gui_lift.on_click(lambda _: self._impulse_all((0.0, 3.5, 0.0)))
+        self.gui_reset.on_click(lambda _: self._reset())
+        self.gui_iters.on_update(self._iters_changed)
+        self.gui_gravity.on_update(self._gravity_changed)
+        self.gui_edge_k.on_update(self._edge_k_changed)
+
+        self._frame = 0
+        self._step_ms_window: list[float] = []
+
+    # ----- rendering ------------------------------------------------------
+    def _refresh_mesh(self):
+        """Tear down + rebuild the SKINNED bunny mesh (high-res Stanford
+        surface bound to the tet pool via barycentric weights) plus an
+        optional vertex point cloud showing where the actual AVBD 3-DOF
+        blocks sit. Wrapped in `server.atomic()` so the client never sees
+        a mid-update empty state.
+        """
+        with self._solver_lock:
+            pos = self.solver.positions().copy()
+        tet_pos = pos[self.deform.indices].astype(np.float32)
+        # Apply the barycentric skin to get the deformed high-res bunny.
+        # ~3 ms per call for the 35k-vert Stanford bunny.
+        render_verts = self.deform.skin_positions(tet_pos)
+        render_tris = self.deform.skin.render_tris
+
+        wireframe = (getattr(self, "gui_wireframe", None) is not None
+                     and self.gui_wireframe.value)
+        show_mesh = (getattr(self, "gui_show_mesh", None) is None
+                     or self.gui_show_mesh.value)
+        show_points = (getattr(self, "gui_show_points", None) is None
+                       or self.gui_show_points.value)
+
+        # Point cloud colors for the TET (sim) vertices — distinct from the
+        # render mesh so it's clear what's physics and what's pure render.
+        n_pts = len(tet_pos)
+        pt_colors = np.empty((n_pts, 3), dtype=np.uint8)
+        pt_colors[:] = (40, 90, 220)  # deeper blue for interior tet verts
+        surf = self.deform.tet.surface_verts
+        pt_colors[surf] = (255, 90, 60)  # warm red-orange for surface tet verts
+
+        with self.server.atomic():
+            if self._mesh_handle is not None:
+                try:
+                    self._mesh_handle.remove()
+                except Exception:
+                    pass
+                self._mesh_handle = None
+            if self._points_handle is not None:
+                try:
+                    self._points_handle.remove()
+                except Exception:
+                    pass
+                self._points_handle = None
+
+            if show_mesh:
+                # The Stanford bunny is rendered as a high-res
+                # (~35k vert, 69k tri) skinned mesh — looks like an actual
+                # bunny, no voxel blocks. viser rejects
+                # (wireframe=True, flat_shading=True); set only one.
+                mesh_kwargs = dict(
+                    name="/bunny/surface",
+                    vertices=render_verts,
+                    faces=render_tris,
+                    color=(220, 195, 175),  # warm parchment
+                    side="front",
+                )
+                if wireframe:
+                    mesh_kwargs["wireframe"] = True
+                else:
+                    mesh_kwargs["material"] = "standard"
+                self._mesh_handle = self.server.scene.add_mesh_simple(**mesh_kwargs)
+
+            if show_points:
+                # The point cloud still shows the actual SIMULATION DOFs
+                # (the tet vertices, not the render verts) so the user
+                # can see where AVBD is doing its 3-DOF block solves.
+                pt_size_m = (getattr(self, "gui_point_size", None).value / 1000.0
+                             if getattr(self, "gui_point_size", None) is not None
+                             else 0.006)
+                self._points_handle = self.server.scene.add_point_cloud(
+                    "/bunny/vertices",
+                    points=tet_pos,
+                    colors=pt_colors,
+                    point_size=float(pt_size_m),
+                    point_shape="circle",
+                    point_shading="gradient",
+                )
+
+    # ----- actions --------------------------------------------------------
+    def _shake(self):
+        rng = np.random.default_rng()
+        with self._solver_lock:
+            v = self.solver.velocities().copy()
+            n = len(self.deform.bodies)
+            v[self.deform.indices] += rng.uniform(-2.0, 2.0, size=(n, 3)).astype(np.float32)
+            self.solver.v = self._wp_array_vec3(v)
+
+    def _impulse_all(self, dv: tuple[float, float, float]):
+        with self._solver_lock:
+            v = self.solver.velocities().copy()
+            for idx in self.deform.indices:
+                v[int(idx)] += np.asarray(dv, dtype=np.float32)
+            self.solver.v = self._wp_array_vec3(v)
+
+    def _wp_array_vec3(self, arr: np.ndarray):
+        import warp as wp
+        return wp.array(arr.astype(np.float32), dtype=wp.vec3, device=self.solver.device)
+
+    def _reset(self):
+        with self._solver_lock:
+            self.solver.x = self._wp_array_vec3(self._initial_positions.copy())
+            self.solver.v = self._wp_array_vec3(np.zeros_like(self._initial_velocities))
+            self.solver.prev_v = self._wp_array_vec3(np.zeros_like(self._initial_velocities))
+            # Reset λ and penalty caches so the bunny re-settles cleanly.
+            n_c = len(self.solver._constraints)
+            self.solver.c_lambda = self._wp_scalar(np.zeros(n_c, dtype=np.float32))
+            self.solver.c_penalty = self._wp_scalar(np.ones(n_c, dtype=np.float32))
+            n = len(self.solver._constraints)
+            self.solver.c_active = self._wp_int(np.ones(n, dtype=np.int32))
+        self._frame = 0
+
+    def _wp_scalar(self, arr: np.ndarray):
+        import warp as wp
+        return wp.array(arr.astype(np.float32), dtype=float, device=self.solver.device)
+
+    def _wp_int(self, arr: np.ndarray):
+        import warp as wp
+        return wp.array(arr.astype(np.int32), dtype=int, device=self.solver.device)
+
+    # ----- GUI handlers ---------------------------------------------------
+    def _iters_changed(self, _evt):
+        with self._solver_lock:
+            self.solver.iterations = int(self.gui_iters.value)
+
+    def _gravity_changed(self, _evt):
+        with self._solver_lock:
+            self.solver.gravity = (0.0, float(self.gui_gravity.value), 0.0)
+
+    def _edge_k_changed(self, _evt):
+        new_k = float(self.gui_edge_k.value) * 1e4
+        with self._solver_lock:
+            for h in self.deform.edge_constraints:
+                # ConstraintHandle stores `index` (first row); DISTANCE has 1 row.
+                self.solver._constraints[h.index].stiffness = new_k
+            self.solver._dirty = True
+
+    # ----- tick -----------------------------------------------------------
+    def tick(self):
+        if self.gui_pause.value:
+            return
+        with self._solver_lock:
+            t0 = time.perf_counter()
+            self.solver.step()
+            dt = time.perf_counter() - t0
+            pos = self.solver.positions().copy()
+        # Refresh mesh + points
+        self._refresh_mesh()
+        # HUD
+        self._frame += 1
+        self.gui_frame.value = str(self._frame)
+        self.gui_time.value = f"{self._frame * self.solver.dt:.2f}"
+        self._step_ms_window.append(dt * 1000.0)
+        if len(self._step_ms_window) > 30:
+            self._step_ms_window.pop(0)
+        step_ms = float(np.mean(self._step_ms_window))
+        self.gui_step_ms.value = f"{step_ms:.2f} ms"
+        self.gui_capacity.value = f"{1000.0/max(step_ms, 1e-3):.0f} Hz"
+        # Max displacement from rest
+        verts_now = pos[self.deform.indices]
+        rest = self._initial_positions[self.deform.indices]
+        disp = np.linalg.norm(verts_now - rest, axis=1).max() * 1000.0
+        self.gui_max_disp.value = f"{disp:.1f}"
+
+    def run(self):
+        target_dt = self.solver.dt
+        print("\nviser server running. open the URL above in a browser to interact.\n")
+        try:
+            while True:
+                t = time.perf_counter()
+                self.tick()
+                spent = time.perf_counter() - t
+                if spent < target_dt:
+                    time.sleep(target_dt - spent)
+        except KeyboardInterrupt:
+            print("\nstopping...")
+
+
 # -----------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser()
@@ -751,8 +1094,40 @@ def main():
                    help="Number of inner sub-steps per solver.step(). Stiff "
                         "stacking needs ≥8 to converge without bouncing "
                         "(AVBD paper Fig. 6 uses 5).")
+    # ---- Deformable-bunny mode flags ----------------------------------------
+    p.add_argument("--deformable-bunny", action="store_true",
+                   help="Replace the rigid-body scene with a deformable "
+                        "Stanford bunny. Uses the 3-DOF particle Solver, "
+                        "one DISTANCE constraint per tet edge (mass-spring "
+                        "approximation — proper co-rotated FEM is the "
+                        "next milestone). Vertex point cloud + deformed "
+                        "surface are both rendered each frame.")
+    p.add_argument("--bunny-resolution", type=int, default=10,
+                   help="Voxel grid resolution along the longest bunny bbox "
+                        "axis. 10 → ~350 verts / ~1700 edges (sane on CPU). "
+                        "16 → ~1500 verts / ~10k edges (slow on CPU, fine "
+                        "on CUDA).")
+    p.add_argument("--bunny-scale", type=float, default=1.2,
+                   help="World-space scale of the bunny (unit-bbox before "
+                        "scaling).")
+    p.add_argument("--bunny-drop-y", type=float, default=1.5,
+                   help="Initial y-centre of the bunny. The bunny falls "
+                        "from here onto the floor at y=0.")
+    p.add_argument("--edge-stiffness", type=float, default=5.0e4,
+                   help="Per-tet-edge DISTANCE constraint stiffness "
+                        "(AVBD penalty clamp ceiling).")
+    p.add_argument("--volume-stiffness", type=float, default=1.0e4,
+                   help="Per-tet TET_VOLUME constraint material stiffness "
+                        "(AVBD penalty clamp ceiling, in N·m). Soft volume "
+                        "preservation — keeps the tet network from "
+                        "pancaking under floor contact. Too high → contact "
+                        "instability; 1e4 is a reasonable default for the "
+                        "rubber-bunny look. Set to 0 to disable.")
     args = p.parse_args()
-    Viewer(args).run()
+    if args.deformable_bunny:
+        DeformableViewer(args).run()
+    else:
+        Viewer(args).run()
 
 
 if __name__ == "__main__":

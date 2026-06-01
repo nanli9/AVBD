@@ -497,20 +497,42 @@ def primal_update_6dof(
             lam_eff = 0.0
 
         # Force magnitude — clamp differs for tangent (friction cone) vs others.
+        # lam_plus is the un-clamped force, used both for the actual clamp and
+        # for Eq.14's Hessian rescaling test below.
+        lam_plus = k_p * C + lam_eff
         if t == CONTACT_TANGENT_6DOF:
             sib = c_sibling[cj]
             mu = c_friction[cj]
             if c_was_static[sib] != 0:
                 mu = c_friction_static[cj]
             bound = mu * wp.abs(c_lambda[sib])
-            f = wp.clamp(k_p * C + lam_eff, -bound, bound)
+            f_lo = -bound
+            f_hi = bound
         else:
-            f = wp.clamp(k_p * C + lam_eff, c_fmin[cj], c_fmax[cj])
+            f_lo = c_fmin[cj]
+            f_hi = c_fmax[cj]
+        f = wp.clamp(lam_plus, f_lo, f_hi)
+
+        # AVBD Eq.14 Hessian rescaling (Sec.3.2). When the unclamped force
+        # lam_plus = k·C + λ falls outside [f_lo, f_hi], the actual delta-x
+        # produced by the linearised k will overshoot what the clamped force
+        # warrants. Replace k by k̃ = |bound − lam_plus| / |C| for the LHS
+        # only — this is the stiffness that makes a one-step linear model
+        # land exactly on the bound. RHS still uses the clamped f, so the
+        # force magnitude is unchanged. Skips when |C| ≈ 0 (no rescale
+        # information) or when in-bounds.
+        k_for_lhs = k_p
+        abs_C = wp.abs(C)
+        if abs_C > 1.0e-12:
+            if lam_plus < f_lo:
+                k_for_lhs = wp.abs(f_lo - lam_plus) / abs_C
+            elif lam_plus > f_hi:
+                k_for_lhs = wp.abs(f_hi - lam_plus) / abs_C
 
         # LHS accumulation (J·k·J^T outer products split into A/B/D 3×3).
-        A = A + outer3(j_lin, j_lin) * k_p
-        B = B + outer3(j_ang, j_lin) * k_p
-        D = D + outer3(j_ang, j_ang) * k_p
+        A = A + outer3(j_lin, j_lin) * k_for_lhs
+        B = B + outer3(j_ang, j_lin) * k_for_lhs
+        D = D + outer3(j_ang, j_ang) * k_for_lhs
 
         # G column-norm diagonal (AVBD Eq 17 + Sec 3.5). r_self_w is the body-
         # local anchor on `i` after rotation — already computed above, no
@@ -1210,3 +1232,172 @@ def obb_sat_pairs(
     pair_sat_idx[p] = best_idx
     pair_n_hat[p] = best_axis
     pair_depth[p] = best_overlap
+
+
+# =============================================================================
+# Contact warm-start cache restore / collect — keeps λ + k + was_static
+# GPU-resident across substeps (closes AVBD_PERFORMANCE_GAP §5).
+# =============================================================================
+# The dynamic OBB contact pool rebuilds every substep — fresh BOX_BOX_CONTACT
+# rows + tangent partners are appended at the end of the constraint list. To
+# preserve augmented-Lagrangian state across the rebuild, the previous version
+# did:
+#     lam_np = c_lambda.numpy().copy()           # GPU→CPU sync
+#     pen_np = c_penalty.numpy().copy()          # GPU→CPU sync
+#     was_np = c_was_static.numpy().copy()       # GPU→CPU sync
+#     for ...: lam_np[idx] = cache[key].λ, ...   # Python dict loop
+#     c_lambda  = wp.array(lam_np, ...)          # CPU→GPU upload (full)
+#     c_penalty = wp.array(pen_np, ...)          # CPU→GPU upload (full)
+#     c_was_static = wp.array(was_np, ...)       # CPU→GPU upload (full)
+# 6 full-array transfers per substep × 8 substeps = 48 stream syncs/frame
+# just for cache state. These kernels replace that with one small upload
+# + one small readback per substep — the in-place sparse writes happen on
+# GPU through `pool_idx_*` index arrays.
+#
+# Packed layout (8 floats per pool pair) — chosen so persist needs ONE
+# .numpy() instead of 8:
+#     [p*8 + 0] = λ_n  (normal-row Lagrange multiplier)
+#     [p*8 + 1] = λ_t  (tangent row, or 0 if no friction)
+#     [p*8 + 2] = λ_b  (bitangent row, or 0 if no friction)
+#     [p*8 + 3] = k_n  (normal-row penalty)
+#     [p*8 + 4] = k_t  (tangent penalty, or 1 if no friction)
+#     [p*8 + 5] = k_b  (bitangent penalty, or 1 if no friction)
+#     [p*8 + 6] = c_active[n_idx]  (cast to float for packing)
+#     [p*8 + 7] = c_was_static[n_idx]  (cast to float)
+
+
+@wp.kernel
+def cache_restore_6dof(
+    pool_idx_n: wp.array(dtype=int),
+    pool_idx_t: wp.array(dtype=int),
+    pool_idx_b: wp.array(dtype=int),
+    cache_valid: wp.array(dtype=int),   # 1 if this pair had a cache hit
+    in_packed: wp.array(dtype=float),   # 8 floats per pair (see header)
+    # in-place outputs (the live constraint arrays)
+    c_lambda: wp.array(dtype=float),
+    c_penalty: wp.array(dtype=float),
+    c_was_static: wp.array(dtype=int),
+):
+    """Per pool pair: if cache_valid[p] then write packed λ/k/was_static into
+    c_lambda/c_penalty/c_was_static at the row indices for that pair. Misses
+    leave the row slots untouched — _flush() pre-initialises them to the
+    PENALTY_MIN floors, which is the same fresh-contact bootstrap state."""
+    p = wp.tid()
+    if cache_valid[p] == 0:
+        return
+    base = p * 8
+    n = pool_idx_n[p]
+    c_lambda[n] = in_packed[base + 0]
+    c_penalty[n] = in_packed[base + 3]
+    c_was_static[n] = int(in_packed[base + 7])
+    t = pool_idx_t[p]
+    if t >= 0:
+        c_lambda[t] = in_packed[base + 1]
+        c_penalty[t] = in_packed[base + 4]
+    bb = pool_idx_b[p]
+    if bb >= 0:
+        c_lambda[bb] = in_packed[base + 2]
+        c_penalty[bb] = in_packed[base + 5]
+
+
+@wp.kernel
+def cache_collect_6dof(
+    pool_idx_n: wp.array(dtype=int),
+    pool_idx_t: wp.array(dtype=int),
+    pool_idx_b: wp.array(dtype=int),
+    c_lambda: wp.array(dtype=float),
+    c_penalty: wp.array(dtype=float),
+    c_active: wp.array(dtype=int),
+    c_was_static: wp.array(dtype=int),
+    # output: 8 floats per pair, ready for one .numpy() readback
+    out_packed: wp.array(dtype=float),
+):
+    """Inverse of cache_restore_6dof — pack the live (λ, k, active, was_static)
+    state of every pool-pair row back into the contiguous staging buffer so
+    the Python side can read it with a single .numpy() call instead of four."""
+    p = wp.tid()
+    base = p * 8
+    n = pool_idx_n[p]
+    out_packed[base + 0] = c_lambda[n]
+    out_packed[base + 3] = c_penalty[n]
+    out_packed[base + 6] = float(c_active[n])
+    out_packed[base + 7] = float(c_was_static[n])
+    t = pool_idx_t[p]
+    if t >= 0:
+        out_packed[base + 1] = c_lambda[t]
+        out_packed[base + 4] = c_penalty[t]
+    else:
+        out_packed[base + 1] = 0.0
+        out_packed[base + 4] = 1.0
+    bb = pool_idx_b[p]
+    if bb >= 0:
+        out_packed[base + 2] = c_lambda[bb]
+        out_packed[base + 5] = c_penalty[bb]
+    else:
+        out_packed[base + 2] = 0.0
+        out_packed[base + 5] = 1.0
+
+
+# =============================================================================
+# Viewer-side fused readback — packs every per-frame stat the viewer reads
+# into one staging buffer (closes AVBD_PERFORMANCE_GAP §6).
+# =============================================================================
+# Per-frame the interactive viewer asks for: positions, orientations, angular
+# velocities, lambdas, active flags, c_was_static, c_type. Done naively that's
+# 7 separate .numpy() calls — each one a stream sync on CUDA. This kernel
+# fuses everything into one float array so the viewer issues 2 transfers
+# (one for the per-body block, one for the per-row stats block).
+#
+# Per-body layout (10 floats):
+#     [0..2] position
+#     [3..6] orientation (xyzw)
+#     [7..9] angular velocity
+# Per-row stats layout (3 floats):
+#     [0] lambda
+#     [1] float(active)
+#     [2] float(was_static * 16 + c_type)   # 1 byte was, 1 byte type
+# was_static * 16 fits because c_type ∈ {0,1,2,3} and was_static ∈ {0,1}.
+
+
+@wp.kernel
+def viewer_pack_bodies_6dof(
+    x: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.quat),
+    omega: wp.array(dtype=wp.vec3),
+    out: wp.array(dtype=float),
+):
+    """Pack (position, orientation, angular_velocity) into 10 contiguous
+    floats per body for a single viewer .numpy() readback."""
+    i = wp.tid()
+    base = i * 10
+    xi = x[i]
+    qi = q[i]
+    wi = omega[i]
+    out[base + 0] = xi[0]
+    out[base + 1] = xi[1]
+    out[base + 2] = xi[2]
+    out[base + 3] = qi[0]
+    out[base + 4] = qi[1]
+    out[base + 5] = qi[2]
+    out[base + 6] = qi[3]
+    out[base + 7] = wi[0]
+    out[base + 8] = wi[1]
+    out[base + 9] = wi[2]
+
+
+@wp.kernel
+def viewer_pack_rows_6dof(
+    c_lambda: wp.array(dtype=float),
+    c_active: wp.array(dtype=int),
+    c_was_static: wp.array(dtype=int),
+    c_type: wp.array(dtype=int),
+    out: wp.array(dtype=float),
+):
+    """Pack (lambda, active, was_static*16+type) into 3 contiguous floats per
+    constraint row for the viewer HUD. `was_static*16 + type` packs 5 bits
+    into one float — well within IEEE-754 exact integer range."""
+    j = wp.tid()
+    base = j * 3
+    out[base + 0] = c_lambda[j]
+    out[base + 1] = float(c_active[j])
+    out[base + 2] = float(c_was_static[j] * 16 + c_type[j])

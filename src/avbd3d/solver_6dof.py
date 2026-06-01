@@ -339,6 +339,26 @@ class Solver6DOF:
         # Tracks broadphase wall time (seconds) of the most recent rebuild
         # so the viewer can surface it without polling internals.
         self.broadphase_ms = 0.0
+        # GPU-resident contact warm-start scratch (AVBD_PERFORMANCE_GAP §5).
+        # Each substep's contact pool gets index arrays (idx_n/t/b) so
+        # cache_restore_6dof + cache_collect_6dof can mutate c_lambda /
+        # c_penalty / c_was_static in place without a full-array
+        # GPU↔CPU round trip. Reused frame-to-frame; the helper
+        # `_ensure_pool_buffers` grows them in 256-pair chunks when the
+        # pool count goes up.
+        self._pool_idx_n = None       # wp.array(int)
+        self._pool_idx_t = None       # wp.array(int)
+        self._pool_idx_b = None       # wp.array(int)
+        self._pool_cache_valid = None # wp.array(int)
+        self._pool_in_packed = None   # wp.array(float), shape (n_pool*8,)
+        self._pool_out_packed = None  # wp.array(float), shape (n_pool*8,)
+        self._pool_buf_cap = 0
+        # Viewer staging buffers — built lazily on first read_batched() call,
+        # shared across frames, reuploaded only when body/row counts change.
+        self._viewer_pack_bodies = None
+        self._viewer_pack_rows = None
+        self._viewer_pack_bodies_n = 0
+        self._viewer_pack_rows_n = 0
 
     # ---- Scene building -----------------------------------------------------
 
@@ -639,46 +659,101 @@ class Solver6DOF:
 
     def _emit_obb_edge_edge(self, i, j, c_A, R_A, e_A, c_B, R_B, e_B,
                             n_hat, sat_idx, positions, quats) -> None:
-        """Single-point fallback for edge-edge contacts. Uses the most-
-        penetrating vertex of B as the incident point and projects it onto
-        A's closest face — coarse but stable. Proper edge-edge needs
-        closest-points-on-line-segments (Ericson §5.1.9); deferred."""
-        # B's vertex with MAX projection along n̂ (n̂ points B → A, so the
-        # vertex furthest along +n̂ from B's center is the one most "into"
-        # A). Don't use (v - c_A): that subtracts an arbitrary offset that
-        # makes the extremum direction depend on |c_A − c_B|.
-        signs = [(-1, -1, -1), (1, -1, -1), (-1, 1, -1), (1, 1, -1),
-                 (-1, -1, 1), (1, -1, 1), (-1, 1, 1), (1, 1, 1)]
-        deepest_v = None
-        deepest_proj = -np.inf
-        for s in signs:
-            v_local = np.array(s, dtype=np.float32) * e_B
-            v_world = c_B + R_B @ v_local
-            proj = float(np.dot(v_world - c_B, n_hat))
-            if proj > deepest_proj:
-                deepest_proj = proj
-                deepest_v = v_world
+        """Proper edge-edge OBB contact (Ericson §5.1.9 + §15.6.3).
 
-        p_inc = deepest_v
-        # ref body = A; pick A's face whose outward normal is most anti-
-        # aligned with n̂ (i.e., points toward incident=B).
-        best = (0, 1.0, -np.inf)
-        for k in range(3):
-            for sign in (-1.0, 1.0):
-                d = float(np.dot(sign * R_A[:, k], -n_hat))
-                if d > best[2]:
-                    best = (k, sign, d)
-        ref_axis, ref_sign, _ = best
-        ref_face_c, ref_face_n, _, _ = _box_face_data(c_A, R_A, e_A, ref_axis, ref_sign)
-        # Penetration depth: vertex is BELOW ref face plane (inside A) when
-        # (v - face_c) · face_outward_normal < 0.
-        d_proj = float(np.dot(p_inc - ref_face_c, ref_face_n))
-        if d_proj > 0.005:  # margin for warm-start preservation
-            return  # vertex more than 5 mm OUTSIDE A — no contact
-        p_ref = p_inc - d_proj * ref_face_n
+        When SAT picks an edge×edge separating axis L = R_A[:,k_A] × R_B[:,k_B],
+        the contact happens between one edge on A parallel to R_A[:,k_A] and
+        one edge on B parallel to R_B[:,k_B]. The contact normal is n_hat
+        (already oriented B→A by the SAT). The contact "point" is the
+        midpoint of the closest-segment-pair on those two edges.
 
-        off_ref_local = R_A.T @ (p_ref - c_A)
-        off_inc_local = R_B.T @ (p_inc - c_B)
+        Selecting WHICH parallel edge on each body: each box has 4 edges
+        along a given direction (at the 4 corners of the perpendicular face).
+        The contact edge is the one whose midpoint is closest to the OTHER
+        body's centre — equivalently, whose perpendicular-axis offsets
+        have the right sign to face the other body.
+        """
+        # Decode SAT index back to (k_A, k_B) edge axes (paired in row-major
+        # 3×3 order). sat_idx ∈ [6, 15).
+        eidx = sat_idx - 6
+        k_A = eidx // 3
+        k_B = eidx % 3
+        eA_dir = R_A[:, k_A]
+        eB_dir = R_B[:, k_B]
+        # Degenerate: cross product near zero (edges nearly parallel) → skip,
+        # the face-axis cases will already have captured the contact.
+        cross_mag = float(np.linalg.norm(np.cross(eA_dir, eB_dir)))
+        if cross_mag < 1.0e-4:
+            return
+
+        # Pick the contact edge on A: 4 candidates, indexed by sign pair
+        # (s_b, s_c) on A's perpendicular axes (k_A+1)%3 and (k_A+2)%3.
+        # Choose signs that put the edge midpoint on the side of A closest
+        # to c_B.
+        kA1 = (k_A + 1) % 3
+        kA2 = (k_A + 2) % 3
+        toB = c_B - c_A
+        s_b_A = 1.0 if float(np.dot(toB, R_A[:, kA1])) >= 0 else -1.0
+        s_c_A = 1.0 if float(np.dot(toB, R_A[:, kA2])) >= 0 else -1.0
+        edge_A_mid = c_A + s_b_A * e_A[kA1] * R_A[:, kA1] + s_c_A * e_A[kA2] * R_A[:, kA2]
+        # A's edge spans [-e_A[k_A], +e_A[k_A]] along eA_dir from edge_A_mid.
+        P1 = edge_A_mid - e_A[k_A] * eA_dir
+        Q1 = edge_A_mid + e_A[k_A] * eA_dir
+
+        # Same for B (toward c_A).
+        kB1 = (k_B + 1) % 3
+        kB2 = (k_B + 2) % 3
+        toA = c_A - c_B
+        s_b_B = 1.0 if float(np.dot(toA, R_B[:, kB1])) >= 0 else -1.0
+        s_c_B = 1.0 if float(np.dot(toA, R_B[:, kB2])) >= 0 else -1.0
+        edge_B_mid = c_B + s_b_B * e_B[kB1] * R_B[:, kB1] + s_c_B * e_B[kB2] * R_B[:, kB2]
+        P2 = edge_B_mid - e_B[k_B] * eB_dir
+        Q2 = edge_B_mid + e_B[k_B] * eB_dir
+
+        # Closest points on two segments (Ericson §5.1.9).
+        d1 = Q1 - P1
+        d2 = Q2 - P2
+        r = P1 - P2
+        a = float(np.dot(d1, d1))
+        e = float(np.dot(d2, d2))
+        f = float(np.dot(d2, r))
+        eps = 1.0e-12
+        if a <= eps and e <= eps:
+            s_p, t_p = 0.0, 0.0
+        elif a <= eps:
+            s_p = 0.0
+            t_p = float(np.clip(f / max(e, eps), 0.0, 1.0))
+        elif e <= eps:
+            t_p = 0.0
+            c_ = float(np.dot(d1, r))
+            s_p = float(np.clip(-c_ / a, 0.0, 1.0))
+        else:
+            c_ = float(np.dot(d1, r))
+            b_ = float(np.dot(d1, d2))
+            denom = a * e - b_ * b_
+            if denom != 0.0:
+                s_p = float(np.clip((b_ * f - c_ * e) / denom, 0.0, 1.0))
+            else:
+                s_p = 0.0
+            t_p = (b_ * s_p + f) / e
+            if t_p < 0.0:
+                t_p = 0.0
+                s_p = float(np.clip(-c_ / a, 0.0, 1.0))
+            elif t_p > 1.0:
+                t_p = 1.0
+                s_p = float(np.clip((b_ - c_) / a, 0.0, 1.0))
+        p_on_A = P1 + s_p * d1
+        p_on_B = P2 + t_p * d2
+
+        # Penetration check: the two closest points should be within `margin`
+        # along n_hat (signed gap). n_hat points B→A so (p_on_A - p_on_B)·n_hat
+        # > 0 means separated, ≤ 0 means penetrating.
+        gap = float(np.dot(p_on_A - p_on_B, n_hat))
+        if gap > 0.005:
+            return
+
+        off_a_local = R_A.T @ (p_on_A - c_A)
+        off_b_local = R_B.T @ (p_on_B - c_B)
         t_hat, b_hat = _orthonormal_basis(n_hat)
         mu = self._self_friction
         if (self._friction[i] > 0.0 or self._friction[j] > 0.0):
@@ -689,8 +764,8 @@ class Solver6DOF:
             type=BOX_BOX_CONTACT_6DOF,
             body_a=i, body_b=j,
             world_anchor=(float(n_hat[0]), float(n_hat[1]), float(n_hat[2])),
-            off_a=(float(off_ref_local[0]), float(off_ref_local[1]), float(off_ref_local[2])),
-            off_b=(float(off_inc_local[0]), float(off_inc_local[1]), float(off_inc_local[2])),
+            off_a=(float(off_a_local[0]), float(off_a_local[1]), float(off_a_local[2])),
+            off_b=(float(off_b_local[0]), float(off_b_local[1]), float(off_b_local[2])),
             rest=0.0, stiffness=math.inf,
             fmin=-math.inf, fmax=0.0,
         ))
@@ -701,8 +776,8 @@ class Solver6DOF:
             self._rows.append(_Row(
                 type=CONTACT_TANGENT_6DOF, body_a=i, body_b=j,
                 world_anchor=(float(t_hat[0]), float(t_hat[1]), float(t_hat[2])),
-                off_a=(float(off_ref_local[0]), float(off_ref_local[1]), float(off_ref_local[2])),
-                off_b=(float(off_inc_local[0]), float(off_inc_local[1]), float(off_inc_local[2])),
+                off_a=(float(off_a_local[0]), float(off_a_local[1]), float(off_a_local[2])),
+                off_b=(float(off_b_local[0]), float(off_b_local[1]), float(off_b_local[2])),
                 stiffness=math.inf, sibling=normal_idx, friction=mu,
                 friction_static=mu_s,
             ))
@@ -710,16 +785,18 @@ class Solver6DOF:
             self._rows.append(_Row(
                 type=CONTACT_TANGENT_6DOF, body_a=i, body_b=j,
                 world_anchor=(float(b_hat[0]), float(b_hat[1]), float(b_hat[2])),
-                off_a=(float(off_ref_local[0]), float(off_ref_local[1]), float(off_ref_local[2])),
-                off_b=(float(off_inc_local[0]), float(off_inc_local[1]), float(off_inc_local[2])),
+                off_a=(float(off_a_local[0]), float(off_a_local[1]), float(off_a_local[2])),
+                off_b=(float(off_b_local[0]), float(off_b_local[1]), float(off_b_local[2])),
                 stiffness=math.inf, sibling=normal_idx, friction=mu,
                 friction_static=mu_s,
             ))
             self._rows[t_idx].partner = b_idx
             self._rows[b_idx].partner = t_idx
-        qx = int(round(float(off_ref_local[0]) * 200))
-        qy = int(round(float(off_ref_local[1]) * 200))
-        qz = int(round(float(off_ref_local[2]) * 200))
+        # Cache key on lower-index body for tiebreak invariance.
+        off_key = off_a_local if i < j else off_b_local
+        qx = int(round(float(off_key[0]) * 200))
+        qy = int(round(float(off_key[1]) * 200))
+        qz = int(round(float(off_key[2]) * 200))
         cache_key = (min(i, j), max(i, j), qx, qy, qz)
         self._pool_pair_rows.append((cache_key, normal_idx, t_idx, b_idx))
 
@@ -1078,6 +1155,129 @@ class Solver6DOF:
         finally:
             self.dt = full_dt
 
+    def _ensure_pool_buffers(self, n_pool: int) -> None:
+        """Reallocate GPU-resident cache scratch arrays when the dynamic
+        contact pool grows. Buffers are shared across substeps and only
+        resized when the active pair count exceeds the current capacity.
+        Each pool pair owns 8 floats in the packed buffer — see the layout
+        header above `cache_restore_6dof` in kernels_6dof.py.
+
+        Also reuses the host-side numpy staging buffers so the per-substep
+        upload pattern is (assign into preallocated wp.array) instead of
+        (wp.array(...) → wp.copy → free)."""
+        if n_pool <= self._pool_buf_cap:
+            return
+        cap = max(256, n_pool * 2)
+        dev = self.device
+        self._pool_idx_n = wp.zeros(cap, dtype=int, device=dev)
+        self._pool_idx_t = wp.zeros(cap, dtype=int, device=dev)
+        self._pool_idx_b = wp.zeros(cap, dtype=int, device=dev)
+        self._pool_cache_valid = wp.zeros(cap, dtype=int, device=dev)
+        self._pool_in_packed = wp.zeros(cap * 8, dtype=float, device=dev)
+        self._pool_out_packed = wp.zeros(cap * 8, dtype=float, device=dev)
+        # Host-side staging arrays — sized to capacity so we can reuse them
+        # in subsequent substeps without re-allocating. wp.array.assign()
+        # writes only the prefix that the source covers.
+        self._pool_h_idx_n = np.empty(cap, dtype=np.int32)
+        self._pool_h_idx_t = np.empty(cap, dtype=np.int32)
+        self._pool_h_idx_b = np.empty(cap, dtype=np.int32)
+        self._pool_h_valid = np.empty(cap, dtype=np.int32)
+        self._pool_h_packed = np.empty(cap * 8, dtype=np.float32)
+        self._pool_buf_cap = cap
+
+    def _restore_cache_from_pool(self) -> None:
+        """Build the per-pair index + cached-state buffers on the CPU, upload
+        once, then run cache_restore_6dof to write λ/k/was_static into the
+        live c_* arrays in place. Replaces three full-array GPU↔CPU round
+        trips (c_lambda.numpy(), c_penalty.numpy(), c_was_static.numpy() +
+        their wp.array re-creations) with one small upload + one launch.
+        See AVBD_PERFORMANCE_GAP §5."""
+        n_pool = len(self._pool_pair_rows)
+        if n_pool == 0:
+            return
+        self._ensure_pool_buffers(n_pool)
+        # Fill the staging numpy buffers (preallocated, no new allocations).
+        idx_n = self._pool_h_idx_n
+        idx_t = self._pool_h_idx_t
+        idx_b = self._pool_h_idx_b
+        valid = self._pool_h_valid
+        packed = self._pool_h_packed
+        valid[:n_pool] = 0
+        packed[:n_pool * 8] = 0.0
+        for p_idx, (pair, n_idx, t_idx, b_idx) in enumerate(self._pool_pair_rows):
+            idx_n[p_idx] = n_idx
+            idx_t[p_idx] = t_idx
+            idx_b[p_idx] = b_idx
+            cached = self._contact_cache.get(pair)
+            if cached is None:
+                continue
+            if not all(math.isfinite(v) for v in cached[:6]):
+                continue
+            lam_n, lam_t, lam_b, k_n, k_t, k_b, was = cached
+            base = p_idx * 8
+            packed[base + 0] = lam_n
+            packed[base + 1] = lam_t
+            packed[base + 2] = lam_b
+            packed[base + 3] = k_n
+            packed[base + 4] = k_t
+            packed[base + 5] = k_b
+            packed[base + 7] = float(was)
+            valid[p_idx] = 1
+        # `assign()` writes the source's prefix into the preallocated wp.array
+        # storage — no per-substep device-side allocation, no temp wp.array.
+        self._pool_idx_n.assign(idx_n[:n_pool])
+        self._pool_idx_t.assign(idx_t[:n_pool])
+        self._pool_idx_b.assign(idx_b[:n_pool])
+        self._pool_cache_valid.assign(valid[:n_pool])
+        self._pool_in_packed.assign(packed[:n_pool * 8])
+        wp.launch(
+            K.cache_restore_6dof, dim=n_pool,
+            inputs=[self._pool_idx_n, self._pool_idx_t, self._pool_idx_b,
+                    self._pool_cache_valid, self._pool_in_packed,
+                    self.c_lambda, self.c_penalty, self.c_was_static],
+            device=self.device,
+        )
+
+    def _persist_cache_from_pool(self) -> None:
+        """Inverse of _restore_cache_from_pool — runs cache_collect_6dof to
+        gather the post-solve λ/k/active/was_static of every pool-pair row
+        into one packed staging buffer, then does ONE .numpy() readback
+        before rebuilding the Python contact_cache dict. Eliminates the
+        four full-array .numpy() calls (lam, pen, act, was) the original
+        loop did per substep."""
+        n_pool = len(self._pool_pair_rows)
+        if n_pool == 0:
+            self._contact_cache = {}
+            return
+        dev = self.device
+        wp.launch(
+            K.cache_collect_6dof, dim=n_pool,
+            inputs=[self._pool_idx_n, self._pool_idx_t, self._pool_idx_b,
+                    self.c_lambda, self.c_penalty,
+                    self.c_active, self.c_was_static],
+            outputs=[self._pool_out_packed],
+            device=dev,
+        )
+        arr = self._pool_out_packed.numpy()[:n_pool * 8].reshape(n_pool, 8)
+        new_cache: dict[
+            tuple, tuple[float, float, float, float, float, float, int]
+        ] = {}
+        for p_idx, (pair, _n_idx, _t_idx, _b_idx) in enumerate(self._pool_pair_rows):
+            if arr[p_idx, 6] == 0.0:   # c_active[n_idx] == 0
+                continue
+            lam_n = float(arr[p_idx, 0])
+            lam_t = float(arr[p_idx, 1])
+            lam_b = float(arr[p_idx, 2])
+            k_n = float(arr[p_idx, 3])
+            k_t = float(arr[p_idx, 4])
+            k_b = float(arr[p_idx, 5])
+            was = int(arr[p_idx, 7])
+            if not all(math.isfinite(v)
+                       for v in (lam_n, lam_t, lam_b, k_n, k_t, k_b)):
+                continue
+            new_cache[pair] = (lam_n, lam_t, lam_b, k_n, k_t, k_b, was)
+        self._contact_cache = new_cache
+
     def _step_one(self) -> None:
         # Generate dynamic OBB-OBB contacts from CURRENT body positions
         # BEFORE the upload — _rebuild_contact_pool mutates self._rows and
@@ -1089,31 +1289,12 @@ class Solver6DOF:
         # Seed λ + penalty for pool rows from the persistent cache so OBB
         # stacks carry their augmented-Lagrangian state across frames (without
         # this, every contact restarts from PENALTY_MIN every frame and a
-        # stable stack looks like a soft spring during the transient).
+        # stable stack looks like a soft spring during the transient). The
+        # restore runs as a Warp kernel against preallocated GPU buffers so
+        # the live c_lambda / c_penalty / c_was_static arrays stay resident
+        # through the substep — see AVBD_PERFORMANCE_GAP §5.
         if self._self_collide and self._pool_pair_rows:
-            lam_np = self.c_lambda.numpy().copy()
-            pen_np = self.c_penalty.numpy().copy()
-            was_np = self.c_was_static.numpy().copy()
-            for pair, n_idx, t_idx, b_idx in self._pool_pair_rows:
-                cached = self._contact_cache.get(pair)
-                if cached is None:
-                    continue
-                # Tuple layout: (λ_n, λ_t, λ_b, k_n, k_t, k_b, was_static)
-                if not all(math.isfinite(v) for v in cached[:6]):
-                    continue
-                lam_n, lam_t, lam_b, k_n, k_t, k_b, was = cached
-                lam_np[n_idx] = lam_n
-                pen_np[n_idx] = k_n
-                was_np[n_idx] = int(was)
-                if t_idx >= 0:
-                    lam_np[t_idx] = lam_t
-                    pen_np[t_idx] = k_t
-                if b_idx >= 0:
-                    lam_np[b_idx] = lam_b
-                    pen_np[b_idx] = k_b
-            self.c_lambda = wp.array(lam_np, dtype=float, device=self.device)
-            self.c_penalty = wp.array(pen_np, dtype=float, device=self.device)
-            self.c_was_static = wp.array(was_np, dtype=int, device=self.device)
+            self._restore_cache_from_pool()
         n_b = len(self._x)
         n_c = len(self._rows)
         if n_b == 0:
@@ -1231,31 +1412,10 @@ class Solver6DOF:
 
         # Persist contact-pool λ + penalty for the next step. Drop pairs
         # whose contact became inactive (e.g., separated or fractured).
+        # The collect kernel packs everything into one float buffer so we
+        # do a single .numpy() (vs four) — see AVBD_PERFORMANCE_GAP §5.
         if self._self_collide and self._pool_pair_rows:
-            lam_np = self.c_lambda.numpy()
-            pen_np = self.c_penalty.numpy()
-            act_np = self.c_active.numpy()
-            was_np = self.c_was_static.numpy()
-            new_cache: dict[
-                tuple, tuple[float, float, float, float, float, float, int]
-            ] = {}
-            for pair, n_idx, t_idx, b_idx in self._pool_pair_rows:
-                if act_np[n_idx] == 0:
-                    continue
-                lam_n = float(lam_np[n_idx])
-                k_n = float(pen_np[n_idx])
-                lam_t = float(lam_np[t_idx]) if t_idx >= 0 else 0.0
-                k_t = float(pen_np[t_idx]) if t_idx >= 0 else 1.0
-                lam_b = float(lam_np[b_idx]) if b_idx >= 0 else 0.0
-                k_b = float(pen_np[b_idx]) if b_idx >= 0 else 1.0
-                if not all(math.isfinite(v) for v in (lam_n, lam_t, lam_b, k_n, k_t, k_b)):
-                    continue
-                # was_static is stored on the NORMAL row and is the
-                # "is this contact currently sticking" flag carried across
-                # frames so a settled stack doesn't have to re-discover it.
-                new_cache[pair] = (lam_n, lam_t, lam_b, k_n, k_t, k_b,
-                                   int(was_np[n_idx]))
-            self._contact_cache = new_cache
+            self._persist_cache_from_pool()
 
     # ---- Read-back ----------------------------------------------------------
 
@@ -1288,3 +1448,84 @@ class Solver6DOF:
         if self.c_active is None:
             return np.ones(len(self._rows), dtype=np.int32)
         return self.c_active.numpy()
+
+    # ---- Batched readback (AVBD_PERFORMANCE_GAP §6) ------------------------
+
+    def read_state_batched(self) -> dict[str, np.ndarray]:
+        """Pack everything the interactive viewer needs into TWO contiguous
+        Warp arrays, then issue a single .numpy() per packed buffer. Replaces
+        seven separate stream-syncing .numpy() calls with two.
+
+        Returns a dict with keys:
+            positions          (n_b, 3) float32
+            orientations       (n_b, 4) float32   xyzw
+            angular_velocities (n_b, 3) float32
+            lambdas            (n_c,)   float32
+            active             (n_c,)   int32
+            was_static         (n_c,)   int32
+            c_type             (n_c,)   int32
+
+        Falls back to the per-array readers if the solver hasn't flushed yet
+        (caller hit it before the first step()).
+        """
+        n_b = len(self._x)
+        n_c = len(self._rows)
+        if n_b == 0 or self.x is None:
+            return {
+                "positions": np.array(self._x, dtype=np.float32).reshape(-1, 3),
+                "orientations": np.array(self._q, dtype=np.float32).reshape(-1, 4),
+                "angular_velocities": np.array(self._omega, dtype=np.float32).reshape(-1, 3),
+                "lambdas": np.zeros(n_c, dtype=np.float32),
+                "active": np.ones(n_c, dtype=np.int32),
+                "was_static": np.zeros(n_c, dtype=np.int32),
+                "c_type": np.zeros(n_c, dtype=np.int32),
+            }
+        dev = self.device
+        # Reuse staging buffers across frames; reallocate only on count change.
+        if (self._viewer_pack_bodies is None
+                or self._viewer_pack_bodies_n != n_b):
+            self._viewer_pack_bodies = wp.zeros(n_b * 10, dtype=float,
+                                                device=dev)
+            self._viewer_pack_bodies_n = n_b
+        if (self._viewer_pack_rows is None
+                or self._viewer_pack_rows_n != n_c):
+            self._viewer_pack_rows = (wp.zeros(n_c * 3, dtype=float,
+                                               device=dev)
+                                      if n_c > 0 else None)
+            self._viewer_pack_rows_n = n_c
+        wp.launch(
+            K.viewer_pack_bodies_6dof, dim=n_b,
+            inputs=[self.x, self.q, self.omega],
+            outputs=[self._viewer_pack_bodies],
+            device=dev,
+        )
+        if n_c > 0:
+            wp.launch(
+                K.viewer_pack_rows_6dof, dim=n_c,
+                inputs=[self.c_lambda, self.c_active,
+                        self.c_was_static, self.c_type],
+                outputs=[self._viewer_pack_rows],
+                device=dev,
+            )
+        bod = self._viewer_pack_bodies.numpy().reshape(n_b, 10)
+        if n_c > 0:
+            row = self._viewer_pack_rows.numpy().reshape(n_c, 3)
+            lam = row[:, 0].astype(np.float32, copy=True)
+            act = row[:, 1].astype(np.int32, copy=False)
+            ws_type = row[:, 2].astype(np.int32, copy=False)
+            was = (ws_type // 16).astype(np.int32, copy=False)
+            ctype = (ws_type % 16).astype(np.int32, copy=False)
+        else:
+            lam = np.zeros(0, dtype=np.float32)
+            act = np.zeros(0, dtype=np.int32)
+            was = np.zeros(0, dtype=np.int32)
+            ctype = np.zeros(0, dtype=np.int32)
+        return {
+            "positions": bod[:, 0:3].astype(np.float32, copy=True),
+            "orientations": bod[:, 3:7].astype(np.float32, copy=True),
+            "angular_velocities": bod[:, 7:10].astype(np.float32, copy=True),
+            "lambdas": lam,
+            "active": act,
+            "was_static": was,
+            "c_type": ctype,
+        }

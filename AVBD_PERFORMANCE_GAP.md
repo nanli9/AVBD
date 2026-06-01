@@ -1,5 +1,42 @@
 # AVBD Performance Gap Notes
 
+> **Status update (2026-06-01).** Two of the gaps below have been closed.
+> The rest are deferred with implementation plans in
+> [PERFORMANCE_PROGRESS.md](PERFORMANCE_PROGRESS.md). Constraint: this
+> machine has no NVIDIA GPU, so changes had to be architectural shifts
+> validatable on the Warp CPU backend — no GPU perf numbers reportable.
+>
+> **Done this session**
+> - §5 *Contact warm-start cache crosses CPU/GPU* — replaced 6 full-array
+>   `.numpy()` syncs + 3 `wp.array` rebuilds per substep with 2 Warp
+>   kernels (`cache_restore_6dof`, `cache_collect_6dof`) operating on
+>   preallocated GPU-resident scratch buffers. Host staging arrays are
+>   reused via `wp.array.assign(prefix)` so the device side no longer
+>   reallocates per substep.
+> - §6 *Viewer readbacks every frame* — added
+>   `Solver6DOF.read_state_batched()` backed by two pack kernels
+>   (`viewer_pack_bodies_6dof`, `viewer_pack_rows_6dof`). Per-frame
+>   stream syncs in `examples/viewer.py:tick` drop from ~7 to 2.
+>
+> **Not done this session (deferred)**
+> - §3 *Dynamic contact generation not fully GPU-resident* — Warp
+>   face-clip + contact-emit kernel. Skipped because the SH-clip
+>   geometry is dense, output is variable-per-pair (0–4 contacts), and
+>   it has no CPU-validation path. Detailed implementation plan in
+>   PERFORMANCE_PROGRESS.md §3.
+> - §4 *Constraint rows are Python objects rebuilt every substep* —
+>   blocked on §3 (contact manifold must land in GPU buffers first)
+>   and on the body adjacency / coloring rebuild problem.
+> - §2 *Too many launches per visual frame* — CUDA-graph capture path.
+>   `wp.ScopedCapture` is CUDA-only, no CPU validation possible.
+> - §1 *Tiny GPU work per launch* and §8 *Hardware difference* —
+>   intrinsic to the scene size + local GPU, not addressable in code.
+> - §7 *Renderer not built for many bodies* — out of scope (rendering,
+>   not solver).
+>
+> See PERFORMANCE_PROGRESS.md for the full change list and the deferred
+> work plans.
+
 ## Summary
 
 The GPU is visible and Warp is launching kernels on `cuda:0`, but the current
