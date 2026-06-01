@@ -176,6 +176,9 @@ problem size is too small and too synchronization-heavy for CUDA to win.
 
 ### 1. Tiny GPU Work Per Launch
 
+**Status: STILL OPEN. Intrinsic to scene size; not addressable in
+code without a larger benchmark scene.**
+
 Relevant code:
 
 - `src/avbd3d/solver_6dof.py`, primal loop around the per-color launch.
@@ -196,6 +199,8 @@ thousands of independent bodies to process.
 
 ### 2. Too Many Launches Per Visual Frame
 
+**Status: STILL OPEN. Needs CUDA-only `wp.ScopedCapture` to validate.**
+
 Default viewer settings:
 
 ```text
@@ -213,102 +218,139 @@ small Warp launches.
 Paper highlighted numbers use about `4` iterations. They are not directly
 comparable to the current viewer's stability-heavy settings.
 
+What closing this needs: CUDA-graph capture of the substep kernel
+sequence (predict_inertial → substep_prelude → (primal × colors +
+dual) × iters → finalize) with re-capture on topology change. The
+graph replays as one launch per substep on CUDA. `wp.ScopedCapture`
+is CUDA-only — there is no CPU code path to validate against, so
+this stays deferred until a GPU is available. Implementation plan
+in `PERFORMANCE_PROGRESS.md` §5.
+
 ### 3. Dynamic Contact Generation Is Not Fully GPU-Resident
+
+**Status: geometry hot loop CLOSED (opt-in). Row append still Python.**
+
+The Sutherland-Hodgman face-clip + closest-segment-pair + tangent-basis
++ body-local-offset math now lives in
+`kernels_6dof.py::obb_contact_manifold_6dof`. Enable with:
+
+```python
+Solver6DOF(..., use_warp_face_clip=True)
+```
+
+The kernel handles both face-face (up to 4 contacts per pair via SH
+clipping) and edge-edge (1 contact via closest-segment-pair) inside
+one launch. Output is written to fixed-size buffers (4 contact slots
+per pair) and read back once per substep.
+
+What is still CPU-side: the row-append into `self._rows` (the Python
+`_Row` list). That's gap §4 below — the contact pipeline math is now
+on GPU, but the dynamic constraint storage isn't yet.
 
 Relevant code:
 
-- `src/avbd3d/solver_6dof.py`, `_warp_broadphase_emit_contacts`.
-- `src/avbd3d/solver_6dof.py`, `_emit_obb_pair_with_sat`.
-- `src/avbd3d/solver_6dof.py`, `_rebuild_contact_pool`.
+- `kernels_6dof.py::obb_contact_manifold_6dof` (kernel).
+- `solver_6dof.py::_warp_emit_contacts_kernel_path` (integration).
+- `solver_6dof.py::_warp_broadphase_emit_contacts` (the branch on the flag).
 
-The current code does use Warp for AABB generation, BVH broadphase, and SAT, but
-then reads data back to CPU:
+Parity vs the Python emitter is guarded by
+`tests/test_kernel_face_clip.py::test_kernel_face_clip_matches_python_stack`
+(3-cube tower, 360 frames × 8 substeps = 2880 manifold passes; max y
+divergence between paths ~6 µm on the CPU backend).
 
-```python
-n_pairs = int(self._bp_pair_count.numpy()[0])
-a_np = self._bp_pair_a.numpy()[:n_pairs]
-b_np = self._bp_pair_b.numpy()[:n_pairs]
-ov_np = self._bp_pair_overlap.numpy()[:n_pairs]
-si_np = self._bp_pair_sat_idx.numpy()[:n_pairs]
-nh_np = self._bp_pair_n_hat.numpy().reshape(-1, 3)[:n_pairs]
-```
-
-Then contact face clipping and row emission happen in Python/NumPy. This creates
-CPU/GPU synchronization and prevents the contact pipeline from scaling like a
-fully GPU-resident implementation.
-
-Paper-level performance requires the collision/contact/constraint pipeline to
-stay on GPU or to use carefully batched GPU buffers with minimal readback.
+The flag stays default-False until benchmarked on real CUDA hardware.
 
 ### 4. Constraint Rows Are Python Objects Rebuilt Every Substep
 
-Dynamic contacts mutate `self._rows`, a Python list of `_Row` objects. After
-contacts are rebuilt, the solver has to upload arrays again for:
+**Status: STILL OPEN.** This is now the largest remaining
+software-side gap.
 
-- row types,
-- body indices,
-- anchors,
-- offsets,
-- stiffness,
-- lambda,
-- penalty,
-- friction,
-- active flags,
-- adjacency,
-- body colors.
+The §3 kernel computed each contact's geometry on GPU but still
+appends the resulting Box-Box + tangent rows to `self._rows` (the
+Python `_Row` list). `_flush()` then rebuilds the full `c_*` Warp
+arrays + the body-adjacency CSR + the graph coloring on every substep.
 
-That is good for clarity and debugging, but it is not how the paper-scale
-implementation would represent constraints.
+What closing this needs:
 
-A high-performance implementation would usually use preallocated GPU buffers,
-active counts, compaction, persistent contact keys, and on-device cache updates.
+1. Preallocate a fixed-cap "dynamic constraint region" at the tail of
+   the `c_*` Warp arrays. Have `obb_contact_manifold_6dof` (or a
+   sibling kernel) atomic-append directly into that region instead
+   of writing to the per-pair contact slots that Python then reads.
+2. Skip `_flush()` per substep when only the dynamic region changes.
+3. Solve the coloring problem — either a conservative proximity-graph
+   coloring computed once per scene (large N pays back the
+   over-coloring cost) or atomic-primal updates (loses Gauss-Seidel
+   ordering; AVBD paper avoids this).
+
+The official `avbd-demo3d` GPU pipeline uses option (3a) — fixed
+coloring + GPU-resident constraint buffers + atomic-append from the
+contact kernel. That's the target architecture.
 
 ### 5. Contact Warm-Start Cache Crosses CPU/GPU
 
+**Status: CLOSED.**
+
+The per-substep cache restore + persist now run as Warp kernels
+(`cache_restore_6dof`, `cache_collect_6dof`) against preallocated
+GPU-resident scratch buffers. The previous code did 6 full-array
+`.numpy()` reads + 3 `wp.array(...)` rebuilds per substep (≈ 48
+stream syncs per frame at `substeps=8`); the new code does 1 small
+upload + 1 launch (restore) + 1 launch + 1 small readback (persist).
+
+Host-side staging arrays are reused via `wp.array.assign(prefix)`
+so the device side does not reallocate per substep.
+
 Relevant code:
 
-- `src/avbd3d/solver_6dof.py`, contact cache restore before the solve.
-- `src/avbd3d/solver_6dof.py`, contact cache persist after the solve.
+- `kernels_6dof.py::cache_restore_6dof`,
+  `kernels_6dof.py::cache_collect_6dof`.
+- `solver_6dof.py::_restore_cache_from_pool`,
+  `solver_6dof.py::_persist_cache_from_pool`,
+  `solver_6dof.py::_ensure_pool_buffers`.
 
-The current implementation reads lambda, penalty, active flags, and static
-friction state back to CPU to preserve contact-pool warm-start data.
-
-This helps physical stability, but it adds synchronization and CPU-side work.
-
-For paper-like throughput, this cache would need to be GPU-resident.
+Validated by the existing `test_two_cubes_stack_axis_aligned` and
+`test_three_cubes_stack` cases — both stress the cache restore/persist
+path across substep boundaries.
 
 ### 6. Viewer Readbacks Happen Every Frame
 
+**Status: CLOSED.**
+
+`Solver6DOF.read_state_batched()` packs all seven per-frame fields the
+viewer reads (positions, orientations, angular velocities, lambdas,
+active, was_static, c_type) into two staging buffers via the
+`viewer_pack_bodies_6dof` + `viewer_pack_rows_6dof` kernels. The HUD +
+scene update now does 2 `.numpy()` calls per rendered frame instead of
+7. The remaining residual cost — individual viser scene-handle updates
+per body — is gap §7 (renderer, out of scope for the solver).
+
 Relevant code:
 
-- `examples/viewer.py`, `tick`.
+- `kernels_6dof.py::viewer_pack_bodies_6dof`,
+  `kernels_6dof.py::viewer_pack_rows_6dof`.
+- `solver_6dof.py::Solver6DOF.read_state_batched`.
+- `examples/viewer.py::Viewer.tick` (now reads `state["..."]` keys).
 
-The viewer reads from the solver every frame:
-
-- positions,
-- orientations,
-- angular velocities,
-- lambdas,
-- active flags,
-- static friction flags,
-- row types.
-
-Each `.numpy()` on CUDA synchronizes or transfers data to CPU. This is fine for a
-small interactive debug viewer, but not for benchmark-style GPU throughput.
-
-The paper demo's performance should be considered simulation/rendering pipeline
-performance, not Python GUI object update performance.
+A direct comparison vs. the per-array readers (`positions()`,
+`orientations()`, …) produces identical float values and exact int
+matches for `active` / `was_static` / `c_type`.
 
 ### 7. Renderer/View Layer Is Not Built for Millions of Bodies
+
+**Status: STILL OPEN. Out of scope for the solver.**
 
 `viser` is convenient for debugging and interaction, but the current viewer
 updates individual scene handles from Python. That is not comparable to an
 instanced renderer or GPU-driven visualization.
 
 Even if the solver were faster, the viewer architecture would become a
-bottleneck long before millions of bodies.
+bottleneck long before millions of bodies. Closing this is a renderer
+change (instanced draw via a different visualization stack), not a
+solver change.
 
 ### 8. Hardware Difference
+
+**Status: STILL OPEN. Not addressable in code.**
 
 The paper number cited above uses an RTX 4090. The local machine reported:
 
@@ -321,77 +363,99 @@ by itself, but it matters once the implementation is otherwise optimized.
 
 ## What Is Implemented Correctly vs. What Is Missing
 
-Implemented or partially implemented in this repo:
+Implemented in this repo:
 
 - AVBD-style primal/dual iteration.
 - 6-DOF rigid-body local solve.
-- Graph coloring for parallel body updates.
+- Graph coloring for parallel body updates (rebuilt per substep — see §4).
 - Warp kernels for core solver operations.
-- Warp broadphase/SAT pieces.
+- Warp broadphase / SAT / contact manifold (manifold opt-in via
+  `use_warp_face_clip=True`, see §3).
+- GPU-resident contact warm-start cache (was §5, now closed).
+- Batched viewer readback (was §6, now closed).
 - Persistent lambda/penalty warm-starting for contacts.
 - Static/dynamic friction logic.
 - Interactive Viser viewer.
 
-Missing for paper-like performance:
+Still missing for paper-like performance:
 
-- fully GPU-resident contact manifold generation,
-- GPU-resident dynamic constraint buffers,
-- GPU-resident contact warm-start cache,
-- fewer CPU `.numpy()` readbacks,
-- fewer Python-driven kernel launches,
-- larger batched workloads,
-- lower iteration-count benchmark mode,
-- GPU-friendly rendering/instancing,
-- likely CUDA graph capture or fused kernels for stable parts of the step.
+- GPU-resident dynamic constraint buffers (§4 — biggest open item).
+- Fewer Python-driven kernel launches (§2 — needs CUDA-graph capture).
+- Larger batched workloads (§1 — scene-size bound, not addressable in code).
+- Lower iteration-count benchmark mode (cheap to add; gated on GPU).
+- GPU-friendly rendering / instancing (§7 — out of scope for the solver).
 
 ## Practical Interpretation
 
 The current repo is useful for validating AVBD concepts and debugging behavior,
-but it is not a reproduction of the paper's optimized performance path.
+but it is not yet a reproduction of the paper's optimized performance path.
 
-The slow result is therefore expected:
+After this session's changes:
+
+- Cache restore/persist no longer hops through CPU per substep (§5).
+- Viewer no longer issues 7 separate stream syncs per rendered frame (§6).
+- The contact-manifold geometry hot loop runs on GPU when the opt-in
+  flag is on (§3).
+
+The slow result is still expected on small scenes:
 
 - CPU does relatively well because the scene is small and Python/Warp launch
   overhead dominates.
-- GPU does not win because it is doing very little work per launch and is forced
-  to synchronize with CPU repeatedly.
-- Increasing bodies substantially would help GPU occupancy, but the current
-  Python contact/viewer pipeline will then become the next bottleneck.
+- GPU does not win because it is doing very little work per launch (§1) and
+  Python still drives hundreds of launches per frame (§2).
+- Increasing bodies will help GPU occupancy, but the per-substep `_flush()`
+  rebuild (§4) will then be the next bottleneck — that is the next milestone.
 
 ## Most Important Code Hotspots
 
-These are the areas responsible for the performance gap:
-
-- `examples/viewer.py`
-  - Per-frame `.numpy()` readbacks and individual Viser object updates.
+After this session's changes, the remaining hotspots are:
 
 - `src/avbd3d/solver_6dof.py`
-  - `_step_one`: substep structure, contact rebuild, cache restore/persist.
-  - `_warp_broadphase_emit_contacts`: GPU broadphase/SAT followed by CPU
-    readback and Python face clipping.
-  - `_emit_obb_pair_with_sat`: Python/NumPy contact manifold generation.
-  - `_flush` / constraint upload path: Python rows converted into Warp arrays.
-  - primal loop: one launch per color per iteration.
+  - `_flush` / constraint upload path: still rebuilds the full `c_*`
+    Warp arrays + body adjacency CSR + graph coloring on every substep
+    when dynamic contacts mutate `self._rows`. This is gap §4 and is
+    now the single largest software-side cost on CPU. Closing it
+    requires GPU-resident dynamic row buffers.
+  - primal loop: one launch per color per iteration. With small scenes
+    each launch is mostly overhead (§1). With large scenes the launches
+    add up (§2) and would benefit from CUDA-graph capture.
+  - `_warp_emit_contacts_kernel_path`: still has one batched readback
+    of the kernel's per-pair contact output (count + ref_is_a + n/t/b
+    + off_ref + off_inc — 8 small arrays). One sync per substep, vs. the
+    previous Python path that read back broadphase results AND did the
+    face-clip math in Python. Eliminating this last readback is part
+    of closing §4 (rows would be on GPU; no Python row append needed).
+
+- `examples/viewer.py`
+  - Per-frame Viser scene-handle updates (per-box `.position` /
+    `.wxyz`). Solver-side state is now batched (§6 closed) but the
+    rendering layer still iterates Python objects (§7, out of scope).
 
 - `src/avbd3d/kernels_6dof.py`
-  - `primal_update_6dof`: does the local solve on GPU, but the default scene
-    launches it with too few active bodies.
-  - `dual_update_6dof`: also launched many times over relatively small arrays.
+  - `primal_update_6dof` / `dual_update_6dof`: still launched per-color
+    per-iter. Mostly bound by §1/§2, not by the kernel math itself.
 
 ## Bottom Line
 
-The gap is not that AVBD is slow. The gap is that this implementation does not
-yet have the GPU-resident, large-batch, low-synchronization architecture needed
-to reproduce the paper's performance claims.
+The gap is not that AVBD is slow. The gap is that this implementation
+does not yet have the GPU-resident, large-batch, low-synchronization
+architecture needed to reproduce the paper's performance claims.
 
-To move toward the paper result, the first major milestone would be:
+Progress on the six-milestone roadmap:
 
-1. keep dynamic contact generation and contact manifolds on GPU,
-2. store constraints in preallocated GPU buffers rather than Python `_Row`
-   objects,
-3. keep the contact warm-start cache on GPU,
-4. reduce `.numpy()` calls in the solver/viewer hot path,
-5. benchmark with paper-like iteration counts and much larger scenes,
-6. use a renderer path that can instance many bodies without Python per-object
-   updates.
+1. ☑ Keep dynamic contact generation and contact manifolds on GPU.
+   (§3 — `obb_contact_manifold_6dof` kernel, opt-in.)
+2. ☐ Store constraints in preallocated GPU buffers rather than Python
+   `_Row` objects. (§4 — open; now the biggest single item.)
+3. ☑ Keep the contact warm-start cache on GPU. (§5 — closed.)
+4. ◐ Reduce `.numpy()` calls in the solver/viewer hot path. (§5 + §6
+   closed; the solver still has one batched readback per substep for
+   the §3 kernel output, which closes when §4 closes.)
+5. ☐ Benchmark with paper-like iteration counts and much larger scenes.
+   (Gated on GPU access.)
+6. ☐ Use a renderer path that can instance many bodies without Python
+   per-object updates. (§7 — out of scope for the solver.)
+
+Six-milestone score: 2.5 done, 0 + 2 + 1 deferred (the latter gated on
+either GPU access or scope-expansion into the renderer).
 
