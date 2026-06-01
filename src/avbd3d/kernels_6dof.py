@@ -1385,6 +1385,365 @@ def viewer_pack_bodies_6dof(
     out[base + 9] = wi[2]
 
 
+# =============================================================================
+# OBB contact manifold — GPU port of _emit_obb_pair_with_sat /
+# _emit_obb_edge_edge (closes AVBD_PERFORMANCE_GAP §3 hot inner loop).
+# =============================================================================
+# Replaces the Python Sutherland-Hodgman face-clip + tangent-basis + body-local
+# offset computation with a single kernel. Output is up to 4 contacts per pair
+# in fixed-size buffers; the Python caller reads back the count + buffers and
+# emits the Box-Box constraint rows (row emission still touches the Python
+# `_Row` list since that lives outside the GPU — see §4 in PERFORMANCE_PROGRESS).
+#
+# Layout per pair p:
+#   out_contact_count[p]            in {0, 1, 2, 3, 4}
+#   out_ref_is_a[p]                 1 if "reference" body == pair_a[p], else 0
+#                                   (always 1 for edge-edge contacts)
+#   out_n_hat[p], out_t_hat[p], out_b_hat[p]  contact-frame world axes
+#   out_off_ref[p*4 + c]            body-local anchor on ref body for contact c
+#   out_off_inc[p*4 + c]            body-local anchor on inc body for contact c
+#
+# Scratch per pair: 16 vec3 slots in `poly_scratch` (two 8-vert polygons used
+# as the SH double-buffer) + 8 floats / 8 ints in `depth_scratch` /
+# `idx_scratch` for the top-4 selection sort.
+#
+# Edge-edge contact (sat_idx >= 6) emits a single contact via Ericson §5.1.9
+# closest-segment-pair, identical math to _emit_obb_edge_edge.
+
+vec4i = wp.types.vector(length=4, dtype=int)
+
+
+@wp.func
+def orthonormal_basis_3d(n: wp.vec3) -> wp.vec3:
+    """Duff 2017 stable orthonormal basis perp to n̂. Returns t̂; the third
+    basis vector b̂ = n̂ × t̂. Matches the Python `_orthonormal_basis` in
+    solver_6dof.py byte-for-byte so kernel-emitted tangent rows have the
+    same (t, b) frame as the Python reference path."""
+    sign = wp.where(n[2] >= 0.0, 1.0, -1.0)
+    a = -1.0 / (sign + n[2])
+    b_ = n[0] * n[1] * a
+    t = wp.vec3(1.0 + sign * n[0] * n[0] * a, sign * b_, -sign * n[0])
+    return t
+
+
+@wp.kernel
+def obb_contact_manifold_6dof(
+    x: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.quat),
+    half_extents: wp.array(dtype=wp.vec3),
+    pair_a: wp.array(dtype=int),
+    pair_b: wp.array(dtype=int),
+    pair_overlap: wp.array(dtype=int),
+    pair_sat_idx: wp.array(dtype=int),
+    pair_n_hat: wp.array(dtype=wp.vec3),
+    n_pairs: int,
+    margin: float,
+    # scratch: 16 vec3 slots per pair for SH polygon double-buffer
+    poly_scratch: wp.array(dtype=wp.vec3),
+    # outputs (per pair, 1 each)
+    out_contact_count: wp.array(dtype=int),
+    out_ref_is_a: wp.array(dtype=int),
+    out_n_hat: wp.array(dtype=wp.vec3),
+    out_t_hat: wp.array(dtype=wp.vec3),
+    out_b_hat: wp.array(dtype=wp.vec3),
+    # outputs (per pair × 4 contact slots)
+    out_off_ref: wp.array(dtype=wp.vec3),
+    out_off_inc: wp.array(dtype=wp.vec3),
+):
+    p = wp.tid()
+    out_contact_count[p] = 0
+    if p >= n_pairs:
+        return
+    if pair_overlap[p] == 0:
+        return
+    sat_idx = pair_sat_idx[p]
+    i = pair_a[p]
+    j = pair_b[p]
+    c_A = x[i]
+    c_B = x[j]
+    e_A = half_extents[i]
+    e_B = half_extents[j]
+    R_A = wp.quat_to_matrix(q[i])
+    R_B = wp.quat_to_matrix(q[j])
+    n_hat_in = pair_n_hat[p]
+
+    # ------------------------- Edge-edge case (sat_idx ≥ 6) -------------------
+    if sat_idx >= 6:
+        eidx = sat_idx - 6
+        k_A = eidx // 3
+        k_B = eidx % 3
+        eA_dir = wp.vec3(R_A[0, k_A], R_A[1, k_A], R_A[2, k_A])
+        eB_dir = wp.vec3(R_B[0, k_B], R_B[1, k_B], R_B[2, k_B])
+        cross_mag = wp.length(wp.cross(eA_dir, eB_dir))
+        if cross_mag < 1.0e-4:
+            return    # parallel edges — face-axis case already handled
+        # Sign-select the contact edge on each body (away from the other COM).
+        kA1 = (k_A + 1) % 3
+        kA2 = (k_A + 2) % 3
+        A1c = wp.vec3(R_A[0, kA1], R_A[1, kA1], R_A[2, kA1])
+        A2c = wp.vec3(R_A[0, kA2], R_A[1, kA2], R_A[2, kA2])
+        toB = c_B - c_A
+        s_b_A = wp.where(wp.dot(toB, A1c) >= 0.0, 1.0, -1.0)
+        s_c_A = wp.where(wp.dot(toB, A2c) >= 0.0, 1.0, -1.0)
+        edge_A_mid = c_A + A1c * (s_b_A * e_A[kA1]) + A2c * (s_c_A * e_A[kA2])
+        P1 = edge_A_mid - eA_dir * e_A[k_A]
+        Q1 = edge_A_mid + eA_dir * e_A[k_A]
+        kB1 = (k_B + 1) % 3
+        kB2 = (k_B + 2) % 3
+        B1c = wp.vec3(R_B[0, kB1], R_B[1, kB1], R_B[2, kB1])
+        B2c = wp.vec3(R_B[0, kB2], R_B[1, kB2], R_B[2, kB2])
+        toA = c_A - c_B
+        s_b_B = wp.where(wp.dot(toA, B1c) >= 0.0, 1.0, -1.0)
+        s_c_B = wp.where(wp.dot(toA, B2c) >= 0.0, 1.0, -1.0)
+        edge_B_mid = c_B + B1c * (s_b_B * e_B[kB1]) + B2c * (s_c_B * e_B[kB2])
+        P2 = edge_B_mid - eB_dir * e_B[k_B]
+        Q2 = edge_B_mid + eB_dir * e_B[k_B]
+        # Closest-segment-pair (Ericson §5.1.9) — same branch structure as
+        # the Python reference.
+        d1 = Q1 - P1
+        d2 = Q2 - P2
+        r = P1 - P2
+        a = wp.dot(d1, d1)
+        e_val = wp.dot(d2, d2)
+        f = wp.dot(d2, r)
+        eps = 1.0e-12
+        s_p = float(0.0)
+        t_p = float(0.0)
+        if a <= eps and e_val <= eps:
+            s_p = 0.0
+            t_p = 0.0
+        elif a <= eps:
+            s_p = 0.0
+            t_p = wp.clamp(f / wp.max(e_val, eps), 0.0, 1.0)
+        elif e_val <= eps:
+            t_p = 0.0
+            c_ = wp.dot(d1, r)
+            s_p = wp.clamp(-c_ / a, 0.0, 1.0)
+        else:
+            c_ = wp.dot(d1, r)
+            b_ = wp.dot(d1, d2)
+            denom = a * e_val - b_ * b_
+            if denom != 0.0:
+                s_p = wp.clamp((b_ * f - c_ * e_val) / denom, 0.0, 1.0)
+            else:
+                s_p = 0.0
+            t_p = (b_ * s_p + f) / e_val
+            if t_p < 0.0:
+                t_p = 0.0
+                s_p = wp.clamp(-c_ / a, 0.0, 1.0)
+            elif t_p > 1.0:
+                t_p = 1.0
+                s_p = wp.clamp((b_ - c_) / a, 0.0, 1.0)
+        p_on_A = P1 + d1 * s_p
+        p_on_B = P2 + d2 * t_p
+        gap = wp.dot(p_on_A - p_on_B, n_hat_in)
+        if gap > margin:
+            return
+        Rt_A = wp.transpose(R_A)
+        Rt_B = wp.transpose(R_B)
+        off_a_local = Rt_A * (p_on_A - c_A)
+        off_b_local = Rt_B * (p_on_B - c_B)
+        t_hat = orthonormal_basis_3d(n_hat_in)
+        b_hat = wp.cross(n_hat_in, t_hat)
+        out_contact_count[p] = 1
+        out_ref_is_a[p] = 1
+        out_n_hat[p] = n_hat_in
+        out_t_hat[p] = t_hat
+        out_b_hat[p] = b_hat
+        out_off_ref[p * 4 + 0] = off_a_local
+        out_off_inc[p * 4 + 0] = off_b_local
+        return
+
+    # ------------------------- Face-face case (sat_idx < 6) -------------------
+    ref_is_a_int = wp.where(sat_idx < 3, 1, 0)
+    out_ref_is_a[p] = ref_is_a_int
+    # Select ref/inc geometry. Note: when ref=B (sat_idx ∈ [3,6)), we flip
+    # n_hat because pair_n_hat was returned "B→A" by obb_sat_pairs and we
+    # need it to point "inc→ref" for the new mapping.
+    ref_axis = int(0)
+    n_hat_used = wp.vec3(0.0, 0.0, 0.0)
+    ref_c = wp.vec3(0.0, 0.0, 0.0)
+    R_ref = wp.mat33()
+    e_ref = wp.vec3(0.0, 0.0, 0.0)
+    inc_c = wp.vec3(0.0, 0.0, 0.0)
+    R_inc = wp.mat33()
+    e_inc = wp.vec3(0.0, 0.0, 0.0)
+    if sat_idx < 3:
+        ref_axis = sat_idx
+        n_hat_used = n_hat_in
+        ref_c = c_A
+        R_ref = R_A
+        e_ref = e_A
+        inc_c = c_B
+        R_inc = R_B
+        e_inc = e_B
+    else:
+        ref_axis = sat_idx - 3
+        n_hat_used = -n_hat_in
+        ref_c = c_B
+        R_ref = R_B
+        e_ref = e_B
+        inc_c = c_A
+        R_inc = R_A
+        e_inc = e_A
+
+    # Reference face: outward normal opposes n_hat_used.
+    ref_col_axis = wp.vec3(R_ref[0, ref_axis], R_ref[1, ref_axis], R_ref[2, ref_axis])
+    ref_sign = wp.where(wp.dot(ref_col_axis, n_hat_used) > 0.0, -1.0, 1.0)
+    ref_face_n = ref_col_axis * ref_sign
+    ref_face_c = ref_c + ref_face_n * e_ref[ref_axis]
+    ax1 = (ref_axis + 1) % 3
+    ax2 = (ref_axis + 2) % 3
+    u_ref = wp.vec3(R_ref[0, ax1], R_ref[1, ax1], R_ref[2, ax1])
+    v_ref = wp.vec3(R_ref[0, ax2], R_ref[1, ax2], R_ref[2, ax2])
+    eu = e_ref[ax1]
+    ev = e_ref[ax2]
+
+    # Incident face: max-dot axis × sign on inc body.
+    inc_axis = int(0)
+    inc_sign = float(1.0)
+    best_dot = float(-1.0e20)
+    for k in range(3):
+        col = wp.vec3(R_inc[0, k], R_inc[1, k], R_inc[2, k])
+        d_pos = wp.dot(col, n_hat_used)
+        if d_pos > best_dot:
+            best_dot = d_pos
+            inc_axis = k
+            inc_sign = 1.0
+        d_neg = -d_pos
+        if d_neg > best_dot:
+            best_dot = d_neg
+            inc_axis = k
+            inc_sign = -1.0
+    inc_col_axis = wp.vec3(R_inc[0, inc_axis], R_inc[1, inc_axis], R_inc[2, inc_axis])
+    inc_face_n = inc_col_axis * inc_sign
+    inc_face_c = inc_c + inc_face_n * e_inc[inc_axis]
+    inc_ax1 = (inc_axis + 1) % 3
+    inc_ax2 = (inc_axis + 2) % 3
+    inc_u = wp.vec3(R_inc[0, inc_ax1], R_inc[1, inc_ax1], R_inc[2, inc_ax1])
+    inc_v = wp.vec3(R_inc[0, inc_ax2], R_inc[1, inc_ax2], R_inc[2, inc_ax2])
+    inc_eu = e_inc[inc_ax1]
+    inc_ev = e_inc[inc_ax2]
+
+    # Sutherland-Hodgman clip — double-buffered polygon in poly_scratch.
+    # Each pair owns 16 vec3 slots: [p*16, p*16+8) and [p*16+8, p*16+16).
+    cur_base = p * 16
+    nxt_base = p * 16 + 8
+    # Initial polygon: 4 incident-face verts, same winding order as Python.
+    poly_scratch[cur_base + 0] = inc_face_c + inc_u * inc_eu + inc_v * inc_ev
+    poly_scratch[cur_base + 1] = inc_face_c - inc_u * inc_eu + inc_v * inc_ev
+    poly_scratch[cur_base + 2] = inc_face_c - inc_u * inc_eu - inc_v * inc_ev
+    poly_scratch[cur_base + 3] = inc_face_c + inc_u * inc_eu - inc_v * inc_ev
+    poly_a_len = int(4)
+
+    for plane_idx in range(4):
+        plane_pt = wp.vec3(0.0, 0.0, 0.0)
+        plane_n = wp.vec3(0.0, 0.0, 0.0)
+        if plane_idx == 0:
+            plane_pt = ref_face_c + u_ref * eu
+            plane_n = u_ref
+        elif plane_idx == 1:
+            plane_pt = ref_face_c - u_ref * eu
+            plane_n = -u_ref
+        elif plane_idx == 2:
+            plane_pt = ref_face_c + v_ref * ev
+            plane_n = v_ref
+        else:
+            plane_pt = ref_face_c - v_ref * ev
+            plane_n = -v_ref
+        if poly_a_len == 0:
+            return
+        out_len = int(0)
+        for i_v in range(poly_a_len):
+            a_pt = poly_scratch[cur_base + i_v]
+            nxt_i = (i_v + 1) % poly_a_len
+            b_pt = poly_scratch[cur_base + nxt_i]
+            da = wp.dot(a_pt - plane_pt, plane_n)
+            db = wp.dot(b_pt - plane_pt, plane_n)
+            if da <= 0.0:
+                if out_len < 8:
+                    poly_scratch[nxt_base + out_len] = a_pt
+                    out_len = out_len + 1
+                if db > 0.0:
+                    t = da / (da - db)
+                    if out_len < 8:
+                        poly_scratch[nxt_base + out_len] = a_pt + (b_pt - a_pt) * t
+                        out_len = out_len + 1
+            else:
+                if db <= 0.0:
+                    t = da / (da - db)
+                    if out_len < 8:
+                        poly_scratch[nxt_base + out_len] = a_pt + (b_pt - a_pt) * t
+                        out_len = out_len + 1
+        # Swap polygon buffers.
+        tmp = cur_base
+        cur_base = nxt_base
+        nxt_base = tmp
+        poly_a_len = out_len
+
+    if poly_a_len == 0:
+        return
+
+    # Top-4 by depth (descending). depth = -d where d = (pt - ref_face_c)·ref_face_n.
+    # Reject if d ≥ margin (separated by more than the warm-start gap). Maintain
+    # a 4-slot "best so far" set in two parallel vec4s (float depths + int indices).
+    best_d = wp.vec4(-1.0e30, -1.0e30, -1.0e30, -1.0e30)
+    best_i = vec4i(-1, -1, -1, -1)
+    n_best = int(0)
+    for i_v in range(poly_a_len):
+        pt = poly_scratch[cur_base + i_v]
+        d_signed = wp.dot(pt - ref_face_c, ref_face_n)
+        if d_signed < margin:
+            depth = -d_signed
+            if n_best < 4:
+                best_d[n_best] = depth
+                best_i[n_best] = i_v
+                n_best = n_best + 1
+            else:
+                min_pos = int(0)
+                min_val = best_d[0]
+                for k in range(1, 4):
+                    if best_d[k] < min_val:
+                        min_val = best_d[k]
+                        min_pos = k
+                if depth > min_val:
+                    best_d[min_pos] = depth
+                    best_i[min_pos] = i_v
+    if n_best == 0:
+        return
+
+    # Sort the n_best slots by depth descending — selection sort, n ≤ 4.
+    for i_s in range(n_best - 1):
+        max_pos = i_s
+        for k in range(i_s + 1, n_best):
+            if best_d[k] > best_d[max_pos]:
+                max_pos = k
+        if max_pos != i_s:
+            tmp_d = best_d[i_s]
+            best_d[i_s] = best_d[max_pos]
+            best_d[max_pos] = tmp_d
+            tmp_i = best_i[i_s]
+            best_i[i_s] = best_i[max_pos]
+            best_i[max_pos] = tmp_i
+
+    # Emit contacts.
+    out_n_hat[p] = n_hat_used
+    t_hat = orthonormal_basis_3d(n_hat_used)
+    b_hat = wp.cross(n_hat_used, t_hat)
+    out_t_hat[p] = t_hat
+    out_b_hat[p] = b_hat
+    out_contact_count[p] = n_best
+    Rt_ref = wp.transpose(R_ref)
+    Rt_inc = wp.transpose(R_inc)
+    for c in range(n_best):
+        i_v = best_i[c]
+        p_inc = poly_scratch[cur_base + i_v]
+        d_signed = wp.dot(p_inc - ref_face_c, ref_face_n)
+        p_ref = p_inc - ref_face_n * d_signed
+        out_off_ref[p * 4 + c] = Rt_ref * (p_ref - ref_c)
+        out_off_inc[p * 4 + c] = Rt_inc * (p_inc - inc_c)
+
+
 @wp.kernel
 def viewer_pack_rows_6dof(
     c_lambda: wp.array(dtype=float),

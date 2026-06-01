@@ -6,7 +6,7 @@
 > machine has no NVIDIA GPU, so changes had to be architectural shifts
 > validatable on the Warp CPU backend — no GPU perf numbers reportable.
 >
-> **Done this session**
+> **Done**
 > - §5 *Contact warm-start cache crosses CPU/GPU* — replaced 6 full-array
 >   `.numpy()` syncs + 3 `wp.array` rebuilds per substep with 2 Warp
 >   kernels (`cache_restore_6dof`, `cache_collect_6dof`) operating on
@@ -17,16 +17,21 @@
 >   `Solver6DOF.read_state_batched()` backed by two pack kernels
 >   (`viewer_pack_bodies_6dof`, `viewer_pack_rows_6dof`). Per-frame
 >   stream syncs in `examples/viewer.py:tick` drop from ~7 to 2.
+> - §3 *Dynamic contact manifold not GPU-resident* (geometry hot loop)
+>   — added `obb_contact_manifold_6dof` kernel: handles both face-face
+>   (Sutherland-Hodgman, up to 4 contacts) and edge-edge
+>   (closest-segment-pair, 1 contact) cases. Opt-in via
+>   `Solver6DOF(..., use_warp_face_clip=True)`. Parity vs the Python
+>   emitter is verified by `test_kernel_face_clip_matches_python_stack`
+>   (3-cube tower, 360 × 8 = 2880 manifold passes, max y divergence
+>   ~6 µm). Row-append still touches the Python `_Row` list — that's
+>   gap §4 (deferred).
 >
-> **Not done this session (deferred)**
-> - §3 *Dynamic contact generation not fully GPU-resident* — Warp
->   face-clip + contact-emit kernel. Skipped because the SH-clip
->   geometry is dense, output is variable-per-pair (0–4 contacts), and
->   it has no CPU-validation path. Detailed implementation plan in
->   PERFORMANCE_PROGRESS.md §3.
+> **Not done (deferred)**
 > - §4 *Constraint rows are Python objects rebuilt every substep* —
->   blocked on §3 (contact manifold must land in GPU buffers first)
->   and on the body adjacency / coloring rebuild problem.
+>   needs GPU-resident dynamic row buffers + the body adjacency /
+>   coloring rebuild problem solved. Detailed plan in
+>   PERFORMANCE_PROGRESS.md §4.
 > - §2 *Too many launches per visual frame* — CUDA-graph capture path.
 >   `wp.ScopedCapture` is CUDA-only, no CPU validation possible.
 > - §1 *Tiny GPU work per launch* and §8 *Hardware difference* —

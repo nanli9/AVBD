@@ -252,6 +252,7 @@ class Solver6DOF:
         max_angular_speed: float = 50.0,
         substeps: int = 1,
         friction_static_mult: float = 1.5,
+        use_warp_face_clip: bool = False,
     ):
         wp.init()
         self.device = device
@@ -339,6 +340,23 @@ class Solver6DOF:
         # Tracks broadphase wall time (seconds) of the most recent rebuild
         # so the viewer can surface it without polling internals.
         self.broadphase_ms = 0.0
+        # Opt-in Warp face-clip path (AVBD_PERFORMANCE_GAP §3). When True,
+        # obb_contact_manifold_6dof runs the Sutherland-Hodgman clip,
+        # closest-segment-pair, and body-local offset extraction on the
+        # GPU instead of in Python. Default off until benchmarked on
+        # CUDA — parity vs the Python reference is verified on CPU
+        # via tests/_probe_parity.py.
+        self.use_warp_face_clip = bool(use_warp_face_clip)
+        # Manifold-kernel output buffers — lazy-allocated alongside the
+        # broadphase pair buffers when the kernel path is active.
+        self._mf_poly_scratch = None
+        self._mf_contact_count = None
+        self._mf_ref_is_a = None
+        self._mf_n_hat = None
+        self._mf_t_hat = None
+        self._mf_b_hat = None
+        self._mf_off_ref = None
+        self._mf_off_inc = None
         # GPU-resident contact warm-start scratch (AVBD_PERFORMANCE_GAP §5).
         # Each substep's contact pool gets index arrays (idx_n/t/b) so
         # cache_restore_6dof + cache_collect_6dof can mutate c_lambda /
@@ -941,12 +959,17 @@ class Solver6DOF:
             device=dev,
         )
 
-        # 7. Readback + Python face-clip on confirmed overlaps. We pay one
-        # GPU→CPU sync here for the SAT result arrays (4 small int/float
-        # buffers, ~50 entries on a tower scene). Face-clip variable output
-        # is awkward in Warp; keeping it on CPU is the residual cost. (A
-        # full Warp port with fixed-size polygon buffers is left as a
-        # follow-up — the broadphase + SAT move was the dominant share.)
+        # 7. Contact manifold generation — two paths.
+        if self.use_warp_face_clip:
+            self._warp_emit_contacts_kernel_path(n_pairs)
+            return
+
+        # Default (CPU) path: readback + Python face-clip on confirmed overlaps.
+        # We pay one GPU→CPU sync here for the SAT result arrays (4 small
+        # int/float buffers, ~50 entries on a tower scene). Face-clip variable
+        # output is awkward in Warp; keeping it on CPU is the residual cost.
+        # The kernel path above closes this gap when enabled — see
+        # _warp_emit_contacts_kernel_path.
         a_np = self._bp_pair_a.numpy()[:n_pairs]
         b_np = self._bp_pair_b.numpy()[:n_pairs]
         ov_np = self._bp_pair_overlap.numpy()[:n_pairs]
@@ -968,6 +991,136 @@ class Solver6DOF:
             self._emit_obb_pair_with_sat(i, j, positions, quats,
                                          sat_idx, n_hat,
                                          c_A, c_B, e_A, e_B, R_A, R_B)
+
+    def _ensure_manifold_buffers(self, cap: int) -> None:
+        """Allocate or grow the manifold-kernel output buffers to match the
+        broadphase pair-buffer capacity (cap = self._bp_max_pairs). Each
+        pair owns 16 vec3 polygon-scratch slots + 4 contact slots."""
+        if (self._mf_poly_scratch is not None
+                and self._mf_poly_scratch.shape[0] >= cap * 16):
+            return
+        dev = self.device
+        self._mf_poly_scratch = wp.zeros(cap * 16, dtype=wp.vec3, device=dev)
+        self._mf_contact_count = wp.zeros(cap, dtype=int, device=dev)
+        self._mf_ref_is_a = wp.zeros(cap, dtype=int, device=dev)
+        self._mf_n_hat = wp.zeros(cap, dtype=wp.vec3, device=dev)
+        self._mf_t_hat = wp.zeros(cap, dtype=wp.vec3, device=dev)
+        self._mf_b_hat = wp.zeros(cap, dtype=wp.vec3, device=dev)
+        self._mf_off_ref = wp.zeros(cap * 4, dtype=wp.vec3, device=dev)
+        self._mf_off_inc = wp.zeros(cap * 4, dtype=wp.vec3, device=dev)
+
+    def _warp_emit_contacts_kernel_path(self, n_pairs: int) -> None:
+        """GPU face-clip path: launches obb_contact_manifold_6dof, reads
+        back the (count, ref_is_a, n/t/b, off_ref/off_inc) outputs once,
+        then emits Box-Box rows + tangent partners from the kernel output.
+        Skips the Python SH-clip and edge-edge fallback entirely — both
+        run inside the kernel. Closes AVBD_PERFORMANCE_GAP §3.
+
+        Row append still touches the Python `_Row` list because dynamic
+        constraint rows are not yet GPU-resident (that is GAP §4, still
+        deferred — see PERFORMANCE_PROGRESS.md). What this method removes
+        is the Sutherland-Hodgman polygon math and the closest-segment-pair
+        math from the per-pair Python loop."""
+        dev = self.device
+        self._ensure_manifold_buffers(self._bp_max_pairs)
+        wp.launch(
+            K.obb_contact_manifold_6dof, dim=n_pairs,
+            inputs=[self.x, self.q, self._bp_half_extents,
+                    self._bp_pair_a, self._bp_pair_b,
+                    self._bp_pair_overlap, self._bp_pair_sat_idx,
+                    self._bp_pair_n_hat,
+                    n_pairs, 0.005,
+                    self._mf_poly_scratch],
+            outputs=[self._mf_contact_count, self._mf_ref_is_a,
+                     self._mf_n_hat, self._mf_t_hat, self._mf_b_hat,
+                     self._mf_off_ref, self._mf_off_inc],
+            device=dev,
+        )
+        # Single batched readback — 8 arrays' worth of small per-pair data,
+        # all blocking on the same sync since they were written by one launch.
+        a_np = self._bp_pair_a.numpy()[:n_pairs]
+        b_np = self._bp_pair_b.numpy()[:n_pairs]
+        count_np = self._mf_contact_count.numpy()[:n_pairs]
+        ref_is_a_np = self._mf_ref_is_a.numpy()[:n_pairs]
+        n_np = self._mf_n_hat.numpy().reshape(-1, 3)[:n_pairs]
+        t_np = self._mf_t_hat.numpy().reshape(-1, 3)[:n_pairs]
+        b_hat_np = self._mf_b_hat.numpy().reshape(-1, 3)[:n_pairs]
+        off_ref_np = self._mf_off_ref.numpy().reshape(-1, 4, 3)[:n_pairs]
+        off_inc_np = self._mf_off_inc.numpy().reshape(-1, 4, 3)[:n_pairs]
+        for p in range(n_pairs):
+            n_contacts = int(count_np[p])
+            if n_contacts == 0:
+                continue
+            i = int(a_np[p])
+            j = int(b_np[p])
+            if int(ref_is_a_np[p]) == 1:
+                ref_i, inc_i = i, j
+            else:
+                ref_i, inc_i = j, i
+            n_hat = n_np[p].astype(np.float32)
+            t_hat = t_np[p].astype(np.float32)
+            b_hat = b_hat_np[p].astype(np.float32)
+            mu = self._self_friction
+            if (self._friction[ref_i] > 0.0 or self._friction[inc_i] > 0.0):
+                mu = math.sqrt(self._friction[ref_i] * self._friction[inc_i])
+            for c in range(n_contacts):
+                off_ref_local = off_ref_np[p, c].astype(np.float32)
+                off_inc_local = off_inc_np[p, c].astype(np.float32)
+                normal_idx = len(self._rows)
+                self._rows.append(_Row(
+                    type=BOX_BOX_CONTACT_6DOF,
+                    body_a=ref_i, body_b=inc_i,
+                    world_anchor=(float(n_hat[0]), float(n_hat[1]), float(n_hat[2])),
+                    off_a=(float(off_ref_local[0]), float(off_ref_local[1]),
+                           float(off_ref_local[2])),
+                    off_b=(float(off_inc_local[0]), float(off_inc_local[1]),
+                           float(off_inc_local[2])),
+                    rest=0.0, stiffness=math.inf,
+                    fmin=-math.inf, fmax=0.0,
+                ))
+                t_idx, b_idx = -1, -1
+                if mu > 0.0:
+                    mu_s = mu * self.friction_static_mult
+                    t_idx = len(self._rows)
+                    self._rows.append(_Row(
+                        type=CONTACT_TANGENT_6DOF,
+                        body_a=ref_i, body_b=inc_i,
+                        world_anchor=(float(t_hat[0]), float(t_hat[1]),
+                                      float(t_hat[2])),
+                        off_a=(float(off_ref_local[0]), float(off_ref_local[1]),
+                               float(off_ref_local[2])),
+                        off_b=(float(off_inc_local[0]), float(off_inc_local[1]),
+                               float(off_inc_local[2])),
+                        stiffness=math.inf, sibling=normal_idx, friction=mu,
+                        friction_static=mu_s,
+                    ))
+                    b_idx = len(self._rows)
+                    self._rows.append(_Row(
+                        type=CONTACT_TANGENT_6DOF,
+                        body_a=ref_i, body_b=inc_i,
+                        world_anchor=(float(b_hat[0]), float(b_hat[1]),
+                                      float(b_hat[2])),
+                        off_a=(float(off_ref_local[0]), float(off_ref_local[1]),
+                               float(off_ref_local[2])),
+                        off_b=(float(off_inc_local[0]), float(off_inc_local[1]),
+                               float(off_inc_local[2])),
+                        stiffness=math.inf, sibling=normal_idx, friction=mu,
+                        friction_static=mu_s,
+                    ))
+                    self._rows[t_idx].partner = b_idx
+                    self._rows[b_idx].partner = t_idx
+                # Cache key — match the Python emitter exactly so existing
+                # warm-start cache entries from the Python path stay valid
+                # after the user flips the flag at runtime.
+                if ref_i < inc_i:
+                    off_key = off_ref_local
+                else:
+                    off_key = off_inc_local
+                qx = int(round(float(off_key[0]) * 200))
+                qy = int(round(float(off_key[1]) * 200))
+                qz = int(round(float(off_key[2]) * 200))
+                cache_key = (min(ref_i, inc_i), max(ref_i, inc_i), qx, qy, qz)
+                self._pool_pair_rows.append((cache_key, normal_idx, t_idx, b_idx))
 
     # ---- Runtime perturbations ---------------------------------------------
 

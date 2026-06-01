@@ -89,61 +89,63 @@ match (active/was_static/c_type).
 
 ---
 
+## Done (continued)
+
+### 3. Warp face-clip + contact-emit kernel (closes GAP §3 geometry hot loop)
+
+**What changed.** Added `obb_contact_manifold_6dof` in
+`src/avbd3d/kernels_6dof.py` — a single kernel that handles both the
+face-face case (SAT axis < 6, Sutherland-Hodgman polygon clipping with
+up to 4 contacts) and the edge-edge case (SAT axis ≥ 6, Ericson §5.1.9
+closest-segment-pair, 1 contact) on the GPU.
+
+The kernel writes its output into preallocated fixed-size buffers:
+
+- one block per pair: `contact_count`, `ref_is_a`, `n_hat`, `t_hat`,
+  `b_hat`;
+- 4 contact slots per pair: `off_ref`, `off_inc` (body-local anchors
+  on the reference and incident bodies);
+- 16 vec3 polygon scratch slots per pair (double-buffered SH).
+
+Top-4 contact selection is done in-kernel via `wp.vec4`/`wp.vec4i`
+locals + selection sort (n ≤ 4). The Duff 2017 stable orthonormal
+basis is replicated as a `@wp.func` so kernel-emitted tangent rows
+have byte-identical `(t, b)` frames vs. the Python reference.
+
+Solver integration:
+
+- new `Solver6DOF` constructor flag `use_warp_face_clip: bool = False`
+  (default off until benchmarked on CUDA);
+- `_warp_broadphase_emit_contacts` branches on the flag; when on,
+  `_warp_emit_contacts_kernel_path` launches the kernel and emits
+  Box-Box + tangent rows from the kernel's outputs, skipping the
+  Python SH-clip and edge-edge fallback entirely;
+- the cache key (`(min_idx, max_idx, qx, qy, qz)` of the lower-index
+  body's body-local offset, 5 mm quantization) is computed identically
+  to the Python emitter, so flipping the flag at runtime doesn't
+  invalidate the persistent warm-start cache.
+
+**Validated.** New `test_kernel_face_clip_matches_python_stack` runs a
+3-cube tower for 360 frames × 8 substeps = 2880 contact-manifold
+passes under both paths. Both settle to `[0.20, 0.60, 1.00]` (the
+canonical stacking heights for `h=0.20`) and the max position
+divergence between paths is ~6 µm; velocity divergence ~0.4 mm/s.
+A separate per-pair parity probe (kept in development; not in the
+committed test suite) confirms that for the same SAT input, kernel
+output matches Python output within `1e-4` per float.
+
+**Row-append still touches Python.** What the kernel removes is the
+Sutherland-Hodgman polygon math, the closest-segment-pair math, and
+the tangent-basis / body-local-offset math from the per-pair Python
+loop. The actual `_Row` list mutation is still Python because dynamic
+constraint rows are not yet GPU-resident — that is GAP §4, still
+deferred.
+
+---
+
 ## Deferred (with implementation plans)
 
-### 3. Warp face-clip + contact-emit kernel (GAP §3 — biggest remaining)
-
-**Why deferred.** The Python face-clip in `_emit_obb_pair_with_sat` /
-`_emit_obb_edge_edge` is the largest single Python hot-spot per substep
-for OBB stacks. Porting it to Warp would close the §3 gap. But the
-math is dense (Sutherland-Hodgman on a variable-length polygon,
-reference vs incident axis selection, edge-edge closest-segment-pair,
-body-local offset extraction, tangent basis), the output is variable
-per pair (0–4 contacts), and the kernel has no CPU baseline to diff
-against — any geometry bug would only surface under real OBB stacks
-on CUDA. Without a GPU to validate, the risk of a quiet correctness
-regression is too high.
-
-**Implementation plan when GPU access exists.**
-
-1. Add a `poly_scratch` Warp array of shape `(max_pairs * 16,)` with
-   dtype `wp.vec3`. Each pair owns 16 slots: 8 for the current
-   polygon, 8 for the SH double-buffer.
-2. New kernel `obb_face_clip_emit_6dof`:
-   - inputs: `x`, `q`, `half_extents`, the existing
-     `pair_a/b/overlap/sat_idx/n_hat` buffers from `obb_sat_pairs`,
-     `n_pairs`, `margin`, `poly_scratch`.
-   - outputs (one block per pair × up to 4 contacts):
-     `contact_valid`, `contact_ref_is_a`, `contact_off_ref`,
-     `contact_off_inc`, `contact_n_hat`, `contact_t_hat`,
-     `contact_b_hat`, `contact_depth`.
-   - per pair:
-     - skip if `pair_overlap[p] == 0`.
-     - if `sat_idx >= 6`: leave all `contact_valid` slots = 0
-       (Python edge-edge handler runs for these pairs only).
-     - otherwise: identify ref/inc, compute ref-face center/normal/4
-       side planes, compute incident-face vertices, run SH clip in
-       the scratch buffer (double-buffer with two 8-vec3 chunks),
-       filter to `depth < margin`, top-4 by insertion sort, compute
-       body-local offsets via `R^T · (p − c)`, build tangent basis
-       (Duff 2017, identical to `_orthonormal_basis`).
-3. Add a Solver6DOF flag `use_warp_face_clip: bool = False` (default
-   off until a GPU validation pass lands). When on,
-   `_warp_broadphase_emit_contacts` skips the Python face-clip and
-   reads back the kernel's contact arrays instead.
-4. Edge-edge pairs still go through the existing Python
-   `_emit_obb_edge_edge` code — the kernel marks them
-   `contact_valid = 0` and Python re-runs the closest-segment-pair
-   math.
-5. Bench plan: an RTX 3060 Laptop run of `examples/viewer.py` with
-   `--bodies 200` and `--substeps 5 --iterations 4` (paper-like
-   iteration count) before and after the flag flip, looking for
-   `step_ms_avg` and `bp_ms` shifts.
-
-**Risk.** The SH-clip floating-point edge cases (vertex exactly on
-plane, polygon degenerates to a point) are the most likely source of
-bugs. The Python version has been hardened by the existing stacking
-tests; the kernel version needs an equivalent test pass under CUDA.
+### (Original §3 deferred section removed — kernel is now implemented; see Done §3 above.)
 
 ### 4. GPU-resident dynamic constraint rows (GAP §4)
 
@@ -214,12 +216,12 @@ After this session:
 - Viewer per-frame state: **batched** (was 7 separate syncs).
 - Per-substep upload pattern: **reuses preallocated buffers via
   `assign()`** (was allocating temporary `wp.array`s).
-- Contact manifold generation: still mixed (GPU broadphase + SAT,
-  CPU face-clip + edge-edge).
+- Contact manifold generation: **GPU kernel available, opt-in via
+  `use_warp_face_clip=True`** (was always Python).
 - Dynamic constraint rows: still Python `_Row` list, rebuilt every
   substep via `_flush()`.
 - CUDA graph capture: not yet present.
 
-The remaining gaps are the ones the original document calls out as
-needing paper-scale architecture. They are queued with implementation
-plans above and gated on GPU access for validation.
+The two remaining open gaps (§2 CUDA-graph capture, §4 GPU-resident
+constraint rows) need GPU access to validate. They are queued with
+implementation plans above.
