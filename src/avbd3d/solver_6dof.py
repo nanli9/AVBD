@@ -305,9 +305,18 @@ class Solver6DOF:
         self._spatial_cell_size = 0.0
         # One-shot warning gate for row-pool overflow on dense clusters.
         self._row_overflow_warned = False
+        # Live-contact-graph coloring fingerprint — set by _maybe_recolor.
+        # `None` means "first substep, run the recolor unconditionally".
+        self._color_topology_sig: int | None = None
         # CUDA-graph cache for the per-substep kernel sequence (Phase B).
         # `None` means "recapture on next step" (also the CPU fallback).
         self._graph = None
+        # Signature of the Python-side scalars baked into _graph at
+        # capture time. Compared against the live signature on each step;
+        # mismatch → invalidate. Self-protects the solver against viewer
+        # GUI mutations (iterations / dt / gravity sliders) that would
+        # otherwise let the old graph replay with the new config.
+        self._graph_signature: tuple | None = None
         # Cached probe: does this Warp build expose graph capture?
         self._graph_supported: bool | None = None
 
@@ -463,33 +472,75 @@ class Solver6DOF:
         self._mf_off_ref = wp.zeros(cap * 4, dtype=wp.vec3, device=dev)
         self._mf_off_inc = wp.zeros(cap * 4, dtype=wp.vec3, device=dev)
 
-    def _add_aabb_neighbors_inflated(
-        self,
-        adj: list[set[int]],
-        positions: np.ndarray,
-        half_extents: np.ndarray,
-        inflate: float,
-    ) -> None:
-        """Add an edge to `adj[i]` for every pair (i,j) whose initial AABBs
-        overlap when each half-extent is inflated by `inflate`. The result
-        is a conservative superset of every body pair that could produce
-        a dynamic contact between flushes — used to seed the body-coloring
-        adjacency graph so the per-color primal sweep stays
-        Gauss-Seidel-correct even as the broadphase rediscovers contacts.
+    def _maybe_recolor(self, n_active: int) -> None:
+        """Rebuild body coloring from the substep's live contact graph.
 
-        O(n_b²) but only runs in _flush, not the hot path."""
-        n = positions.shape[0]
-        if n < 2:
+        Coloring correctness requires the adjacency to match the constraint
+        set the primal sweep will see. Any static approximation (static
+        rows, inflated initial AABBs, parity hash) is structurally unsound
+        for a simulation where bodies move and new contacts form: two
+        bodies whose initial AABBs do not overlap can still collide later
+        and race in the per-color update.
+
+        Topology-hash short-circuit: when the (a, b) adjacency is unchanged
+        from the previous substep (the common case for settled stacks) we
+        skip the recolor — it stays a free no-op."""
+        if n_active <= 0:
             return
-        lo = positions - (half_extents + inflate)
-        hi = positions + (half_extents + inflate)
-        for i in range(n):
-            for j in range(i + 1, n):
-                if (lo[i, 0] <= hi[j, 0] and hi[i, 0] >= lo[j, 0]
-                        and lo[i, 1] <= hi[j, 1] and hi[i, 1] >= lo[j, 1]
-                        and lo[i, 2] <= hi[j, 2] and hi[i, 2] >= lo[j, 2]):
-                    adj[i].add(j)
-                    adj[j].add(i)
+        n_b = len(self._x)
+        if n_b < 2:
+            return
+        # Readback shares the bus with the n_active_rows readback we
+        # already do for overflow detection.
+        ba_full = self.c_body_a.numpy()
+        bb_full = self.c_body_b.numpy()
+        ct_full = self.c_type.numpy()
+        ba = ba_full[:n_active]
+        bb = bb_full[:n_active]
+        ct = ct_full[:n_active]
+        # PIN_6DOF re-uses c_body_b as an axis id (not a body), and
+        # negative indices encode "world / no second body".
+        mask = ((ct != PIN_6DOF) & (ba >= 0) & (bb >= 0) & (ba != bb))
+        a_edges = ba[mask].astype(np.int64, copy=False)
+        b_edges = bb[mask].astype(np.int64, copy=False)
+        if a_edges.size == 0:
+            # No body-body edges this substep — every body is its own
+            # color class. Leave coloring alone; the static seed from
+            # _flush is already a valid partition.
+            sig = 0
+        else:
+            # Canonical (min, max) packed into one int64 → topology key.
+            lo_e = np.minimum(a_edges, b_edges)
+            hi_e = np.maximum(a_edges, b_edges)
+            canon = np.sort((lo_e << 32) | hi_e)
+            sig = hash(canon.tobytes())
+        if sig == self._color_topology_sig:
+            return
+        self._color_topology_sig = sig
+
+        adj = build_body_edges(n_b, a_edges.tolist(), b_edges.tolist())
+        color_np = greedy_color(adj)
+        new_num_colors = int(color_np.max() + 1) if n_b > 0 else 0
+        color_bodies_np = np.argsort(color_np, kind="stable").astype(np.int32)
+        counts = np.bincount(
+            color_np, minlength=max(new_num_colors, 1)).astype(np.int32)
+        offsets = np.zeros(new_num_colors + 1, dtype=np.int32)
+        offsets[1:] = np.cumsum(counts[:new_num_colors])
+
+        dev = self.device
+        # Reuse the existing body_color Warp array (size n_b is fixed
+        # across substeps) but rebuild color_bodies on size change.
+        self.body_color.assign(color_np)
+        if (self.color_bodies is None
+                or self.color_bodies.shape[0] != color_bodies_np.shape[0]):
+            self.color_bodies = wp.array(color_bodies_np, dtype=int, device=dev)
+        else:
+            self.color_bodies.assign(color_bodies_np)
+        self._color_offsets_np = offsets
+        self.num_colors = new_num_colors
+        self.color_counts = color_summary(color_np)
+        # Per-color launch shape changed → invalidate any cached CUDA graph.
+        self._graph = None
 
     # ---- Runtime perturbations ---------------------------------------------
 
@@ -603,36 +654,27 @@ class Solver6DOF:
         self.inv_inertia_world = wp.zeros(n_b, dtype=wp.mat33, device=dev)
         self.inertia_world = wp.zeros(n_b, dtype=wp.mat33, device=dev)
 
-        # Body coloring — Welsh-Powell greedy over the body-adjacency graph.
-        # Edges come from (a) every static row (pin / floor contact rows
-        # that name two bodies — rare but possible) and (b) the initial-
-        # AABB-overlap predicate, inflated by 2× the max half-extent so any
-        # pair that could ever produce a dynamic contact this _flush cycle
-        # is already in the same conflict set. The conservative inflation
-        # is what keeps the per-color primal sweep safe even though the
-        # contact graph itself is rebuilt each substep on the GPU.
-        # spatial_8color() is intentionally NOT used here — it can assign
-        # the same color to two bodies that share a grid cell, violating
-        # the Gauss-Seidel independence invariant.
+        # Body coloring — initial seed only. Edges from static body-body
+        # rows (e.g. floor/PIN don't qualify); the *runtime* coloring is
+        # rebuilt each substep by `_maybe_recolor` from the live
+        # `c_body_a` / `c_body_b` set after broadphase fills the dynamic
+        # region. Static seeding here gives the first substep a sane
+        # `num_colors` before the runtime recolor takes over.
+        # spatial_8color() is intentionally NOT used — it can assign the
+        # same color to two bodies that share a grid cell, violating the
+        # Gauss-Seidel independence invariant.
         if n_b > 0:
-            max_he = float(max(max(he) for he in self._half_extents))
-            # Only BOX_BOX_CONTACT_6DOF rows (type 3) have body_b as a body
-            # index. PIN_6DOF (type 2) re-purposes body_b for the axis id, so
-            # feeding it to build_body_edges would IndexError on n_b. Static
-            # rows in self._rows are FLOOR / PIN / TANGENT — none body-body.
             body_body_a = [r.body_a for r in self._rows
                            if r.type == BOX_BOX_CONTACT_6DOF]
             body_body_b = [r.body_b for r in self._rows
                            if r.type == BOX_BOX_CONTACT_6DOF]
             adj = build_body_edges(n_b, body_body_a, body_body_b)
-            if self._self_collide and n_b >= 2:
-                self._add_aabb_neighbors_inflated(
-                    adj, x_np, np.asarray(self._half_extents, dtype=np.float32),
-                    inflate=2.0 * max_he,
-                )
             color_np = greedy_color(adj)
         else:
             color_np = np.zeros(0, dtype=np.int32)
+        # Reset the topology fingerprint so the first substep recolor
+        # always runs against the live contact graph.
+        self._color_topology_sig = None
         self.num_colors = int(color_np.max() + 1) if n_b > 0 else 0
         self.color_counts = color_summary(color_np)
         self.body_color = wp.array(color_np, dtype=int, device=dev)
@@ -844,6 +886,9 @@ class Solver6DOF:
                 self._grow_row_pool(max(2 * self._gpu_pool_n_dyn_capacity,
                                           (n_active_raw - n_static) * 2))
             n_active = min(n_active_raw, cap)
+            # Live-contact-graph recolor (round 2 §1). Must run before the
+            # CSR build below uses self.color_bodies / _color_offsets_np.
+            self._maybe_recolor(n_active)
 
         # Post-Phase-A: row-side launches all use fixed dim=row_dim with
         # device-side bounds via `self.n_active_rows[0]`. Lets the inner
@@ -916,6 +961,14 @@ class Solver6DOF:
         # The capture region launches at fixed dims that all bound against
         # device-side counts (Phase A), so the same graph replays correctly
         # across substeps with varying `n_active_rows[0]`.
+        # Invalidate cached graph whenever any captured-in scalar changes.
+        # Computed even on the CPU fallback path so the signature stays
+        # up-to-date across device switches and so tests can assert on it.
+        sig = self._current_graph_signature()
+        if sig != self._graph_signature:
+            self._graph = None
+            self._graph_signature = sig
+
         use_graph = (n_active > 0
                      and str(dev).startswith("cuda")
                      and self._graph_cuda_supported())
@@ -944,6 +997,23 @@ class Solver6DOF:
                         self.hash_keys, self.hash_state],
                 device=dev,
             )
+
+    def _current_graph_signature(self) -> tuple:
+        """Snapshot of every Python-side scalar the capture region bakes
+        into the recorded launches. Any change here means the cached
+        graph is stale and must be recaptured."""
+        return (
+            int(self.iterations),
+            int(self.post_stabilize),
+            int(self.num_colors),
+            float(self.dt),
+            float(self.alpha),
+            float(self.beta),
+            float(self.gamma),
+            float(self.max_linear_speed),
+            float(self.max_angular_speed),
+            tuple(self._color_offsets_np.tolist()),
+        )
 
     def _graph_cuda_supported(self) -> bool:
         """Whether the current Warp build can capture a CUDA graph. Caches
