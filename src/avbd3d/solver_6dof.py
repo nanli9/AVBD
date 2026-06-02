@@ -25,36 +25,13 @@ import numpy as np
 import warp as wp
 
 from . import kernels_6dof as K
-from .coloring import build_body_edges, color_summary, greedy_color
+from .coloring import build_body_edges, color_summary, greedy_color, spatial_8color
 
 # Re-export the constraint type codes for callers / tests.
 FLOOR_CONTACT_6DOF = 0
 CONTACT_TANGENT_6DOF = 1
 PIN_6DOF = 2
 BOX_BOX_CONTACT_6DOF = 3
-
-
-def _q_to_R(q_xyzw) -> np.ndarray:
-    """Quaternion (xyzw) → 3×3 rotation matrix. Columns are the world-space
-    images of the body-local basis vectors."""
-    qx, qy, qz, qw = float(q_xyzw[0]), float(q_xyzw[1]), float(q_xyzw[2]), float(q_xyzw[3])
-    return np.array([
-        [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qw*qz),     2*(qx*qz + qw*qy)],
-        [2*(qx*qy + qw*qz),     1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qw*qx)],
-        [2*(qx*qz - qw*qy),     2*(qy*qz + qw*qx),     1 - 2*(qx*qx + qy*qy)],
-    ], dtype=np.float32)
-
-
-def _orthonormal_basis(n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Duff et al. 2017 stable orthonormal basis perpendicular to unit n̂."""
-    n = n / (np.linalg.norm(n) + 1e-20)
-    sign = 1.0 if n[2] >= 0.0 else -1.0
-    a = -1.0 / (sign + n[2])
-    b_ = n[0] * n[1] * a
-    t = np.array([1.0 + sign * n[0] * n[0] * a, sign * b_, -sign * n[0]],
-                 dtype=np.float32)
-    bvec = np.array([b_, sign + n[1] * n[1] * a, -n[1]], dtype=np.float32)
-    return t, bvec
 
 
 def _obb_sat(c_A: np.ndarray, R_A: np.ndarray, e_A: np.ndarray,
@@ -123,56 +100,6 @@ def _obb_sat(c_A: np.ndarray, R_A: np.ndarray, e_A: np.ndarray,
                 best_idx = 6 + 3 * i + j
                 best_axis = -L if np.dot(t, L) > 0 else L
     return (best_idx, best_axis.astype(np.float32), float(best_overlap))
-
-
-def _box_face_data(c: np.ndarray, R: np.ndarray, e: np.ndarray,
-                   axis: int, sign: float):
-    """Return (face_center, face_outward_normal, [4 vertices in world],
-    [4 side planes: (point, outward_normal)]) for the box face along sign·R[:,axis]."""
-    n_face = sign * R[:, axis]
-    face_center = c + n_face * e[axis]
-    other = [k for k in range(3) if k != axis]
-    u = R[:, other[0]]
-    v = R[:, other[1]]
-    eu, ev = e[other[0]], e[other[1]]
-    verts = [
-        face_center + u * eu + v * ev,
-        face_center - u * eu + v * ev,
-        face_center - u * eu - v * ev,
-        face_center + u * eu - v * ev,
-    ]
-    # Side planes — outward normals point AWAY from the face's center.
-    side_planes = [
-        (face_center + u * eu,  u),
-        (face_center - u * eu, -u),
-        (face_center + v * ev,  v),
-        (face_center - v * ev, -v),
-    ]
-    return face_center, n_face, verts, side_planes
-
-
-def _sh_clip(polygon: list, plane_pt: np.ndarray, plane_n: np.ndarray) -> list:
-    """Sutherland-Hodgman in 3D: clip the polygon against a single half-space
-    {q : (q − plane_pt) · plane_n ≤ 0} (keep the INSIDE side). Returns the
-    clipped polygon as a list of 3D points."""
-    if not polygon:
-        return []
-    out = []
-    n = len(polygon)
-    for i in range(n):
-        a = polygon[i]
-        b = polygon[(i + 1) % n]
-        da = float(np.dot(a - plane_pt, plane_n))
-        db = float(np.dot(b - plane_pt, plane_n))
-        if da <= 0.0:
-            out.append(a)
-            if db > 0.0:
-                t = da / (da - db)
-                out.append(a + t * (b - a))
-        elif db <= 0.0:
-            t = da / (da - db)
-            out.append(a + t * (b - a))
-    return out
 
 
 @dataclass
@@ -252,7 +179,6 @@ class Solver6DOF:
         max_angular_speed: float = 50.0,
         substeps: int = 1,
         friction_static_mult: float = 1.5,
-        use_warp_face_clip: bool = False,
     ):
         wp.init()
         self.device = device
@@ -297,14 +223,6 @@ class Solver6DOF:
         # rerun SAT + face clip on each colliding pair, append new rows.
         self._self_collide: bool = False
         self._self_friction: float = 0.0
-        # Index of the first row in self._rows that came from the dynamic
-        # contact pool — rows at index ≥ this are stripped+rebuilt every step.
-        self._contact_pool_start: int | None = None
-        # Persistent warm-start cache: key = (a, b, sat_axis, corner_id),
-        # value = (λ_n, λ_t, λ_b, k_n, k_t, k_b). Lets stacked boxes carry
-        # full augmented-Lagrangian state across frames so the contact penalty
-        # doesn't relitigate from PENALTY_MIN every frame.
-        self._contact_cache: dict[tuple, tuple[float, float, float, float, float, float]] = {}
 
         # Warp arrays — built in _flush.
         self.x = self.q = self.v = self.omega = None
@@ -324,7 +242,7 @@ class Solver6DOF:
         self.body_con_starts = self.body_con_indices = None
         self.num_colors = 0
         # Broadphase scratch (AVBD Alg 1 line 1 — LBVH on device-side AABBs).
-        # See _rebuild_contact_pool for the per-step pipeline.
+        # See _gpu_emit_dynamic_contacts for the per-substep pipeline.
         self._bp_half_extents = None    # wp.array(vec3) — body half-extents
         self._bp_aabb_lo = None         # wp.array(vec3)
         self._bp_aabb_hi = None
@@ -340,13 +258,6 @@ class Solver6DOF:
         # Tracks broadphase wall time (seconds) of the most recent rebuild
         # so the viewer can surface it without polling internals.
         self.broadphase_ms = 0.0
-        # Opt-in Warp face-clip path (AVBD_PERFORMANCE_GAP §3). When True,
-        # obb_contact_manifold_6dof runs the Sutherland-Hodgman clip,
-        # closest-segment-pair, and body-local offset extraction on the
-        # GPU instead of in Python. Default off until benchmarked on
-        # CUDA — parity vs the Python reference is verified on CPU
-        # via tests/_probe_parity.py.
-        self.use_warp_face_clip = bool(use_warp_face_clip)
         # Manifold-kernel output buffers — lazy-allocated alongside the
         # broadphase pair buffers when the kernel path is active.
         self._mf_poly_scratch = None
@@ -357,26 +268,41 @@ class Solver6DOF:
         self._mf_b_hat = None
         self._mf_off_ref = None
         self._mf_off_inc = None
-        # GPU-resident contact warm-start scratch (AVBD_PERFORMANCE_GAP §5).
-        # Each substep's contact pool gets index arrays (idx_n/t/b) so
-        # cache_restore_6dof + cache_collect_6dof can mutate c_lambda /
-        # c_penalty / c_was_static in place without a full-array
-        # GPU↔CPU round trip. Reused frame-to-frame; the helper
-        # `_ensure_pool_buffers` grows them in 256-pair chunks when the
-        # pool count goes up.
-        self._pool_idx_n = None       # wp.array(int)
-        self._pool_idx_t = None       # wp.array(int)
-        self._pool_idx_b = None       # wp.array(int)
-        self._pool_cache_valid = None # wp.array(int)
-        self._pool_in_packed = None   # wp.array(float), shape (n_pool*8,)
-        self._pool_out_packed = None  # wp.array(float), shape (n_pool*8,)
-        self._pool_buf_cap = 0
         # Viewer staging buffers — built lazily on first read_batched() call,
         # shared across frames, reuploaded only when body/row counts change.
         self._viewer_pack_bodies = None
         self._viewer_pack_rows = None
         self._viewer_pack_bodies_n = 0
         self._viewer_pack_rows_n = 0
+
+        # ---- GPU-resident dynamic constraint pool (AVBD_PERFORMANCE_GAP §1) ---
+        # After _init_gpu_pool runs (lazily on first step), all c_* arrays are
+        # allocated at N_static + N_dyn_capacity and the hot path no longer
+        # rebuilds them. Static rows occupy [0, n_static); dynamic BOX_BOX +
+        # tangent rows are atomically appended into the dynamic region by the
+        # gpu_pool_emit_rows kernel each substep. The pair hash table seeds
+        # warm-start λ/k from the previous substep without any CPU dict.
+        self._gpu_pool_ready = False
+        self._gpu_pool_n_static = 0
+        self._gpu_pool_n_capacity = 0
+        self._gpu_pool_n_dyn_capacity = 0
+        self._gpu_pool_max_pairs = 0
+        self._gpu_pool_hash_cap = 0
+        self._gpu_pool_pool_max = 0
+        # GPU buffers — allocated once in _init_gpu_pool.
+        self.n_active_rows = None    # wp.array(int, 1) atomic row count
+        self.body_friction = None    # wp.array(float, n_b)
+        self.body_con_counts = None  # wp.array(int, n_b) — CSR atomic histogram
+        self.body_con_cursor = None  # wp.array(int, n_b) — CSR scatter cursor
+        self.pool_count = None       # wp.array(int, 1) atomic pool size
+        self.pool_idx_n = None       # wp.array(int, pool_max)
+        self.pool_idx_t = None
+        self.pool_idx_b = None
+        self.pool_idx_c = None       # contact ordinal within pair [0, 4)
+        self.hash_keys = None        # wp.array(int, hash_cap) — -1 = empty
+        self.hash_state = None       # wp.array(float, hash_cap*8)
+        # Spatial coloring cell size, set during _init_gpu_pool.
+        self._spatial_cell_size = 0.0
 
     # ---- Scene building -----------------------------------------------------
 
@@ -505,492 +431,13 @@ class Solver6DOF:
 
     def enable_self_collision(self, enabled: bool = True,
                               default_friction: float = 0.0) -> None:
-        """Turn on per-step OBB-OBB contact generation. Pairs of bodies are
-        tested with 15-axis SAT every step and emit BOX_BOX_CONTACT_6DOF +
-        CONTACT_TANGENT_6DOF rows for the active contacts (up to 4 contacts
-        per pair from face clipping). Brute O(N²) broad phase — fine for ≤50
-        bodies; AVBD paper §4 uses LBVH for scale."""
+        """Turn on per-substep OBB-OBB contact generation. The Warp BVH
+        broadphase + 15-axis SAT + face-clip manifold runs entirely on the
+        GPU; the gpu_pool_emit_rows kernel writes BOX_BOX_CONTACT_6DOF +
+        CONTACT_TANGENT_6DOF rows directly into the dynamic region of the
+        c_* arrays. See AVBD_PERFORMANCE_GAP §1/§2."""
         self._self_collide = bool(enabled)
         self._self_friction = max(0.0, float(default_friction))
-        if enabled and self._contact_pool_start is None:
-            self._contact_pool_start = len(self._rows)
-
-    def _emit_obb_pair(self, i: int, j: int, positions: np.ndarray,
-                       quats: np.ndarray) -> None:
-        """CPU fallback path: SAT + face-clip + emit. Used only by the legacy
-        brute-force broadphase (kept for parity tests). The hot path now goes
-        through `_emit_obb_pair_with_sat` after the Warp BVH broadphase + SAT
-        kernels have already computed the separating axis and contact normal.
-        """
-        c_A, c_B = positions[i], positions[j]
-        e_A = np.asarray(self._half_extents[i], dtype=np.float32)
-        e_B = np.asarray(self._half_extents[j], dtype=np.float32)
-        R_A = _q_to_R(quats[i])
-        R_B = _q_to_R(quats[j])
-        sat = _obb_sat(c_A, R_A, e_A, c_B, R_B, e_B)
-        if sat is None:
-            return
-        sat_idx, n_hat, _overlap = sat
-        self._emit_obb_pair_with_sat(i, j, positions, quats,
-                                     sat_idx, n_hat, c_A, c_B,
-                                     e_A, e_B, R_A, R_B)
-
-    def _emit_obb_pair_with_sat(self, i: int, j: int,
-                                positions: np.ndarray, quats: np.ndarray,
-                                sat_idx: int, n_hat: np.ndarray,
-                                c_A: np.ndarray, c_B: np.ndarray,
-                                e_A: np.ndarray, e_B: np.ndarray,
-                                R_A: np.ndarray, R_B: np.ndarray) -> None:
-        """Face-clip + emit using precomputed SAT result. Pulled out of
-        `_emit_obb_pair` so the Warp-side parallel SAT kernel can feed it
-        directly."""
-
-        # Identify reference vs incident body based on which axis won.
-        if sat_idx < 3:
-            ref_i, inc_i = i, j
-            ref_c, ref_R, ref_e = c_A, R_A, e_A
-            inc_c, inc_R, inc_e = c_B, R_B, e_B
-            ref_axis = sat_idx
-        elif sat_idx < 6:
-            ref_i, inc_i = j, i
-            ref_c, ref_R, ref_e = c_B, R_B, e_B
-            inc_c, inc_R, inc_e = c_A, R_A, e_A
-            ref_axis = sat_idx - 3
-            # n_hat from SAT was oriented "B to A" with body indices (i, j) =
-            # (A_input, B_input). Now we swapped which body is "ref"; we need
-            # n_hat to point from new inc (=i) to new ref (=j). Flip.
-            n_hat = -n_hat
-        else:
-            # Edge-edge fallback: single contact at the "deepest" body's
-            # closest vertex projected onto the other body's surface. Crude
-            # but stable. Proper edge-edge needs closest-segment-pair.
-            self._emit_obb_edge_edge(i, j, c_A, R_A, e_A, c_B, R_B, e_B,
-                                     n_hat, sat_idx, positions, quats)
-            return
-
-        # Reference face on ref body: pick the face along ref_axis whose
-        # outward normal opposes n_hat (i.e., points TOWARD the incident).
-        dot = float(np.dot(ref_R[:, ref_axis], n_hat))
-        ref_sign = -1.0 if dot > 0 else 1.0
-        ref_face_c, ref_face_n, _ref_verts, ref_side_planes = _box_face_data(
-            ref_c, ref_R, ref_e, ref_axis, ref_sign)
-
-        # Incident face on inc body: pick the inc local axis (and sign)
-        # whose outward normal is most aligned with n_hat (points toward ref).
-        best = (0, 1.0, -np.inf)
-        for k in range(3):
-            for sign in (-1.0, 1.0):
-                d = float(np.dot(sign * inc_R[:, k], n_hat))
-                if d > best[2]:
-                    best = (k, sign, d)
-        inc_axis, inc_sign, _ = best
-        _inc_face_c, _inc_face_n, inc_verts, _ = _box_face_data(
-            inc_c, inc_R, inc_e, inc_axis, inc_sign)
-
-        # Clip incident-face polygon against the 4 side planes of ref face.
-        polygon = list(inc_verts)
-        for pp, pn in ref_side_planes:
-            polygon = _sh_clip(polygon, pp, pn)
-            if not polygon:
-                return
-
-        # Keep points within `margin` of the ref face plane (penetrating OR
-        # slightly separated). Separated rows produce zero force (C > 0 →
-        # f clamped to 0) but their λ persists in the warm-start cache, which
-        # is what makes stacking stable across the brief separations that
-        # post-stab + finalize_velocity introduce.
-        margin = 0.005
-        contacts = []
-        for p in polygon:
-            d = float(np.dot(p - ref_face_c, ref_face_n))
-            if d < margin:
-                contacts.append((p, -d))
-        if not contacts:
-            return
-        contacts.sort(key=lambda x: -x[1])
-        contacts = contacts[:4]  # up to 4 per pair, same as 3-DOF AABB version
-
-        # Build tangent basis once per pair.
-        t_hat, b_hat = _orthonormal_basis(n_hat)
-        mu = self._self_friction
-        if (self._friction[ref_i] > 0.0 or self._friction[inc_i] > 0.0):
-            mu = math.sqrt(self._friction[ref_i] * self._friction[inc_i])
-
-        for cid, (p_inc, _depth) in enumerate(contacts):
-            # Contact point on REF body: project p_inc onto ref face plane.
-            p_ref = p_inc - np.dot(p_inc - ref_face_c, ref_face_n) * ref_face_n
-            # Body-local anchors — transform world offsets into each body's
-            # rest frame. R^T = R^{-1} since R is orthonormal.
-            off_ref_local = ref_R.T @ (p_ref - ref_c)
-            off_inc_local = inc_R.T @ (p_inc - inc_c)
-
-            normal_idx = len(self._rows)
-            self._rows.append(_Row(
-                type=BOX_BOX_CONTACT_6DOF,
-                body_a=ref_i, body_b=inc_i,
-                world_anchor=(float(n_hat[0]), float(n_hat[1]), float(n_hat[2])),
-                off_a=(float(off_ref_local[0]), float(off_ref_local[1]), float(off_ref_local[2])),
-                off_b=(float(off_inc_local[0]), float(off_inc_local[1]), float(off_inc_local[2])),
-                rest=0.0,
-                stiffness=math.inf,
-                fmin=-math.inf, fmax=0.0,
-            ))
-            t_idx, b_idx = -1, -1
-            if mu > 0.0:
-                mu_s = mu * self.friction_static_mult
-                t_idx = len(self._rows)
-                self._rows.append(_Row(
-                    type=CONTACT_TANGENT_6DOF,
-                    body_a=ref_i, body_b=inc_i,
-                    world_anchor=(float(t_hat[0]), float(t_hat[1]), float(t_hat[2])),
-                    off_a=(float(off_ref_local[0]), float(off_ref_local[1]), float(off_ref_local[2])),
-                    off_b=(float(off_inc_local[0]), float(off_inc_local[1]), float(off_inc_local[2])),
-                    stiffness=math.inf, sibling=normal_idx, friction=mu,
-                    friction_static=mu_s,
-                ))
-                b_idx = len(self._rows)
-                self._rows.append(_Row(
-                    type=CONTACT_TANGENT_6DOF,
-                    body_a=ref_i, body_b=inc_i,
-                    world_anchor=(float(b_hat[0]), float(b_hat[1]), float(b_hat[2])),
-                    off_a=(float(off_ref_local[0]), float(off_ref_local[1]), float(off_ref_local[2])),
-                    off_b=(float(off_inc_local[0]), float(off_inc_local[1]), float(off_inc_local[2])),
-                    stiffness=math.inf, sibling=normal_idx, friction=mu,
-                    friction_static=mu_s,
-                ))
-                self._rows[t_idx].partner = b_idx
-                self._rows[b_idx].partner = t_idx
-            # Cache key — quantize the body-local contact point on the
-            # LOWER-INDEX body to a 5 mm grid. Using the lower-index body
-            # (rather than "ref") keeps the key invariant to which side SAT
-            # picked as ref on a tiebreak; without this, axis switches
-            # between frames cache-miss every time and break stack stability.
-            if ref_i < inc_i:
-                off_key = off_ref_local
-            else:
-                off_key = off_inc_local
-            qx = int(round(float(off_key[0]) * 200))
-            qy = int(round(float(off_key[1]) * 200))
-            qz = int(round(float(off_key[2]) * 200))
-            cache_key = (min(ref_i, inc_i), max(ref_i, inc_i), qx, qy, qz)
-            self._pool_pair_rows.append((cache_key, normal_idx, t_idx, b_idx))
-
-    def _emit_obb_edge_edge(self, i, j, c_A, R_A, e_A, c_B, R_B, e_B,
-                            n_hat, sat_idx, positions, quats) -> None:
-        """Proper edge-edge OBB contact (Ericson §5.1.9 + §15.6.3).
-
-        When SAT picks an edge×edge separating axis L = R_A[:,k_A] × R_B[:,k_B],
-        the contact happens between one edge on A parallel to R_A[:,k_A] and
-        one edge on B parallel to R_B[:,k_B]. The contact normal is n_hat
-        (already oriented B→A by the SAT). The contact "point" is the
-        midpoint of the closest-segment-pair on those two edges.
-
-        Selecting WHICH parallel edge on each body: each box has 4 edges
-        along a given direction (at the 4 corners of the perpendicular face).
-        The contact edge is the one whose midpoint is closest to the OTHER
-        body's centre — equivalently, whose perpendicular-axis offsets
-        have the right sign to face the other body.
-        """
-        # Decode SAT index back to (k_A, k_B) edge axes (paired in row-major
-        # 3×3 order). sat_idx ∈ [6, 15).
-        eidx = sat_idx - 6
-        k_A = eidx // 3
-        k_B = eidx % 3
-        eA_dir = R_A[:, k_A]
-        eB_dir = R_B[:, k_B]
-        # Degenerate: cross product near zero (edges nearly parallel) → skip,
-        # the face-axis cases will already have captured the contact.
-        cross_mag = float(np.linalg.norm(np.cross(eA_dir, eB_dir)))
-        if cross_mag < 1.0e-4:
-            return
-
-        # Pick the contact edge on A: 4 candidates, indexed by sign pair
-        # (s_b, s_c) on A's perpendicular axes (k_A+1)%3 and (k_A+2)%3.
-        # Choose signs that put the edge midpoint on the side of A closest
-        # to c_B.
-        kA1 = (k_A + 1) % 3
-        kA2 = (k_A + 2) % 3
-        toB = c_B - c_A
-        s_b_A = 1.0 if float(np.dot(toB, R_A[:, kA1])) >= 0 else -1.0
-        s_c_A = 1.0 if float(np.dot(toB, R_A[:, kA2])) >= 0 else -1.0
-        edge_A_mid = c_A + s_b_A * e_A[kA1] * R_A[:, kA1] + s_c_A * e_A[kA2] * R_A[:, kA2]
-        # A's edge spans [-e_A[k_A], +e_A[k_A]] along eA_dir from edge_A_mid.
-        P1 = edge_A_mid - e_A[k_A] * eA_dir
-        Q1 = edge_A_mid + e_A[k_A] * eA_dir
-
-        # Same for B (toward c_A).
-        kB1 = (k_B + 1) % 3
-        kB2 = (k_B + 2) % 3
-        toA = c_A - c_B
-        s_b_B = 1.0 if float(np.dot(toA, R_B[:, kB1])) >= 0 else -1.0
-        s_c_B = 1.0 if float(np.dot(toA, R_B[:, kB2])) >= 0 else -1.0
-        edge_B_mid = c_B + s_b_B * e_B[kB1] * R_B[:, kB1] + s_c_B * e_B[kB2] * R_B[:, kB2]
-        P2 = edge_B_mid - e_B[k_B] * eB_dir
-        Q2 = edge_B_mid + e_B[k_B] * eB_dir
-
-        # Closest points on two segments (Ericson §5.1.9).
-        d1 = Q1 - P1
-        d2 = Q2 - P2
-        r = P1 - P2
-        a = float(np.dot(d1, d1))
-        e = float(np.dot(d2, d2))
-        f = float(np.dot(d2, r))
-        eps = 1.0e-12
-        if a <= eps and e <= eps:
-            s_p, t_p = 0.0, 0.0
-        elif a <= eps:
-            s_p = 0.0
-            t_p = float(np.clip(f / max(e, eps), 0.0, 1.0))
-        elif e <= eps:
-            t_p = 0.0
-            c_ = float(np.dot(d1, r))
-            s_p = float(np.clip(-c_ / a, 0.0, 1.0))
-        else:
-            c_ = float(np.dot(d1, r))
-            b_ = float(np.dot(d1, d2))
-            denom = a * e - b_ * b_
-            if denom != 0.0:
-                s_p = float(np.clip((b_ * f - c_ * e) / denom, 0.0, 1.0))
-            else:
-                s_p = 0.0
-            t_p = (b_ * s_p + f) / e
-            if t_p < 0.0:
-                t_p = 0.0
-                s_p = float(np.clip(-c_ / a, 0.0, 1.0))
-            elif t_p > 1.0:
-                t_p = 1.0
-                s_p = float(np.clip((b_ - c_) / a, 0.0, 1.0))
-        p_on_A = P1 + s_p * d1
-        p_on_B = P2 + t_p * d2
-
-        # Penetration check: the two closest points should be within `margin`
-        # along n_hat (signed gap). n_hat points B→A so (p_on_A - p_on_B)·n_hat
-        # > 0 means separated, ≤ 0 means penetrating.
-        gap = float(np.dot(p_on_A - p_on_B, n_hat))
-        if gap > 0.005:
-            return
-
-        off_a_local = R_A.T @ (p_on_A - c_A)
-        off_b_local = R_B.T @ (p_on_B - c_B)
-        t_hat, b_hat = _orthonormal_basis(n_hat)
-        mu = self._self_friction
-        if (self._friction[i] > 0.0 or self._friction[j] > 0.0):
-            mu = math.sqrt(self._friction[i] * self._friction[j])
-
-        normal_idx = len(self._rows)
-        self._rows.append(_Row(
-            type=BOX_BOX_CONTACT_6DOF,
-            body_a=i, body_b=j,
-            world_anchor=(float(n_hat[0]), float(n_hat[1]), float(n_hat[2])),
-            off_a=(float(off_a_local[0]), float(off_a_local[1]), float(off_a_local[2])),
-            off_b=(float(off_b_local[0]), float(off_b_local[1]), float(off_b_local[2])),
-            rest=0.0, stiffness=math.inf,
-            fmin=-math.inf, fmax=0.0,
-        ))
-        t_idx, b_idx = -1, -1
-        if mu > 0.0:
-            mu_s = mu * self.friction_static_mult
-            t_idx = len(self._rows)
-            self._rows.append(_Row(
-                type=CONTACT_TANGENT_6DOF, body_a=i, body_b=j,
-                world_anchor=(float(t_hat[0]), float(t_hat[1]), float(t_hat[2])),
-                off_a=(float(off_a_local[0]), float(off_a_local[1]), float(off_a_local[2])),
-                off_b=(float(off_b_local[0]), float(off_b_local[1]), float(off_b_local[2])),
-                stiffness=math.inf, sibling=normal_idx, friction=mu,
-                friction_static=mu_s,
-            ))
-            b_idx = len(self._rows)
-            self._rows.append(_Row(
-                type=CONTACT_TANGENT_6DOF, body_a=i, body_b=j,
-                world_anchor=(float(b_hat[0]), float(b_hat[1]), float(b_hat[2])),
-                off_a=(float(off_a_local[0]), float(off_a_local[1]), float(off_a_local[2])),
-                off_b=(float(off_b_local[0]), float(off_b_local[1]), float(off_b_local[2])),
-                stiffness=math.inf, sibling=normal_idx, friction=mu,
-                friction_static=mu_s,
-            ))
-            self._rows[t_idx].partner = b_idx
-            self._rows[b_idx].partner = t_idx
-        # Cache key on lower-index body for tiebreak invariance.
-        off_key = off_a_local if i < j else off_b_local
-        qx = int(round(float(off_key[0]) * 200))
-        qy = int(round(float(off_key[1]) * 200))
-        qz = int(round(float(off_key[2]) * 200))
-        cache_key = (min(i, j), max(i, j), qx, qy, qz)
-        self._pool_pair_rows.append((cache_key, normal_idx, t_idx, b_idx))
-
-    def _rebuild_contact_pool(self) -> None:
-        """Strip last frame's BOX_BOX rows + their tangent siblings, run the
-        SAT broad phase on every pair of rigid bodies, append fresh rows.
-        Renumbers `sibling` indices on any surviving CONTACT_TANGENT_6DOF
-        rows that pointed to BOX_BOX (none in MVP — floor tangents survive)."""
-        if not self._self_collide:
-            return
-        kept: list[_Row] = []
-        old_to_new: dict[int, int] = {}
-        for old_idx, r in enumerate(self._rows):
-            if r.type == BOX_BOX_CONTACT_6DOF:
-                continue
-            if (r.type == CONTACT_TANGENT_6DOF
-                    and 0 <= r.sibling < len(self._rows)):
-                sib = self._rows[r.sibling]
-                if sib.type == BOX_BOX_CONTACT_6DOF:
-                    continue
-            old_to_new[old_idx] = len(kept)
-            kept.append(r)
-        for r in kept:
-            if r.type == CONTACT_TANGENT_6DOF and r.sibling >= 0:
-                r.sibling = old_to_new.get(r.sibling, -1)
-            if r.type == CONTACT_TANGENT_6DOF and r.partner >= 0:
-                r.partner = old_to_new.get(r.partner, -1)
-        self._rows = kept
-        self._contact_pool_start = len(self._rows)
-        self._pool_pair_rows: list = []
-
-        positions = (self.x.numpy().reshape(-1, 3) if self.x is not None
-                     else np.array(self._x, dtype=np.float32).reshape(-1, 3))
-        quats = (self.q.numpy().reshape(-1, 4) if self.q is not None
-                 else np.array(self._q, dtype=np.float32).reshape(-1, 4))
-        n = len(self._x)
-        if n < 2:
-            self._dirty = True
-            return
-
-        import time as _t
-        t_bp0 = _t.perf_counter()
-        self._warp_broadphase_emit_contacts(n, positions, quats)
-        self.broadphase_ms = (_t.perf_counter() - t_bp0) * 1000.0
-        self._dirty = True
-
-    def _warp_broadphase_emit_contacts(
-            self, n: int, positions: np.ndarray, quats: np.ndarray) -> None:
-        """AVBD Alg 1 line 1 broadphase. Build per-body world AABBs on the
-        Warp device, construct an LBVH over them, query for overlapping
-        pairs, run 15-axis SAT in parallel on candidate pairs, then run the
-        Python face-clip on confirmed-overlap pairs only.
-
-        The legacy O(N²) Python sphere-test + per-pair SAT loop dominated
-        ~56% of frame time in dense scenes (towers + dominoes); this path
-        moves both the broadphase and the SAT inner loop to Warp where they
-        execute in parallel across pairs."""
-        dev = self.device
-
-        # Margin matches the per-pair SAT margin used in _obb_sat (5 mm) —
-        # bodies within this margin still emit a contact so warm-start λ
-        # persists across brief separations during settle. The AABB margin
-        # must be at least this large or the broadphase silently drops
-        # those grazing pairs and we lose the persistence trick.
-        margin = 0.005
-
-        # 1. Half-extent buffer — only needs rebuild if body count changed.
-        he_np = np.asarray(self._half_extents, dtype=np.float32).reshape(-1, 3)
-        if (self._bp_half_extents is None
-                or self._bp_half_extents.shape[0] != n):
-            self._bp_half_extents = wp.array(he_np, dtype=wp.vec3, device=dev)
-            self._bp_aabb_lo = wp.zeros(n, dtype=wp.vec3, device=dev)
-            self._bp_aabb_hi = wp.zeros(n, dtype=wp.vec3, device=dev)
-        else:
-            # Half-extents are scene-static; only flush if user appended
-            # bodies after the initial _flush. Cheaper to just copy now
-            # than to track a dirty flag for this one buffer.
-            self._bp_half_extents.assign(he_np)
-
-        # 2. Pair-list buffer — generous fixed allocation. Realistic cap
-        # for dense rigid stacks: each body sees ≲ 12 neighbors (corner
-        # contacts on a cube grid), so 16*n is a safe upper bound. We
-        # detect overflow and grow next frame if needed.
-        cap_target = max(256, 16 * n)
-        if self._bp_max_pairs < cap_target:
-            self._bp_max_pairs = cap_target
-            self._bp_pair_a = wp.zeros(cap_target, dtype=int, device=dev)
-            self._bp_pair_b = wp.zeros(cap_target, dtype=int, device=dev)
-            self._bp_pair_overlap = wp.zeros(cap_target, dtype=int, device=dev)
-            self._bp_pair_sat_idx = wp.zeros(cap_target, dtype=int, device=dev)
-            self._bp_pair_n_hat = wp.zeros(cap_target, dtype=wp.vec3, device=dev)
-            self._bp_pair_depth = wp.zeros(cap_target, dtype=float, device=dev)
-        if self._bp_pair_count is None:
-            self._bp_pair_count = wp.zeros(1, dtype=int, device=dev)
-        else:
-            self._bp_pair_count.zero_()
-
-        # 3. World AABBs on device — needs self.x / self.q which _flush()
-        # populated upstream; we're in the post-_flush path of _step_one.
-        wp.launch(
-            K.compute_body_aabb_6dof, dim=n,
-            inputs=[self.x, self.q, self._bp_half_extents, margin],
-            outputs=[self._bp_aabb_lo, self._bp_aabb_hi],
-            device=dev,
-        )
-
-        # 4. Build the BVH. AVBD §4 specifies LBVH (Lauterbach 2009) but
-        # Warp 1.13 only ships the LBVH constructor for CUDA trees. On CPU
-        # the closest equivalent is SAH (Surface Area Heuristic, top-down)
-        # — same O(N log N) build, slightly different split quality, no
-        # behavioral difference for the broadphase.
-        constructor = "lbvh" if str(dev).startswith("cuda") else "sah"
-        self._bp_bvh = wp.Bvh(self._bp_aabb_lo, self._bp_aabb_hi,
-                              constructor=constructor)
-
-        # 5. Broadphase pair generation — each body queries the tree.
-        wp.launch(
-            K.bvh_broadphase_pairs, dim=n,
-            inputs=[self._bp_bvh.id, self._bp_aabb_lo, self._bp_aabb_hi,
-                    self.mass, self._bp_pair_count,
-                    self._bp_pair_a, self._bp_pair_b, self._bp_max_pairs],
-            device=dev,
-        )
-
-        n_pairs = int(self._bp_pair_count.numpy()[0])
-        if n_pairs == 0:
-            return
-        if n_pairs > self._bp_max_pairs:
-            # Overflow — grow buffer and retry next frame. Conservatively
-            # drop this frame's late pairs; the BVH will reissue them next
-            # substep with the resized buffer.
-            self._bp_max_pairs = max(2 * self._bp_max_pairs, n_pairs * 2)
-            n_pairs = self._bp_max_pairs
-
-        # 6. 15-axis SAT in parallel across candidate pairs.
-        wp.launch(
-            K.obb_sat_pairs, dim=n_pairs,
-            inputs=[self.x, self.q, self._bp_half_extents,
-                    self._bp_pair_a, self._bp_pair_b, n_pairs, margin],
-            outputs=[self._bp_pair_overlap, self._bp_pair_sat_idx,
-                     self._bp_pair_n_hat, self._bp_pair_depth],
-            device=dev,
-        )
-
-        # 7. Contact manifold generation — two paths.
-        if self.use_warp_face_clip:
-            self._warp_emit_contacts_kernel_path(n_pairs)
-            return
-
-        # Default (CPU) path: readback + Python face-clip on confirmed overlaps.
-        # We pay one GPU→CPU sync here for the SAT result arrays (4 small
-        # int/float buffers, ~50 entries on a tower scene). Face-clip variable
-        # output is awkward in Warp; keeping it on CPU is the residual cost.
-        # The kernel path above closes this gap when enabled — see
-        # _warp_emit_contacts_kernel_path.
-        a_np = self._bp_pair_a.numpy()[:n_pairs]
-        b_np = self._bp_pair_b.numpy()[:n_pairs]
-        ov_np = self._bp_pair_overlap.numpy()[:n_pairs]
-        si_np = self._bp_pair_sat_idx.numpy()[:n_pairs]
-        nh_np = self._bp_pair_n_hat.numpy().reshape(-1, 3)[:n_pairs]
-
-        for p in range(n_pairs):
-            if ov_np[p] == 0:
-                continue
-            i = int(a_np[p])
-            j = int(b_np[p])
-            sat_idx = int(si_np[p])
-            n_hat = nh_np[p].astype(np.float32)
-            c_A, c_B = positions[i], positions[j]
-            e_A = np.asarray(self._half_extents[i], dtype=np.float32)
-            e_B = np.asarray(self._half_extents[j], dtype=np.float32)
-            R_A = _q_to_R(quats[i])
-            R_B = _q_to_R(quats[j])
-            self._emit_obb_pair_with_sat(i, j, positions, quats,
-                                         sat_idx, n_hat,
-                                         c_A, c_B, e_A, e_B, R_A, R_B)
 
     def _ensure_manifold_buffers(self, cap: int) -> None:
         """Allocate or grow the manifold-kernel output buffers to match the
@@ -1008,119 +455,6 @@ class Solver6DOF:
         self._mf_b_hat = wp.zeros(cap, dtype=wp.vec3, device=dev)
         self._mf_off_ref = wp.zeros(cap * 4, dtype=wp.vec3, device=dev)
         self._mf_off_inc = wp.zeros(cap * 4, dtype=wp.vec3, device=dev)
-
-    def _warp_emit_contacts_kernel_path(self, n_pairs: int) -> None:
-        """GPU face-clip path: launches obb_contact_manifold_6dof, reads
-        back the (count, ref_is_a, n/t/b, off_ref/off_inc) outputs once,
-        then emits Box-Box rows + tangent partners from the kernel output.
-        Skips the Python SH-clip and edge-edge fallback entirely — both
-        run inside the kernel. Closes AVBD_PERFORMANCE_GAP §3.
-
-        Row append still touches the Python `_Row` list because dynamic
-        constraint rows are not yet GPU-resident (that is GAP §4, still
-        deferred — see PERFORMANCE_PROGRESS.md). What this method removes
-        is the Sutherland-Hodgman polygon math and the closest-segment-pair
-        math from the per-pair Python loop."""
-        dev = self.device
-        self._ensure_manifold_buffers(self._bp_max_pairs)
-        wp.launch(
-            K.obb_contact_manifold_6dof, dim=n_pairs,
-            inputs=[self.x, self.q, self._bp_half_extents,
-                    self._bp_pair_a, self._bp_pair_b,
-                    self._bp_pair_overlap, self._bp_pair_sat_idx,
-                    self._bp_pair_n_hat,
-                    n_pairs, 0.005,
-                    self._mf_poly_scratch],
-            outputs=[self._mf_contact_count, self._mf_ref_is_a,
-                     self._mf_n_hat, self._mf_t_hat, self._mf_b_hat,
-                     self._mf_off_ref, self._mf_off_inc],
-            device=dev,
-        )
-        # Single batched readback — 8 arrays' worth of small per-pair data,
-        # all blocking on the same sync since they were written by one launch.
-        a_np = self._bp_pair_a.numpy()[:n_pairs]
-        b_np = self._bp_pair_b.numpy()[:n_pairs]
-        count_np = self._mf_contact_count.numpy()[:n_pairs]
-        ref_is_a_np = self._mf_ref_is_a.numpy()[:n_pairs]
-        n_np = self._mf_n_hat.numpy().reshape(-1, 3)[:n_pairs]
-        t_np = self._mf_t_hat.numpy().reshape(-1, 3)[:n_pairs]
-        b_hat_np = self._mf_b_hat.numpy().reshape(-1, 3)[:n_pairs]
-        off_ref_np = self._mf_off_ref.numpy().reshape(-1, 4, 3)[:n_pairs]
-        off_inc_np = self._mf_off_inc.numpy().reshape(-1, 4, 3)[:n_pairs]
-        for p in range(n_pairs):
-            n_contacts = int(count_np[p])
-            if n_contacts == 0:
-                continue
-            i = int(a_np[p])
-            j = int(b_np[p])
-            if int(ref_is_a_np[p]) == 1:
-                ref_i, inc_i = i, j
-            else:
-                ref_i, inc_i = j, i
-            n_hat = n_np[p].astype(np.float32)
-            t_hat = t_np[p].astype(np.float32)
-            b_hat = b_hat_np[p].astype(np.float32)
-            mu = self._self_friction
-            if (self._friction[ref_i] > 0.0 or self._friction[inc_i] > 0.0):
-                mu = math.sqrt(self._friction[ref_i] * self._friction[inc_i])
-            for c in range(n_contacts):
-                off_ref_local = off_ref_np[p, c].astype(np.float32)
-                off_inc_local = off_inc_np[p, c].astype(np.float32)
-                normal_idx = len(self._rows)
-                self._rows.append(_Row(
-                    type=BOX_BOX_CONTACT_6DOF,
-                    body_a=ref_i, body_b=inc_i,
-                    world_anchor=(float(n_hat[0]), float(n_hat[1]), float(n_hat[2])),
-                    off_a=(float(off_ref_local[0]), float(off_ref_local[1]),
-                           float(off_ref_local[2])),
-                    off_b=(float(off_inc_local[0]), float(off_inc_local[1]),
-                           float(off_inc_local[2])),
-                    rest=0.0, stiffness=math.inf,
-                    fmin=-math.inf, fmax=0.0,
-                ))
-                t_idx, b_idx = -1, -1
-                if mu > 0.0:
-                    mu_s = mu * self.friction_static_mult
-                    t_idx = len(self._rows)
-                    self._rows.append(_Row(
-                        type=CONTACT_TANGENT_6DOF,
-                        body_a=ref_i, body_b=inc_i,
-                        world_anchor=(float(t_hat[0]), float(t_hat[1]),
-                                      float(t_hat[2])),
-                        off_a=(float(off_ref_local[0]), float(off_ref_local[1]),
-                               float(off_ref_local[2])),
-                        off_b=(float(off_inc_local[0]), float(off_inc_local[1]),
-                               float(off_inc_local[2])),
-                        stiffness=math.inf, sibling=normal_idx, friction=mu,
-                        friction_static=mu_s,
-                    ))
-                    b_idx = len(self._rows)
-                    self._rows.append(_Row(
-                        type=CONTACT_TANGENT_6DOF,
-                        body_a=ref_i, body_b=inc_i,
-                        world_anchor=(float(b_hat[0]), float(b_hat[1]),
-                                      float(b_hat[2])),
-                        off_a=(float(off_ref_local[0]), float(off_ref_local[1]),
-                               float(off_ref_local[2])),
-                        off_b=(float(off_inc_local[0]), float(off_inc_local[1]),
-                               float(off_inc_local[2])),
-                        stiffness=math.inf, sibling=normal_idx, friction=mu,
-                        friction_static=mu_s,
-                    ))
-                    self._rows[t_idx].partner = b_idx
-                    self._rows[b_idx].partner = t_idx
-                # Cache key — match the Python emitter exactly so existing
-                # warm-start cache entries from the Python path stay valid
-                # after the user flips the flag at runtime.
-                if ref_i < inc_i:
-                    off_key = off_ref_local
-                else:
-                    off_key = off_inc_local
-                qx = int(round(float(off_key[0]) * 200))
-                qy = int(round(float(off_key[1]) * 200))
-                qz = int(round(float(off_key[2]) * 200))
-                cache_key = (min(ref_i, inc_i), max(ref_i, inc_i), qx, qy, qz)
-                self._pool_pair_rows.append((cache_key, normal_idx, t_idx, b_idx))
 
     # ---- Runtime perturbations ---------------------------------------------
 
@@ -1148,50 +482,52 @@ class Solver6DOF:
         ws[body.index] = np.array(w, dtype=np.float32)
         self.omega = wp.array(ws, dtype=wp.vec3, device=self.device)
 
-    # ---- Adjacency + Warp upload -------------------------------------------
-
-    def _build_adjacency(self) -> tuple[np.ndarray, np.ndarray]:
-        n = len(self._x)
-        counts = np.zeros(n, dtype=np.int32)
-        for r in self._rows:
-            counts[r.body_a] += 1
-            # NOTE: for PIN rows we re-use body_b as the axis index — those
-            # don't count as a second body in the adjacency.
-            if r.type not in (PIN_6DOF,) and r.body_b >= 0:
-                counts[r.body_b] += 1
-        starts = np.zeros(n + 1, dtype=np.int32)
-        starts[1:] = np.cumsum(counts)
-        indices = np.zeros(starts[-1] if n > 0 else 0, dtype=np.int32)
-        cursor = starts[:-1].copy()
-        for ci, r in enumerate(self._rows):
-            indices[cursor[r.body_a]] = ci
-            cursor[r.body_a] += 1
-            if r.type not in (PIN_6DOF,) and r.body_b >= 0:
-                indices[cursor[r.body_b]] = ci
-                cursor[r.body_b] += 1
-        return starts, indices
+    # ---- Warp upload --------------------------------------------------------
 
     def _flush(self) -> None:
+        """Allocate GPU-resident pool. Called once when self._dirty is True.
+
+        After this returns, all c_* arrays live in GPU memory at fixed
+        capacity = N_static + N_dyn_capacity. The hot path in _step_one
+        never reallocates them and never rebuilds rows from Python.
+
+        See AVBD_PERFORMANCE_GAP §1 and the GPU-resident pool plan at
+        ~/.claude/plans/here-is-major-gaps-jaunty-flute.md."""
         if not self._dirty:
             return
         n_b = len(self._x)
-        n_c = len(self._rows)
+        n_static = len(self._rows)
         dev = self.device
 
-        # Snapshot current state so we preserve already-simulated bodies and
-        # constraint λ when bodies/rows are added mid-simulation.
+        # Snapshot existing GPU state so we preserve already-simulated bodies
+        # when add_box is called mid-simulation. Static rows (pins, floor
+        # contacts) cannot be appended mid-sim in the GPU-resident path
+        # because the layout assumes [0, n_static) is fixed; rebuild from
+        # the Python list each time _flush runs is fine for that case (rare).
         cur_x = self.x.numpy() if self.x is not None else None
         cur_q = self.q.numpy() if self.q is not None else None
         cur_v = self.v.numpy() if self.v is not None else None
         cur_w = self.omega.numpy() if self.omega is not None else None
         cur_prev_v = self.prev_v.numpy() if self.prev_v is not None else None
         cur_prev_w = self.prev_omega.numpy() if self.prev_omega is not None else None
-        cur_lam = self.c_lambda.numpy() if self.c_lambda is not None else None
-        cur_pen = self.c_penalty.numpy() if self.c_penalty is not None else None
-        cur_act = self.c_active.numpy() if self.c_active is not None else None
         n_b_prev = 0 if cur_x is None else int(cur_x.shape[0])
-        n_c_prev = 0 if cur_lam is None else int(cur_lam.shape[0])
 
+        # Capacity for the dynamic constraint region. Each broadphase pair
+        # can yield up to GPU_POOL_C_PER_PAIR contact points and each
+        # contact owns 3 rows (normal + 2 tangents). The pair budget
+        # scales with n_bodies — see _bp_max_pairs heuristic in the
+        # broadphase emitter (16·n_b).
+        if self._self_collide:
+            max_pairs = max(64, 16 * max(1, n_b))
+            n_dyn_capacity = max_pairs * 4 * 3   # 4 contacts × 3 rows
+        else:
+            max_pairs = 0
+            n_dyn_capacity = 0
+        n_cap = n_static + n_dyn_capacity
+
+        # Body arrays — sized to n_b. Bodies are static after init in the
+        # default path; if add_box was called mid-sim, copy old state into
+        # the prefix.
         x_np = np.array(self._x, dtype=np.float32).reshape(-1, 3) if n_b else np.zeros((0, 3), np.float32)
         q_np = np.array(self._q, dtype=np.float32).reshape(-1, 4) if n_b else np.zeros((0, 4), np.float32)
         v_np = np.array(self._v, dtype=np.float32).reshape(-1, 3) if n_b else np.zeros((0, 3), np.float32)
@@ -1203,6 +539,7 @@ class Solver6DOF:
                     if n_b else np.zeros((0, 3, 3), dtype=np.float32))
         I_np = (np.stack(self._I_local).astype(np.float32)
                 if n_b else np.zeros((0, 3, 3), dtype=np.float32))
+        fric_np = np.asarray(self._friction, dtype=np.float32) if n_b else np.zeros(0, np.float32)
 
         if n_b_prev > 0 and n_b_prev <= n_b:
             x_np[:n_b_prev] = cur_x[:n_b_prev]
@@ -1223,6 +560,7 @@ class Solver6DOF:
         self.mass = wp.array(m_np, dtype=float, device=dev)
         self.inv_inertia_local = wp.array(inv_I_np, dtype=wp.mat33, device=dev)
         self.inertia_local = wp.array(I_np, dtype=wp.mat33, device=dev)
+        self.body_friction = wp.array(fric_np, dtype=float, device=dev)
         self.x_initial = wp.zeros(n_b, dtype=wp.vec3, device=dev)
         self.q_initial = wp.zeros(n_b, dtype=wp.quat, device=dev)
         self.x_inertial = wp.zeros(n_b, dtype=wp.vec3, device=dev)
@@ -1230,67 +568,143 @@ class Solver6DOF:
         self.inv_inertia_world = wp.zeros(n_b, dtype=wp.mat33, device=dev)
         self.inertia_world = wp.zeros(n_b, dtype=wp.mat33, device=dev)
 
-        # Adjacency uses body indices only.
-        body_a_list = [r.body_a for r in self._rows]
-        body_b_list = [r.body_b if r.type != PIN_6DOF else -1 for r in self._rows]
-        adj = build_body_edges(n_b, body_a_list, body_b_list)
-        color_np = greedy_color(adj) if n_b > 0 else np.zeros(0, dtype=np.int32)
+        # Body coloring — spatial 8-color (AVBD_PERFORMANCE_GAP §5). Cell
+        # size = 2× the max half-extent so any two cubes touching cube-to-
+        # cube fall in adjacent grid cells with different colors. Computed
+        # once at init; never recomputed for dynamic contacts.
+        if n_b > 0:
+            max_he = float(max(max(he) for he in self._half_extents))
+            cell = max(2.0 * max_he, 1e-3)
+            self._spatial_cell_size = cell
+            color_np = spatial_8color(x_np, cell)
+        else:
+            color_np = np.zeros(0, dtype=np.int32)
         self.num_colors = int(color_np.max() + 1) if n_b > 0 else 0
         self.color_counts = color_summary(color_np)
         self.body_color = wp.array(color_np, dtype=int, device=dev)
 
-        def f32(seq): return np.array(seq, dtype=np.float32) if n_c else np.zeros(0, np.float32)
-        def i32(seq): return np.array(seq, dtype=np.int32) if n_c else np.zeros(0, np.int32)
+        # Build the per-color body bucket arrays the primal kernel indexes
+        # into. `color_bodies` is body ids sorted by color (stable);
+        # `color_offsets[c..c+1]` is the slice for color c. Each per-color
+        # primal launch uses dim = bucket size and color_offsets[c] as the
+        # base offset, so the kernel does no per-thread color filtering and
+        # launches no wasted threads.
+        if n_b > 0:
+            color_bodies_np = np.argsort(color_np, kind="stable").astype(np.int32)
+            color_counts_np = np.bincount(
+                color_np, minlength=max(self.num_colors, 1)
+            ).astype(np.int32)
+            color_offsets_np = np.zeros(self.num_colors + 1, dtype=np.int32)
+            color_offsets_np[1:] = np.cumsum(color_counts_np[: self.num_colors])
+        else:
+            color_bodies_np = np.zeros(0, dtype=np.int32)
+            color_offsets_np = np.zeros(1, dtype=np.int32)
+        self.color_bodies = wp.array(color_bodies_np, dtype=int, device=dev)
+        self._color_offsets_np = color_offsets_np
 
-        anchor_np = (np.array([r.world_anchor for r in self._rows], dtype=np.float32).reshape(-1, 3)
-                     if n_c else np.zeros((0, 3), np.float32))
-        off_a_np = (np.array([r.off_a for r in self._rows], dtype=np.float32).reshape(-1, 3)
-                    if n_c else np.zeros((0, 3), np.float32))
-        off_b_np = (np.array([r.off_b for r in self._rows], dtype=np.float32).reshape(-1, 3)
-                    if n_c else np.zeros((0, 3), np.float32))
+        # ---- c_* arrays at fixed capacity (no per-substep realloc) ---------
+        # Static prefix [0, n_static) seeded from self._rows; dynamic
+        # region [n_static, n_cap) zeroed (kernel will overwrite).
+        def _f32_static(attr_fn) -> np.ndarray:
+            arr = np.zeros(n_cap, dtype=np.float32)
+            for i, r in enumerate(self._rows):
+                arr[i] = float(attr_fn(r))
+            return arr
 
-        self.c_type = wp.array(i32([r.type for r in self._rows]), dtype=int, device=dev)
-        self.c_body_a = wp.array(i32([r.body_a for r in self._rows]), dtype=int, device=dev)
-        self.c_body_b = wp.array(i32([r.body_b for r in self._rows]), dtype=int, device=dev)
+        def _i32_static(attr_fn) -> np.ndarray:
+            arr = np.zeros(n_cap, dtype=np.int32)
+            for i, r in enumerate(self._rows):
+                arr[i] = int(attr_fn(r))
+            return arr
+
+        anchor_np = np.zeros((n_cap, 3), dtype=np.float32)
+        off_a_np = np.zeros((n_cap, 3), dtype=np.float32)
+        off_b_np = np.zeros((n_cap, 3), dtype=np.float32)
+        for i, r in enumerate(self._rows):
+            anchor_np[i] = r.world_anchor
+            off_a_np[i] = r.off_a
+            off_b_np[i] = r.off_b
+
+        self.c_type = wp.array(_i32_static(lambda r: r.type), dtype=int, device=dev)
+        self.c_body_a = wp.array(_i32_static(lambda r: r.body_a), dtype=int, device=dev)
+        self.c_body_b = wp.array(_i32_static(lambda r: r.body_b), dtype=int, device=dev)
         self.c_world_anchor = wp.array(anchor_np, dtype=wp.vec3, device=dev)
         self.c_off_a = wp.array(off_a_np, dtype=wp.vec3, device=dev)
         self.c_off_b = wp.array(off_b_np, dtype=wp.vec3, device=dev)
-        self.c_rest = wp.array(f32([r.rest for r in self._rows]), dtype=float, device=dev)
-        self.c_stiffness = wp.array(f32([r.stiffness for r in self._rows]), dtype=float, device=dev)
+        self.c_rest = wp.array(_f32_static(lambda r: r.rest), dtype=float, device=dev)
+        self.c_stiffness = wp.array(
+            _f32_static(lambda r: r.stiffness), dtype=float, device=dev)
+        self.c_fmin = wp.array(_f32_static(lambda r: r.fmin), dtype=float, device=dev)
+        self.c_fmax = wp.array(_f32_static(lambda r: r.fmax), dtype=float, device=dev)
+        self.c_fracture = wp.array(
+            _f32_static(lambda r: r.fracture), dtype=float, device=dev)
+        self.c_friction = wp.array(
+            _f32_static(lambda r: r.friction), dtype=float, device=dev)
+        self.c_friction_static = wp.array(
+            _f32_static(lambda r: r.friction_static), dtype=float, device=dev)
 
-        lam_np = np.zeros(n_c, dtype=np.float32)
-        pen_np = np.full(n_c, 1.0, dtype=np.float32)
-        act_np = np.ones(n_c, dtype=np.int32)
-        n_keep = min(n_c_prev, n_c)
-        if n_keep > 0:
-            lam_np[:n_keep] = cur_lam[:n_keep]
-            if cur_pen is not None:
-                pen_np[:n_keep] = cur_pen[:n_keep]
-            if cur_act is not None:
-                act_np[:n_keep] = cur_act[:n_keep]
+        # Sibling/partner default to -1 in dynamic region (no sibling) so the
+        # kernels' sib >= 0 checks early-out for unused slots.
+        sib_np = np.full(n_cap, -1, dtype=np.int32)
+        partner_np = np.full(n_cap, -1, dtype=np.int32)
+        for i, r in enumerate(self._rows):
+            sib_np[i] = int(r.sibling)
+            partner_np[i] = int(r.partner)
+        self.c_sibling = wp.array(sib_np, dtype=int, device=dev)
+        self.c_partner = wp.array(partner_np, dtype=int, device=dev)
+
+        # λ / penalty seeded for STATIC rows only; dynamic rows are seeded
+        # by the emit kernel from the pair hash each substep.
+        lam_np = np.zeros(n_cap, dtype=np.float32)
+        pen_np = np.full(n_cap, 1.0, dtype=np.float32)
+        act_np = np.zeros(n_cap, dtype=np.int32)
+        for i in range(n_static):
+            act_np[i] = 1
         self.c_lambda = wp.array(lam_np, dtype=float, device=dev)
         self.c_penalty = wp.array(pen_np, dtype=float, device=dev)
-        self.c_fmin = wp.array(f32([r.fmin for r in self._rows]), dtype=float, device=dev)
-        self.c_fmax = wp.array(f32([r.fmax for r in self._rows]), dtype=float, device=dev)
-        self.c_alpha_C0 = wp.zeros(n_c, dtype=float, device=dev)
+        self.c_alpha_C0 = wp.zeros(n_cap, dtype=float, device=dev)
         self.c_active = wp.array(act_np, dtype=int, device=dev)
-        self.c_fracture = wp.array(f32([r.fracture for r in self._rows]), dtype=float, device=dev)
-        self.c_sibling = wp.array(i32([r.sibling for r in self._rows]), dtype=int, device=dev)
-        self.c_friction = wp.array(f32([r.friction for r in self._rows]), dtype=float, device=dev)
-        self.c_friction_static = wp.array(
-            f32([r.friction_static for r in self._rows]), dtype=float, device=dev)
-        self.c_partner = wp.array(
-            i32([r.partner for r in self._rows]), dtype=int, device=dev)
-        # c_was_static persists across substeps via the contact cache + the
-        # update_static_friction kernel. Seed to 0 on first build; subsequent
-        # _flush() calls only happen when scene topology changes (new rows
-        # appended) so we re-init to 0 there too — any in-flight contact will
-        # be re-evaluated on the very next substep.
-        self.c_was_static = wp.zeros(n_c, dtype=int, device=dev)
+        self.c_was_static = wp.zeros(n_cap, dtype=int, device=dev)
 
-        starts, indices = self._build_adjacency()
-        self.body_con_starts = wp.array(starts, dtype=int, device=dev)
-        self.body_con_indices = wp.array(indices, dtype=int, device=dev)
+        # ---- GPU-resident pool scratch -------------------------------------
+        # CSR adjacency: rebuilt by the gpu_csr_* kernels each substep so it
+        # tracks dynamic contacts; capacity covers worst-case (each row
+        # touches up to 2 bodies, for n_cap rows total).
+        self.body_con_counts = wp.zeros(max(n_b, 1), dtype=int, device=dev)
+        self.body_con_cursor = wp.zeros(max(n_b, 1), dtype=int, device=dev)
+        self.body_con_starts = wp.zeros(max(n_b + 1, 2), dtype=int, device=dev)
+        self.body_con_indices = wp.zeros(max(2 * n_cap, 1), dtype=int, device=dev)
+        # Single-element atomic counter for the dynamic-row tail.
+        n_active_np = np.array([n_static], dtype=np.int32)
+        self.n_active_rows = wp.array(n_active_np, dtype=int, device=dev)
+        # Allocate the broadphase pair counter and the pool entry counter
+        # unconditionally. Both are 1-element ints — cost is negligible — and
+        # having them always live lets the fused reset+csr-zero kernel run on
+        # both self-collide and non-self-collide paths without branching.
+        if self._bp_pair_count is None:
+            self._bp_pair_count = wp.zeros(1, dtype=int, device=dev)
+        self.pool_count = wp.zeros(1, dtype=int, device=dev)
+
+        if self._self_collide:
+            # Pair hash for warm-start: keyed on (a, b, contact_ordinal).
+            # Capacity should be ≥ 2 × expected entries to keep load ≤ 0.5.
+            hash_cap = max(1024, max_pairs * 8)
+            self._gpu_pool_hash_cap = hash_cap
+            self.hash_keys = wp.full(hash_cap, -1, dtype=int, device=dev)
+            self.hash_state = wp.zeros(hash_cap * 8, dtype=float, device=dev)
+
+            pool_max = max(64, max_pairs * 4)  # up to 4 contacts per pair
+            self._gpu_pool_pool_max = pool_max
+            self.pool_idx_n = wp.zeros(pool_max, dtype=int, device=dev)
+            self.pool_idx_t = wp.zeros(pool_max, dtype=int, device=dev)
+            self.pool_idx_b = wp.zeros(pool_max, dtype=int, device=dev)
+            self.pool_idx_c = wp.zeros(pool_max, dtype=int, device=dev)
+
+        self._gpu_pool_n_static = n_static
+        self._gpu_pool_n_capacity = n_cap
+        self._gpu_pool_n_dyn_capacity = n_dyn_capacity
+        self._gpu_pool_max_pairs = max_pairs
+        self._gpu_pool_ready = True
         self._dirty = False
 
     # ---- The step -----------------------------------------------------------
@@ -1308,154 +722,80 @@ class Solver6DOF:
         finally:
             self.dt = full_dt
 
-    def _ensure_pool_buffers(self, n_pool: int) -> None:
-        """Reallocate GPU-resident cache scratch arrays when the dynamic
-        contact pool grows. Buffers are shared across substeps and only
-        resized when the active pair count exceeds the current capacity.
-        Each pool pair owns 8 floats in the packed buffer — see the layout
-        header above `cache_restore_6dof` in kernels_6dof.py.
-
-        Also reuses the host-side numpy staging buffers so the per-substep
-        upload pattern is (assign into preallocated wp.array) instead of
-        (wp.array(...) → wp.copy → free)."""
-        if n_pool <= self._pool_buf_cap:
-            return
-        cap = max(256, n_pool * 2)
-        dev = self.device
-        self._pool_idx_n = wp.zeros(cap, dtype=int, device=dev)
-        self._pool_idx_t = wp.zeros(cap, dtype=int, device=dev)
-        self._pool_idx_b = wp.zeros(cap, dtype=int, device=dev)
-        self._pool_cache_valid = wp.zeros(cap, dtype=int, device=dev)
-        self._pool_in_packed = wp.zeros(cap * 8, dtype=float, device=dev)
-        self._pool_out_packed = wp.zeros(cap * 8, dtype=float, device=dev)
-        # Host-side staging arrays — sized to capacity so we can reuse them
-        # in subsequent substeps without re-allocating. wp.array.assign()
-        # writes only the prefix that the source covers.
-        self._pool_h_idx_n = np.empty(cap, dtype=np.int32)
-        self._pool_h_idx_t = np.empty(cap, dtype=np.int32)
-        self._pool_h_idx_b = np.empty(cap, dtype=np.int32)
-        self._pool_h_valid = np.empty(cap, dtype=np.int32)
-        self._pool_h_packed = np.empty(cap * 8, dtype=np.float32)
-        self._pool_buf_cap = cap
-
-    def _restore_cache_from_pool(self) -> None:
-        """Build the per-pair index + cached-state buffers on the CPU, upload
-        once, then run cache_restore_6dof to write λ/k/was_static into the
-        live c_* arrays in place. Replaces three full-array GPU↔CPU round
-        trips (c_lambda.numpy(), c_penalty.numpy(), c_was_static.numpy() +
-        their wp.array re-creations) with one small upload + one launch.
-        See AVBD_PERFORMANCE_GAP §5."""
-        n_pool = len(self._pool_pair_rows)
-        if n_pool == 0:
-            return
-        self._ensure_pool_buffers(n_pool)
-        # Fill the staging numpy buffers (preallocated, no new allocations).
-        idx_n = self._pool_h_idx_n
-        idx_t = self._pool_h_idx_t
-        idx_b = self._pool_h_idx_b
-        valid = self._pool_h_valid
-        packed = self._pool_h_packed
-        valid[:n_pool] = 0
-        packed[:n_pool * 8] = 0.0
-        for p_idx, (pair, n_idx, t_idx, b_idx) in enumerate(self._pool_pair_rows):
-            idx_n[p_idx] = n_idx
-            idx_t[p_idx] = t_idx
-            idx_b[p_idx] = b_idx
-            cached = self._contact_cache.get(pair)
-            if cached is None:
-                continue
-            if not all(math.isfinite(v) for v in cached[:6]):
-                continue
-            lam_n, lam_t, lam_b, k_n, k_t, k_b, was = cached
-            base = p_idx * 8
-            packed[base + 0] = lam_n
-            packed[base + 1] = lam_t
-            packed[base + 2] = lam_b
-            packed[base + 3] = k_n
-            packed[base + 4] = k_t
-            packed[base + 5] = k_b
-            packed[base + 7] = float(was)
-            valid[p_idx] = 1
-        # `assign()` writes the source's prefix into the preallocated wp.array
-        # storage — no per-substep device-side allocation, no temp wp.array.
-        self._pool_idx_n.assign(idx_n[:n_pool])
-        self._pool_idx_t.assign(idx_t[:n_pool])
-        self._pool_idx_b.assign(idx_b[:n_pool])
-        self._pool_cache_valid.assign(valid[:n_pool])
-        self._pool_in_packed.assign(packed[:n_pool * 8])
-        wp.launch(
-            K.cache_restore_6dof, dim=n_pool,
-            inputs=[self._pool_idx_n, self._pool_idx_t, self._pool_idx_b,
-                    self._pool_cache_valid, self._pool_in_packed,
-                    self.c_lambda, self.c_penalty, self.c_was_static],
-            device=self.device,
-        )
-
-    def _persist_cache_from_pool(self) -> None:
-        """Inverse of _restore_cache_from_pool — runs cache_collect_6dof to
-        gather the post-solve λ/k/active/was_static of every pool-pair row
-        into one packed staging buffer, then does ONE .numpy() readback
-        before rebuilding the Python contact_cache dict. Eliminates the
-        four full-array .numpy() calls (lam, pen, act, was) the original
-        loop did per substep."""
-        n_pool = len(self._pool_pair_rows)
-        if n_pool == 0:
-            self._contact_cache = {}
-            return
-        dev = self.device
-        wp.launch(
-            K.cache_collect_6dof, dim=n_pool,
-            inputs=[self._pool_idx_n, self._pool_idx_t, self._pool_idx_b,
-                    self.c_lambda, self.c_penalty,
-                    self.c_active, self.c_was_static],
-            outputs=[self._pool_out_packed],
-            device=dev,
-        )
-        arr = self._pool_out_packed.numpy()[:n_pool * 8].reshape(n_pool, 8)
-        new_cache: dict[
-            tuple, tuple[float, float, float, float, float, float, int]
-        ] = {}
-        for p_idx, (pair, _n_idx, _t_idx, _b_idx) in enumerate(self._pool_pair_rows):
-            if arr[p_idx, 6] == 0.0:   # c_active[n_idx] == 0
-                continue
-            lam_n = float(arr[p_idx, 0])
-            lam_t = float(arr[p_idx, 1])
-            lam_b = float(arr[p_idx, 2])
-            k_n = float(arr[p_idx, 3])
-            k_t = float(arr[p_idx, 4])
-            k_b = float(arr[p_idx, 5])
-            was = int(arr[p_idx, 7])
-            if not all(math.isfinite(v)
-                       for v in (lam_n, lam_t, lam_b, k_n, k_t, k_b)):
-                continue
-            new_cache[pair] = (lam_n, lam_t, lam_b, k_n, k_t, k_b, was)
-        self._contact_cache = new_cache
-
     def _step_one(self) -> None:
-        # Generate dynamic OBB-OBB contacts from CURRENT body positions
-        # BEFORE the upload — _rebuild_contact_pool mutates self._rows and
-        # sets _dirty=True, then _flush() rebuilds Warp arrays + coloring.
-        if self._self_collide:
-            self._flush()  # make sure self.x / self.q reflect latest state
-            self._rebuild_contact_pool()
-        self._flush()
-        # Seed λ + penalty for pool rows from the persistent cache so OBB
-        # stacks carry their augmented-Lagrangian state across frames (without
-        # this, every contact restarts from PENALTY_MIN every frame and a
-        # stable stack looks like a soft spring during the transient). The
-        # restore runs as a Warp kernel against preallocated GPU buffers so
-        # the live c_lambda / c_penalty / c_was_static arrays stay resident
-        # through the substep — see AVBD_PERFORMANCE_GAP §5.
-        if self._self_collide and self._pool_pair_rows:
-            self._restore_cache_from_pool()
+        """One AVBD substep. After the initial _flush() upload from the CPU
+        scene description, the entire hot path runs on the GPU:
+
+            1. gpu_pool_reset_and_csr_zero — reset substep atomic counters
+               and zero body_con_counts in one launch
+            2. broadphase + SAT     — existing kernels (compute_body_aabb,
+                                      bvh_broadphase_pairs, obb_sat_pairs)
+            3. obb_contact_manifold — face-clip / edge-edge → per-pair geom
+            4. gpu_pool_emit_rows   — atomically appends BOX_BOX + tangent
+                                      rows into the dynamic region of c_*,
+                                      looks up pair hash for warm-start
+            5. gpu_csr_* (3 passes) — rebuild body→constraint CSR adjacency
+            6. predict + prelude + iter loop (existing kernels)
+            7. gpu_pool_hash_collect — refresh hash from current state
+
+        Two cheap readbacks remain per substep: _bp_pair_count (sizes SAT /
+        manifold / emit launches) and n_active_rows (sizes row-side launches).
+        Each is a single int — no per-substep Python loop and no array
+        reallocation. See AVBD_PERFORMANCE_GAP.md and the GPU-resident pool
+        plan at ~/.claude/plans/here-is-major-gaps-jaunty-flute.md.
+        """
+        if self._dirty:
+            self._flush()
         n_b = len(self._x)
-        n_c = len(self._rows)
         if n_b == 0:
             return
         dev = self.device
+        n_static = self._gpu_pool_n_static
 
-        # 1. Inertial target + warm-started x⁰, q⁰; cache BOTH R·I_inv·R^T
-        # AND R·I·R^T so primal_update_6dof never has to invert.
+        # ---- 1. Reset substep counters + zero CSR counts (fused) ----
+        # One launch at dim=n_b: thread 0 resets the atomic counters
+        # (n_active_rows, pool_count, _bp_pair_count); every thread zeros
+        # its body_con_counts entry. Replaces the prior dim=1 gpu_pool_reset
+        # + dim=n_b gpu_csr_zero_counts pair.
+        wp.launch(
+            K.gpu_pool_reset_and_csr_zero, dim=n_b,
+            inputs=[self.n_active_rows, self.pool_count,
+                    self._bp_pair_count, self.body_con_counts, n_static],
+            device=dev,
+        )
+
+        # ---- 2-4. Broadphase + SAT + manifold + kernel row emission ----
+        n_active = n_static
+        if self._self_collide and n_b >= 2:
+            self._gpu_emit_dynamic_contacts(n_b)
+            # Single int readback — sizes the row-kernel launches below.
+            n_active = int(self.n_active_rows.numpy()[0])
+
+        # ---- 5. Rebuild body→constraint CSR adjacency on GPU ----
+        # 3 passes: atomic histogram → serial scan → atomic scatter.
+        # (Step 1 above already zeroed body_con_counts.)
+        if n_active > 0:
+            wp.launch(
+                K.gpu_csr_count, dim=n_active,
+                inputs=[self.n_active_rows, self.c_type,
+                        self.c_body_a, self.c_body_b, self.body_con_counts],
+                device=dev,
+            )
+            wp.launch(
+                K.gpu_csr_starts_from_counts, dim=1,
+                inputs=[self.body_con_counts, self.body_con_starts, n_b],
+                device=dev,
+            )
+            wp.copy(self.body_con_cursor, self.body_con_starts, count=n_b)
+            wp.launch(
+                K.gpu_csr_scatter, dim=n_active,
+                inputs=[self.n_active_rows, self.c_type,
+                        self.c_body_a, self.c_body_b,
+                        self.body_con_cursor, self.body_con_indices],
+                device=dev,
+            )
+
+        # ---- 6. Inertial target + warm-started x⁰, q⁰ ----
         wp.launch(
             K.predict_inertial_6dof, dim=n_b,
             inputs=[self.x, self.q, self.v, self.omega, self.prev_v,
@@ -1468,18 +808,11 @@ class Solver6DOF:
             device=dev,
         )
 
-        if n_c > 0:
-            # Fused substep prelude — warmstart_duals + update_static_friction
-            # + cache_alpha_C0(main) in one launch. Each was previously ~95%
-            # launch-overhead-bound (~18 μs Python launch vs <1 μs compute);
-            # fusion cuts 2 launches per substep (= 16/step).
-            # AVBD post-stabilize mode: main-iter α=1.0 (preserve initial
-            # constraint error, only resist NEW motion → contact decelerates
-            # the body correctly), then a separate cache_alpha_C0 launch
-            # below uses α=0.0 for the final post-stab iter.
+        if n_active > 0:
+            # Fused warmstart_duals + update_static_friction + cache_alpha_C0.
             main_alpha = 1.0 if self.post_stabilize else self.alpha
             wp.launch(
-                K.substep_prelude_6dof, dim=n_c,
+                K.substep_prelude_6dof, dim=n_active,
                 inputs=[self.x_initial, self.q_initial,
                         self.c_type, self.c_body_a, self.c_body_b,
                         self.c_world_anchor, self.c_off_a, self.c_off_b,
@@ -1495,9 +828,9 @@ class Solver6DOF:
 
         total_iters = self.iterations + (1 if self.post_stabilize else 0)
         for it in range(total_iters):
-            if self.post_stabilize and it == self.iterations and n_c > 0:
+            if self.post_stabilize and it == self.iterations and n_active > 0:
                 wp.launch(
-                    K.cache_alpha_C0_6dof, dim=n_c,
+                    K.cache_alpha_C0_6dof, dim=n_active,
                     inputs=[self.x, self.q, self.x_initial, self.q_initial,
                             self.c_type, self.c_body_a, self.c_body_b,
                             self.c_world_anchor, self.c_off_a, self.c_off_b,
@@ -1507,11 +840,15 @@ class Solver6DOF:
                 )
 
             for color_id in range(self.num_colors):
+                base = int(self._color_offsets_np[color_id])
+                count = int(self._color_offsets_np[color_id + 1]) - base
+                if count <= 0:
+                    continue
                 wp.launch(
-                    K.primal_update_6dof, dim=n_b,
+                    K.primal_update_6dof, dim=count,
                     inputs=[self.x, self.q, self.mass,
                             self.inv_inertia_world, self.inertia_world,
-                            self.x_inertial, self.q_inertial, self.body_color,
+                            self.x_inertial, self.q_inertial,
                             self.c_type, self.c_body_a, self.c_body_b,
                             self.c_world_anchor, self.c_off_a, self.c_off_b,
                             self.c_rest, self.c_stiffness,
@@ -1521,13 +858,13 @@ class Solver6DOF:
                             self.c_sibling, self.c_friction,
                             self.c_friction_static, self.c_was_static,
                             self.body_con_starts, self.body_con_indices,
-                            self.dt, color_id],
+                            self.color_bodies, base, self.dt],
                     device=dev,
                 )
 
-            if n_c > 0 and it < self.iterations:
+            if n_active > 0 and it < self.iterations:
                 wp.launch(
-                    K.dual_update_6dof, dim=n_c,
+                    K.dual_update_6dof, dim=n_active,
                     inputs=[self.x, self.q,
                             self.c_type, self.c_body_a, self.c_body_b,
                             self.c_world_anchor, self.c_off_a, self.c_off_b,
@@ -1542,10 +879,6 @@ class Solver6DOF:
                 )
 
             if it == self.iterations - 1:
-                # Fused finalize + cap saves 1 launch per substep. Disabled
-                # cap (max_*=inf or ≤0) is folded into the kernel via the
-                # `sl > max_lin` test — wp.inf is never exceeded, so the
-                # cap branch is a no-op then.
                 if (self.max_linear_speed > 0.0
                         and math.isfinite(self.max_linear_speed)
                         and self.max_angular_speed > 0.0
@@ -1563,12 +896,123 @@ class Solver6DOF:
                     device=dev,
                 )
 
-        # Persist contact-pool λ + penalty for the next step. Drop pairs
-        # whose contact became inactive (e.g., separated or fractured).
-        # The collect kernel packs everything into one float buffer so we
-        # do a single .numpy() (vs four) — see AVBD_PERFORMANCE_GAP §5.
-        if self._self_collide and self._pool_pair_rows:
-            self._persist_cache_from_pool()
+        # ---- 7. Refresh pair hash for next-substep warm-start ----
+        if self._self_collide and self._gpu_pool_hash_cap > 0:
+            wp.launch(K.gpu_pool_hash_clear, dim=self._gpu_pool_hash_cap,
+                      inputs=[self.hash_keys], device=dev)
+            wp.launch(
+                K.gpu_pool_hash_collect, dim=self._gpu_pool_pool_max,
+                inputs=[self.pool_count,
+                        self.pool_idx_n, self.pool_idx_t,
+                        self.pool_idx_b, self.pool_idx_c,
+                        self.c_body_a, self.c_body_b,
+                        self.c_lambda, self.c_penalty,
+                        self.c_active, self.c_was_static,
+                        self._gpu_pool_hash_cap,
+                        self.hash_keys, self.hash_state],
+                device=dev,
+            )
+
+    def _gpu_emit_dynamic_contacts(self, n_b: int) -> None:
+        """One-substep GPU pipeline: broadphase → SAT → manifold → emit rows.
+        Atomically appends BOX_BOX + tangent rows into the dynamic region of
+        c_* and records pool entries for the post-solve hash collect. No
+        Python row construction; no per-substep array reallocation."""
+        import time as _t
+        t_bp0 = _t.perf_counter()
+        dev = self.device
+        margin = 0.005
+
+        # Reuse _bp_* and _mf_* buffers from the legacy emitter; allocator
+        # logic was already structured for a fixed-capacity pair pool.
+        he_np = np.asarray(self._half_extents, dtype=np.float32).reshape(-1, 3)
+        if (self._bp_half_extents is None
+                or self._bp_half_extents.shape[0] != n_b):
+            self._bp_half_extents = wp.array(he_np, dtype=wp.vec3, device=dev)
+            self._bp_aabb_lo = wp.zeros(n_b, dtype=wp.vec3, device=dev)
+            self._bp_aabb_hi = wp.zeros(n_b, dtype=wp.vec3, device=dev)
+        else:
+            self._bp_half_extents.assign(he_np)
+
+        cap_target = max(256, 16 * n_b)
+        if self._bp_max_pairs < cap_target:
+            self._bp_max_pairs = cap_target
+            self._bp_pair_a = wp.zeros(cap_target, dtype=int, device=dev)
+            self._bp_pair_b = wp.zeros(cap_target, dtype=int, device=dev)
+            self._bp_pair_overlap = wp.zeros(cap_target, dtype=int, device=dev)
+            self._bp_pair_sat_idx = wp.zeros(cap_target, dtype=int, device=dev)
+            self._bp_pair_n_hat = wp.zeros(cap_target, dtype=wp.vec3, device=dev)
+            self._bp_pair_depth = wp.zeros(cap_target, dtype=float, device=dev)
+
+        wp.launch(
+            K.compute_body_aabb_6dof, dim=n_b,
+            inputs=[self.x, self.q, self._bp_half_extents, margin],
+            outputs=[self._bp_aabb_lo, self._bp_aabb_hi],
+            device=dev,
+        )
+        constructor = "lbvh" if str(dev).startswith("cuda") else "sah"
+        self._bp_bvh = wp.Bvh(self._bp_aabb_lo, self._bp_aabb_hi,
+                              constructor=constructor)
+        wp.launch(
+            K.bvh_broadphase_pairs, dim=n_b,
+            inputs=[self._bp_bvh.id, self._bp_aabb_lo, self._bp_aabb_hi,
+                    self.mass, self._bp_pair_count,
+                    self._bp_pair_a, self._bp_pair_b, self._bp_max_pairs],
+            device=dev,
+        )
+        n_pairs = int(self._bp_pair_count.numpy()[0])
+        if n_pairs == 0:
+            self.broadphase_ms = (_t.perf_counter() - t_bp0) * 1000.0
+            return
+        if n_pairs > self._bp_max_pairs:
+            self._bp_max_pairs = max(2 * self._bp_max_pairs, n_pairs * 2)
+            n_pairs = self._bp_max_pairs
+        wp.launch(
+            K.obb_sat_pairs, dim=n_pairs,
+            inputs=[self.x, self.q, self._bp_half_extents,
+                    self._bp_pair_a, self._bp_pair_b, n_pairs, margin],
+            outputs=[self._bp_pair_overlap, self._bp_pair_sat_idx,
+                     self._bp_pair_n_hat, self._bp_pair_depth],
+            device=dev,
+        )
+        self._ensure_manifold_buffers(self._bp_max_pairs)
+        wp.launch(
+            K.obb_contact_manifold_6dof, dim=n_pairs,
+            inputs=[self.x, self.q, self._bp_half_extents,
+                    self._bp_pair_a, self._bp_pair_b,
+                    self._bp_pair_overlap, self._bp_pair_sat_idx,
+                    self._bp_pair_n_hat,
+                    n_pairs, margin, self._mf_poly_scratch],
+            outputs=[self._mf_contact_count, self._mf_ref_is_a,
+                     self._mf_n_hat, self._mf_t_hat, self._mf_b_hat,
+                     self._mf_off_ref, self._mf_off_inc],
+            device=dev,
+        )
+        wp.launch(
+            K.gpu_pool_emit_rows, dim=n_pairs,
+            inputs=[n_pairs,
+                    self._bp_pair_a, self._bp_pair_b,
+                    self._mf_contact_count, self._mf_ref_is_a,
+                    self._mf_n_hat, self._mf_t_hat, self._mf_b_hat,
+                    self._mf_off_ref, self._mf_off_inc,
+                    self.body_friction, self._self_friction,
+                    self.friction_static_mult,
+                    self.n_active_rows, self.pool_count,
+                    self.pool_idx_n, self.pool_idx_t,
+                    self.pool_idx_b, self.pool_idx_c,
+                    self._gpu_pool_hash_cap,
+                    self.hash_keys, self.hash_state,
+                    self.c_type, self.c_body_a, self.c_body_b,
+                    self.c_world_anchor, self.c_off_a, self.c_off_b,
+                    self.c_rest, self.c_stiffness,
+                    self.c_fmin, self.c_fmax,
+                    self.c_alpha_C0, self.c_active, self.c_fracture,
+                    self.c_sibling, self.c_partner,
+                    self.c_friction, self.c_friction_static,
+                    self.c_lambda, self.c_penalty, self.c_was_static],
+            device=dev,
+        )
+        self.broadphase_ms = (_t.perf_counter() - t_bp0) * 1000.0
 
     # ---- Read-back ----------------------------------------------------------
 

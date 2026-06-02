@@ -320,7 +320,6 @@ def primal_update_6dof(
     inertia_world: wp.array(dtype=wp.mat33),
     x_inertial: wp.array(dtype=wp.vec3),
     q_inertial: wp.array(dtype=wp.quat),
-    body_color: wp.array(dtype=int),
     # constraints
     c_type: wp.array(dtype=int),
     c_body_a: wp.array(dtype=int),
@@ -343,12 +342,16 @@ def primal_update_6dof(
     # adjacency
     body_con_starts: wp.array(dtype=int),
     body_con_indices: wp.array(dtype=int),
+    color_bodies: wp.array(dtype=int),
+    color_offset: int,
     dt: float,
-    current_color: int,
 ):
-    i = wp.tid()
-    if current_color != -1 and body_color[i] != current_color:
-        return
+    # color_bodies is the body-id permutation sorted by color; the launcher
+    # picks the slice for this color and launches at its size, so every
+    # thread maps to exactly one body in this color class (no wasted
+    # threads on bodies of the wrong color, no per-thread color filter).
+    # color_offset is the start of this color in color_bodies.
+    i = color_bodies[color_offset + wp.tid()]
     m = mass[i]
     if m <= 0.0:
         return
@@ -1235,110 +1238,6 @@ def obb_sat_pairs(
 
 
 # =============================================================================
-# Contact warm-start cache restore / collect — keeps λ + k + was_static
-# GPU-resident across substeps (closes AVBD_PERFORMANCE_GAP §5).
-# =============================================================================
-# The dynamic OBB contact pool rebuilds every substep — fresh BOX_BOX_CONTACT
-# rows + tangent partners are appended at the end of the constraint list. To
-# preserve augmented-Lagrangian state across the rebuild, the previous version
-# did:
-#     lam_np = c_lambda.numpy().copy()           # GPU→CPU sync
-#     pen_np = c_penalty.numpy().copy()          # GPU→CPU sync
-#     was_np = c_was_static.numpy().copy()       # GPU→CPU sync
-#     for ...: lam_np[idx] = cache[key].λ, ...   # Python dict loop
-#     c_lambda  = wp.array(lam_np, ...)          # CPU→GPU upload (full)
-#     c_penalty = wp.array(pen_np, ...)          # CPU→GPU upload (full)
-#     c_was_static = wp.array(was_np, ...)       # CPU→GPU upload (full)
-# 6 full-array transfers per substep × 8 substeps = 48 stream syncs/frame
-# just for cache state. These kernels replace that with one small upload
-# + one small readback per substep — the in-place sparse writes happen on
-# GPU through `pool_idx_*` index arrays.
-#
-# Packed layout (8 floats per pool pair) — chosen so persist needs ONE
-# .numpy() instead of 8:
-#     [p*8 + 0] = λ_n  (normal-row Lagrange multiplier)
-#     [p*8 + 1] = λ_t  (tangent row, or 0 if no friction)
-#     [p*8 + 2] = λ_b  (bitangent row, or 0 if no friction)
-#     [p*8 + 3] = k_n  (normal-row penalty)
-#     [p*8 + 4] = k_t  (tangent penalty, or 1 if no friction)
-#     [p*8 + 5] = k_b  (bitangent penalty, or 1 if no friction)
-#     [p*8 + 6] = c_active[n_idx]  (cast to float for packing)
-#     [p*8 + 7] = c_was_static[n_idx]  (cast to float)
-
-
-@wp.kernel
-def cache_restore_6dof(
-    pool_idx_n: wp.array(dtype=int),
-    pool_idx_t: wp.array(dtype=int),
-    pool_idx_b: wp.array(dtype=int),
-    cache_valid: wp.array(dtype=int),   # 1 if this pair had a cache hit
-    in_packed: wp.array(dtype=float),   # 8 floats per pair (see header)
-    # in-place outputs (the live constraint arrays)
-    c_lambda: wp.array(dtype=float),
-    c_penalty: wp.array(dtype=float),
-    c_was_static: wp.array(dtype=int),
-):
-    """Per pool pair: if cache_valid[p] then write packed λ/k/was_static into
-    c_lambda/c_penalty/c_was_static at the row indices for that pair. Misses
-    leave the row slots untouched — _flush() pre-initialises them to the
-    PENALTY_MIN floors, which is the same fresh-contact bootstrap state."""
-    p = wp.tid()
-    if cache_valid[p] == 0:
-        return
-    base = p * 8
-    n = pool_idx_n[p]
-    c_lambda[n] = in_packed[base + 0]
-    c_penalty[n] = in_packed[base + 3]
-    c_was_static[n] = int(in_packed[base + 7])
-    t = pool_idx_t[p]
-    if t >= 0:
-        c_lambda[t] = in_packed[base + 1]
-        c_penalty[t] = in_packed[base + 4]
-    bb = pool_idx_b[p]
-    if bb >= 0:
-        c_lambda[bb] = in_packed[base + 2]
-        c_penalty[bb] = in_packed[base + 5]
-
-
-@wp.kernel
-def cache_collect_6dof(
-    pool_idx_n: wp.array(dtype=int),
-    pool_idx_t: wp.array(dtype=int),
-    pool_idx_b: wp.array(dtype=int),
-    c_lambda: wp.array(dtype=float),
-    c_penalty: wp.array(dtype=float),
-    c_active: wp.array(dtype=int),
-    c_was_static: wp.array(dtype=int),
-    # output: 8 floats per pair, ready for one .numpy() readback
-    out_packed: wp.array(dtype=float),
-):
-    """Inverse of cache_restore_6dof — pack the live (λ, k, active, was_static)
-    state of every pool-pair row back into the contiguous staging buffer so
-    the Python side can read it with a single .numpy() call instead of four."""
-    p = wp.tid()
-    base = p * 8
-    n = pool_idx_n[p]
-    out_packed[base + 0] = c_lambda[n]
-    out_packed[base + 3] = c_penalty[n]
-    out_packed[base + 6] = float(c_active[n])
-    out_packed[base + 7] = float(c_was_static[n])
-    t = pool_idx_t[p]
-    if t >= 0:
-        out_packed[base + 1] = c_lambda[t]
-        out_packed[base + 4] = c_penalty[t]
-    else:
-        out_packed[base + 1] = 0.0
-        out_packed[base + 4] = 1.0
-    bb = pool_idx_b[p]
-    if bb >= 0:
-        out_packed[base + 2] = c_lambda[bb]
-        out_packed[base + 5] = c_penalty[bb]
-    else:
-        out_packed[base + 2] = 0.0
-        out_packed[base + 5] = 1.0
-
-
-# =============================================================================
 # Viewer-side fused readback — packs every per-frame stat the viewer reads
 # into one staging buffer (closes AVBD_PERFORMANCE_GAP §6).
 # =============================================================================
@@ -1386,14 +1285,14 @@ def viewer_pack_bodies_6dof(
 
 
 # =============================================================================
-# OBB contact manifold — GPU port of _emit_obb_pair_with_sat /
-# _emit_obb_edge_edge (closes AVBD_PERFORMANCE_GAP §3 hot inner loop).
+# OBB contact manifold — GPU face-clip + edge-edge closest-segment
+# (closes AVBD_PERFORMANCE_GAP §3 hot inner loop).
 # =============================================================================
-# Replaces the Python Sutherland-Hodgman face-clip + tangent-basis + body-local
-# offset computation with a single kernel. Output is up to 4 contacts per pair
-# in fixed-size buffers; the Python caller reads back the count + buffers and
-# emits the Box-Box constraint rows (row emission still touches the Python
-# `_Row` list since that lives outside the GPU — see §4 in PERFORMANCE_PROGRESS).
+# Sutherland-Hodgman face-clip + tangent-basis + body-local offset computation
+# in one kernel. Output is up to 4 contacts per pair in fixed-size buffers;
+# `gpu_pool_emit_rows` reads those outputs and atomically writes the BOX_BOX +
+# tangent constraint rows directly into the c_* arrays — no CPU readback,
+# no Python row construction (AVBD_PERFORMANCE_GAP §1 / §2).
 #
 # Layout per pair p:
 #   out_contact_count[p]            in {0, 1, 2, 3, 4}
@@ -1760,3 +1659,424 @@ def viewer_pack_rows_6dof(
     out[base + 0] = c_lambda[j]
     out[base + 1] = float(c_active[j])
     out[base + 2] = float(c_was_static[j] * 16 + c_type[j])
+
+
+# =============================================================================
+# GPU-resident dynamic constraint pool (AVBD_PERFORMANCE_GAP §1 follow-up).
+# =============================================================================
+# Below this point are the kernels that let the per-substep contact pipeline
+# stay GPU-side: row emission, pair-slot hash lookup/store, CSR adjacency
+# rebuild, and active-row reset. They replace the per-substep CPU row append
+# + _flush() rebuild path. See solver_6dof.py:Solver6DOF for the new flow.
+#
+# Layout conventions:
+#   - c_* arrays are pre-allocated at capacity = N_static + N_dyn_capacity.
+#     Static rows live in [0, N_static); dynamic BOX_BOX + tangent rows live
+#     in the dynamic region above. Each dynamic contact owns a 3-row block
+#     (normal + 2 tangents) claimed via wp.atomic_add on n_active_rows.
+#   - Pair hash uses open-addressing linear probe. Key = encode(a, b, c_idx)
+#     with a < b and c_idx ∈ [0,4). Empty slot = -1. Capacity should be at
+#     least 2× the expected number of (pair, contact) entries.
+#   - Hash state per slot: 8 floats — λ_n, λ_t, λ_b, k_n, k_t, k_b, was_t, was_b.
+
+HASH_EMPTY = wp.constant(-1)
+GPU_POOL_C_PER_PAIR = wp.constant(4)
+
+
+@wp.func
+def encode_pair_key(a: int, b: int, c_idx: int) -> int:
+    # a ≤ b enforced by caller. (a, b) ∈ [0, 16384), c_idx ∈ [0, 4).
+    # Fits int32 up to ~1.07e9. For scenes with n_b > 16383, swap this for
+    # a wider key or a true 64-bit hash table; the avbd3d prototype tops
+    # out well below that today.
+    return (a * 16384 + b) * 4 + c_idx
+
+
+@wp.func
+def hash_pair_key(key: int, cap: int) -> int:
+    # Bit-mix then mask to int31 so the modulo result is always nonnegative.
+    h = key * 73856093
+    h = h ^ (h >> 16)
+    h = h & 0x7fffffff
+    return h % cap
+
+
+@wp.kernel
+def gpu_pool_reset_and_csr_zero(
+    n_active_rows: wp.array(dtype=int),
+    pool_count: wp.array(dtype=int),
+    bp_pair_count: wp.array(dtype=int),
+    body_con_counts: wp.array(dtype=int),
+    n_static: int,
+):
+    """Fused reset + CSR zero. Launched at dim=n_bodies once per substep.
+    Thread 0 resets the substep-scoped atomic counters; every thread also
+    zeros its per-body constraint count. Replaces the dim=1 gpu_pool_reset
+    plus the dim=n_b gpu_csr_zero_counts (one launch instead of two)."""
+    tid = wp.tid()
+    if tid == 0:
+        n_active_rows[0] = n_static
+        pool_count[0] = 0
+        bp_pair_count[0] = 0
+    body_con_counts[tid] = 0
+
+
+@wp.kernel
+def gpu_csr_count(
+    n_active_rows: wp.array(dtype=int),
+    c_type: wp.array(dtype=int),
+    c_body_a: wp.array(dtype=int),
+    c_body_b: wp.array(dtype=int),
+    body_con_counts: wp.array(dtype=int),
+):
+    """Atomic histogram pass — counts how many active rows touch each body.
+    PIN_6DOF re-uses c_body_b as an axis index, so we exclude it from the
+    second-body increment."""
+    j = wp.tid()
+    if j >= n_active_rows[0]:
+        return
+    ba = c_body_a[j]
+    if ba >= 0:
+        wp.atomic_add(body_con_counts, ba, 1)
+    t = c_type[j]
+    if t != PIN_6DOF:
+        bb = c_body_b[j]
+        if bb >= 0:
+            wp.atomic_add(body_con_counts, bb, 1)
+
+
+@wp.kernel
+def gpu_csr_starts_from_counts(
+    body_con_counts: wp.array(dtype=int),
+    body_con_starts: wp.array(dtype=int),
+    n_bodies: int,
+):
+    """Single-thread inclusive scan into body_con_starts[1..n]. Tiny serial
+    scan — n_bodies is small in practice (≤ 10⁵). Replace with a parallel
+    scan if profiling shows it dominates."""
+    if wp.tid() != 0:
+        return
+    body_con_starts[0] = 0
+    acc = int(0)
+    for i in range(n_bodies):
+        acc = acc + body_con_counts[i]
+        body_con_starts[i + 1] = acc
+
+
+@wp.kernel
+def gpu_csr_scatter(
+    n_active_rows: wp.array(dtype=int),
+    c_type: wp.array(dtype=int),
+    c_body_a: wp.array(dtype=int),
+    c_body_b: wp.array(dtype=int),
+    body_con_cursor: wp.array(dtype=int),
+    body_con_indices: wp.array(dtype=int),
+):
+    """For each active row, atomically claim a slot in body_con_indices for
+    body_a (and body_b if applicable) using a per-body cursor that starts
+    at body_con_starts[i]."""
+    j = wp.tid()
+    if j >= n_active_rows[0]:
+        return
+    ba = c_body_a[j]
+    if ba >= 0:
+        slot = wp.atomic_add(body_con_cursor, ba, 1)
+        body_con_indices[slot] = j
+    t = c_type[j]
+    if t != PIN_6DOF:
+        bb = c_body_b[j]
+        if bb >= 0:
+            slot = wp.atomic_add(body_con_cursor, bb, 1)
+            body_con_indices[slot] = j
+
+
+@wp.kernel
+def gpu_pool_emit_rows(
+    # manifold outputs (per pair)
+    n_pairs: int,
+    pair_a: wp.array(dtype=int),
+    pair_b: wp.array(dtype=int),
+    mf_contact_count: wp.array(dtype=int),
+    mf_ref_is_a: wp.array(dtype=int),
+    mf_n_hat: wp.array(dtype=wp.vec3),
+    mf_t_hat: wp.array(dtype=wp.vec3),
+    mf_b_hat: wp.array(dtype=wp.vec3),
+    mf_off_ref: wp.array(dtype=wp.vec3),
+    mf_off_inc: wp.array(dtype=wp.vec3),
+    body_friction: wp.array(dtype=float),
+    default_mu: float,
+    friction_static_mult: float,
+    # pool/output state
+    n_active_rows: wp.array(dtype=int),
+    pool_count: wp.array(dtype=int),
+    pool_idx_n: wp.array(dtype=int),
+    pool_idx_t: wp.array(dtype=int),
+    pool_idx_b: wp.array(dtype=int),
+    pool_idx_c: wp.array(dtype=int),
+    # pair hash for warm-start lookup (read-only)
+    hash_cap: int,
+    hash_keys: wp.array(dtype=int),
+    hash_state: wp.array(dtype=float),
+    # constraint arrays (written into the dynamic region)
+    c_type: wp.array(dtype=int),
+    c_body_a: wp.array(dtype=int),
+    c_body_b: wp.array(dtype=int),
+    c_world_anchor: wp.array(dtype=wp.vec3),
+    c_off_a: wp.array(dtype=wp.vec3),
+    c_off_b: wp.array(dtype=wp.vec3),
+    c_rest: wp.array(dtype=float),
+    c_stiffness: wp.array(dtype=float),
+    c_fmin: wp.array(dtype=float),
+    c_fmax: wp.array(dtype=float),
+    c_alpha_C0: wp.array(dtype=float),
+    c_active: wp.array(dtype=int),
+    c_fracture: wp.array(dtype=float),
+    c_sibling: wp.array(dtype=int),
+    c_partner: wp.array(dtype=int),
+    c_friction: wp.array(dtype=float),
+    c_friction_static: wp.array(dtype=float),
+    c_lambda: wp.array(dtype=float),
+    c_penalty: wp.array(dtype=float),
+    c_was_static: wp.array(dtype=int),
+):
+    """For each broadphase pair with a contact manifold, atomically claim a
+    contiguous block of 3 rows in the dynamic region of the c_* arrays per
+    contact point (normal + 2 tangents) and write the full row records
+    directly. Looks up (a, b, c_idx) in the pair hash to seed warm-start
+    λ/k/was_static for stable stacks across substeps.
+
+    Replaces the legacy CPU readback + Python _Row append loop. No data
+    leaves the GPU during emission."""
+    p = wp.tid()
+    if p >= n_pairs:
+        return
+    n_contacts = mf_contact_count[p]
+    if n_contacts == 0:
+        return
+
+    a_in = pair_a[p]
+    b_in = pair_b[p]
+    if mf_ref_is_a[p] == 1:
+        ref_i = a_in
+        inc_i = b_in
+    else:
+        ref_i = b_in
+        inc_i = a_in
+    n_hat = mf_n_hat[p]
+    t_hat = mf_t_hat[p]
+    b_hat = mf_b_hat[p]
+
+    mu_ref = body_friction[ref_i]
+    mu_inc = body_friction[inc_i]
+    mu = default_mu
+    if mu_ref > 0.0 or mu_inc > 0.0:
+        mu = wp.sqrt(mu_ref * mu_inc)
+    mu_s = mu * friction_static_mult
+
+    # Canonical pair order for hashing — invariant to ref/inc selection.
+    ka = ref_i
+    kb = inc_i
+    if kb < ka:
+        ka = inc_i
+        kb = ref_i
+
+    for c in range(n_contacts):
+        off_ref = mf_off_ref[p * 4 + c]
+        off_inc = mf_off_inc[p * 4 + c]
+        rows_per_contact = int(3)
+        if mu <= 0.0:
+            rows_per_contact = 1
+        row_base = wp.atomic_add(n_active_rows, 0, rows_per_contact)
+
+        # ----- Normal row -----
+        n_idx = row_base
+        c_type[n_idx] = BOX_BOX_CONTACT_6DOF
+        c_body_a[n_idx] = ref_i
+        c_body_b[n_idx] = inc_i
+        c_world_anchor[n_idx] = n_hat
+        c_off_a[n_idx] = off_ref
+        c_off_b[n_idx] = off_inc
+        c_rest[n_idx] = 0.0
+        c_stiffness[n_idx] = wp.inf
+        c_fmin[n_idx] = -wp.inf
+        c_fmax[n_idx] = 0.0
+        c_alpha_C0[n_idx] = 0.0
+        c_active[n_idx] = 1
+        c_fracture[n_idx] = wp.inf
+        c_sibling[n_idx] = -1
+        c_partner[n_idx] = -1
+        c_friction[n_idx] = 0.0
+        c_friction_static[n_idx] = 0.0
+
+        # ----- Tangent rows (if friction) -----
+        t_idx = -1
+        b_idx = -1
+        if mu > 0.0:
+            t_idx = row_base + 1
+            b_idx = row_base + 2
+            c_type[t_idx] = CONTACT_TANGENT_6DOF
+            c_body_a[t_idx] = ref_i
+            c_body_b[t_idx] = inc_i
+            c_world_anchor[t_idx] = t_hat
+            c_off_a[t_idx] = off_ref
+            c_off_b[t_idx] = off_inc
+            c_rest[t_idx] = 0.0
+            c_stiffness[t_idx] = wp.inf
+            c_fmin[t_idx] = -wp.inf
+            c_fmax[t_idx] = wp.inf
+            c_alpha_C0[t_idx] = 0.0
+            c_active[t_idx] = 1
+            c_fracture[t_idx] = wp.inf
+            c_sibling[t_idx] = n_idx
+            c_partner[t_idx] = b_idx
+            c_friction[t_idx] = mu
+            c_friction_static[t_idx] = mu_s
+
+            c_type[b_idx] = CONTACT_TANGENT_6DOF
+            c_body_a[b_idx] = ref_i
+            c_body_b[b_idx] = inc_i
+            c_world_anchor[b_idx] = b_hat
+            c_off_a[b_idx] = off_ref
+            c_off_b[b_idx] = off_inc
+            c_rest[b_idx] = 0.0
+            c_stiffness[b_idx] = wp.inf
+            c_fmin[b_idx] = -wp.inf
+            c_fmax[b_idx] = wp.inf
+            c_alpha_C0[b_idx] = 0.0
+            c_active[b_idx] = 1
+            c_fracture[b_idx] = wp.inf
+            c_sibling[b_idx] = n_idx
+            c_partner[b_idx] = t_idx
+            c_friction[b_idx] = mu
+            c_friction_static[b_idx] = mu_s
+
+        # ----- Warm-start lookup -----
+        # Defaults if no cache hit: λ=0, penalty=PENALTY_MIN floors, was_static=0.
+        lam_n = float(0.0)
+        lam_t = float(0.0)
+        lam_b = float(0.0)
+        k_n = float(PENALTY_MIN)
+        k_t = float(PENALTY_MIN_TANGENT)
+        k_b = float(PENALTY_MIN_TANGENT)
+        was_t = int(0)
+        was_b = int(0)
+        key = encode_pair_key(ka, kb, c)
+        h = hash_pair_key(key, hash_cap)
+        for probe in range(hash_cap):
+            slot = (h + probe) % hash_cap
+            stored_key = hash_keys[slot]
+            if stored_key == key:
+                base = slot * 8
+                lam_n = hash_state[base + 0]
+                lam_t = hash_state[base + 1]
+                lam_b = hash_state[base + 2]
+                k_n = hash_state[base + 3]
+                k_t = hash_state[base + 4]
+                k_b = hash_state[base + 5]
+                was_t = int(hash_state[base + 6])
+                was_b = int(hash_state[base + 7])
+                break
+            if stored_key == HASH_EMPTY:
+                break
+
+        c_lambda[n_idx] = lam_n
+        c_penalty[n_idx] = k_n
+        c_was_static[n_idx] = 0
+        if t_idx >= 0:
+            c_lambda[t_idx] = lam_t
+            c_penalty[t_idx] = k_t
+            c_was_static[t_idx] = was_t
+        if b_idx >= 0:
+            c_lambda[b_idx] = lam_b
+            c_penalty[b_idx] = k_b
+            c_was_static[b_idx] = was_b
+
+        # ----- Pool entry (for hash_collect after solve) -----
+        pool_id = wp.atomic_add(pool_count, 0, 1)
+        pool_idx_n[pool_id] = n_idx
+        pool_idx_t[pool_id] = t_idx
+        pool_idx_b[pool_id] = b_idx
+        pool_idx_c[pool_id] = c
+
+
+@wp.kernel
+def gpu_pool_hash_clear(
+    hash_keys: wp.array(dtype=int),
+):
+    """Mark every slot empty before a hash_collect pass."""
+    hash_keys[wp.tid()] = HASH_EMPTY
+
+
+@wp.kernel
+def gpu_pool_hash_collect(
+    pool_count: wp.array(dtype=int),
+    pool_idx_n: wp.array(dtype=int),
+    pool_idx_t: wp.array(dtype=int),
+    pool_idx_b: wp.array(dtype=int),
+    pool_idx_c: wp.array(dtype=int),
+    c_body_a: wp.array(dtype=int),
+    c_body_b: wp.array(dtype=int),
+    c_lambda: wp.array(dtype=float),
+    c_penalty: wp.array(dtype=float),
+    c_active: wp.array(dtype=int),
+    c_was_static: wp.array(dtype=int),
+    hash_cap: int,
+    hash_keys: wp.array(dtype=int),
+    hash_state: wp.array(dtype=float),
+):
+    """For each pool entry, read the current λ/k/was_static of its 3 rows and
+    upsert into the pair hash table keyed on (a, b, c_idx). On a fresh
+    post-solve this rebuilds the warm-start cache from in-place GPU state —
+    no .numpy() readback, no Python dict. c_idx was recorded by
+    gpu_pool_emit_rows in emission order so the mapping is stable from one
+    substep to the next for stable poses (manifold SH-clip is deterministic)."""
+    p = wp.tid()
+    if p >= pool_count[0]:
+        return
+    n_idx = pool_idx_n[p]
+    if c_active[n_idx] == 0:
+        return
+    a_raw = c_body_a[n_idx]
+    b_raw = c_body_b[n_idx]
+    ka = a_raw
+    kb = b_raw
+    if kb < ka:
+        ka = b_raw
+        kb = a_raw
+    c_idx = pool_idx_c[p]
+
+    lam_n = c_lambda[n_idx]
+    k_n = c_penalty[n_idx]
+    lam_t = float(0.0)
+    lam_b = float(0.0)
+    k_t = float(PENALTY_MIN_TANGENT)
+    k_b = float(PENALTY_MIN_TANGENT)
+    was_t = int(0)
+    was_b = int(0)
+    t_idx = pool_idx_t[p]
+    if t_idx >= 0:
+        lam_t = c_lambda[t_idx]
+        k_t = c_penalty[t_idx]
+        was_t = c_was_static[t_idx]
+    b_idx = pool_idx_b[p]
+    if b_idx >= 0:
+        lam_b = c_lambda[b_idx]
+        k_b = c_penalty[b_idx]
+        was_b = c_was_static[b_idx]
+
+    key = encode_pair_key(ka, kb, c_idx)
+    h = hash_pair_key(key, hash_cap)
+    for probe in range(hash_cap):
+        slot = (h + probe) % hash_cap
+        prev = wp.atomic_cas(hash_keys, slot, HASH_EMPTY, key)
+        if prev == HASH_EMPTY or prev == key:
+            base = slot * 8
+            hash_state[base + 0] = lam_n
+            hash_state[base + 1] = lam_t
+            hash_state[base + 2] = lam_b
+            hash_state[base + 3] = k_n
+            hash_state[base + 4] = k_t
+            hash_state[base + 5] = k_b
+            hash_state[base + 6] = float(was_t)
+            hash_state[base + 7] = float(was_b)
+            return
