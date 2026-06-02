@@ -29,6 +29,8 @@ SPHERE_CONTACT = 5
 CONTACT_TANGENT = 6
 SPHERE_BOX_CONTACT = 7
 BOX_BOX_CONTACT = 8
+TET_VOLUME = 9
+PLANE_CONTACT = 10
 
 
 def _orthonormal_basis(n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -198,6 +200,13 @@ class Solver:
         # during the transient.
         self._contact_state_cache: dict[tuple[int, int, int, int], tuple[float, float, float, float, float, float]] = {}
 
+        # Tet pool (TET_VOLUME constraints — one per tet, 4 bodies each).
+        # Lives separately from `_constraints` because the regular row-based
+        # pool is 2-body only. Each entry is (v0, v1, v2, v3, rest_vol,
+        # stiffness, fracture). After _flush these get unpacked into Warp
+        # arrays plus per-body adjacency for fast access inside primal_update.
+        self._tets: list[tuple[int, int, int, int, float, float, float]] = []
+
         # Warp arrays — built lazily in _flush().
         self.x = self.v = self.prev_v = self.mass = None
         self.initial = self.inertial = self.body_color = None
@@ -206,6 +215,13 @@ class Solver:
         self.c_lambda = self.c_penalty = self.c_fmin = self.c_fmax = None
         self.c_alpha_C0 = self.c_active = self.c_fracture = None
         self.body_con_starts = self.body_con_indices = None
+        # Tet-pool Warp arrays (zero-length when no tets exist — the
+        # primal_update kernel iterates body_tet_starts which is also zero).
+        self.tet_v0 = self.tet_v1 = self.tet_v2 = self.tet_v3 = None
+        self.tet_rest_vol = self.tet_stiffness = self.tet_fracture = None
+        self.tet_lambda = self.tet_penalty = self.tet_alpha_C0 = None
+        self.tet_active = None
+        self.body_tet_starts = self.body_tet_indices = None
 
     # ---- Scene building -----------------------------------------------------
 
@@ -252,8 +268,34 @@ class Solver:
         fracture: float = math.inf,
     ) -> ConstraintHandle:
         """Pin a particle to a world point along all three axes."""
+        return self.add_pin_axes(
+            body, world_point, (True, True, True),
+            stiffness=stiffness, fracture=fracture,
+        )
+
+    def add_pin_axes(
+        self,
+        body: Body,
+        world_point: tuple[float, float, float],
+        axes: tuple[bool, bool, bool],
+        stiffness: float = math.inf,
+        fracture: float = math.inf,
+    ) -> ConstraintHandle:
+        """Pin a particle along an arbitrary subset of the world XYZ axes.
+
+        `axes` is a 3-tuple of booleans (pin_x, pin_y, pin_z). Each True
+        emits one PIN_AXIS row pulling the particle's coordinate toward
+        `world_point` on that axis. The other coordinates stay free.
+
+        Used by the bunny-squash scene to pin a central vertex in (y, z)
+        only, so the plates can still compress the bunny in x while the
+        bunny can't slide off the side or drop through the floor.
+        """
         start = len(self._constraints)
-        for axis in (PIN_X, PIN_Y, PIN_Z):
+        rows = 0
+        for axis, want in zip((PIN_X, PIN_Y, PIN_Z), axes):
+            if not want:
+                continue
             self._constraints.append(
                 _ConstraintRow(
                     type=axis,
@@ -264,8 +306,9 @@ class Solver:
                     fracture=fracture,
                 )
             )
+            rows += 1
         self._dirty = True
-        return ConstraintHandle(index=start, rows=3)
+        return ConstraintHandle(index=start, rows=rows)
 
     def add_distance(
         self,
@@ -288,6 +331,38 @@ class Solver:
         )
         self._dirty = True
         return ConstraintHandle(index=idx, rows=1)
+
+    def add_tet_volume(
+        self,
+        v0: Body,
+        v1: Body,
+        v2: Body,
+        v3: Body,
+        stiffness: float = 1.0e8,
+        fracture: float = math.inf,
+    ) -> ConstraintHandle:
+        """Add a TET_VOLUME constraint coupling 4 vertices via signed volume.
+
+        Rest volume is computed automatically from the current positions of
+        the 4 bodies. `stiffness` is the AVBD penalty ceiling (interpreted
+        as a bulk-modulus-like term in units of force / volume — high
+        values keep the tet's signed volume near its rest value).
+
+        Returns a `ConstraintHandle` whose `index` is the tet's position
+        in the tet pool (NOT the regular constraint pool).
+        """
+        tid = len(self._tets)
+        p0 = np.asarray(self._bodies_x[v0.index], dtype=np.float64)
+        p1 = np.asarray(self._bodies_x[v1.index], dtype=np.float64)
+        p2 = np.asarray(self._bodies_x[v2.index], dtype=np.float64)
+        p3 = np.asarray(self._bodies_x[v3.index], dtype=np.float64)
+        rest_vol = float(np.dot(p1 - p0, np.cross(p2 - p0, p3 - p0)) / 6.0)
+        self._tets.append((
+            int(v0.index), int(v1.index), int(v2.index), int(v3.index),
+            rest_vol, float(stiffness), float(fracture),
+        ))
+        self._dirty = True
+        return ConstraintHandle(index=tid, rows=1)
 
     def enable_self_collision(
         self,
@@ -756,6 +831,69 @@ class Solver:
         self._dirty = True
         return ConstraintHandle(index=idx, rows=rows)
 
+    def add_plane_contact(
+        self,
+        body: Body,
+        normal: tuple[float, float, float],
+        offset: float,
+        stiffness: float = math.inf,
+    ) -> ConstraintHandle:
+        """One-sided generalized plane contact: pushes `body` to the n · x ≥ d
+        half-space, where d = `offset` and n = unit `normal`.
+
+        Useful for moving plates / walls / squeezers — animate `offset` (and
+        optionally `normal`) each step via `set_plane_contact(...)`.
+        Push-only clamp matches every other contact row (fmin=-inf, fmax=0).
+        Friction is not added by default — pass it via `add_floor_contact`
+        if you need it, or extend this method.
+        """
+        n_arr = np.asarray(normal, dtype=np.float32)
+        n_arr = n_arr / (np.linalg.norm(n_arr) + 1e-20)
+        idx = len(self._constraints)
+        self._constraints.append(
+            _ConstraintRow(
+                type=PLANE_CONTACT,
+                body_a=body.index,
+                body_b=-1,
+                world_anchor=(float(n_arr[0]), float(n_arr[1]), float(n_arr[2])),
+                rest=float(offset),
+                stiffness=stiffness,
+                fmin=-math.inf,
+                fmax=0.0,
+            )
+        )
+        self._dirty = True
+        return ConstraintHandle(index=idx, rows=1)
+
+    def set_plane_contact_bulk(
+        self,
+        handles: list[ConstraintHandle],
+        normal: tuple[float, float, float] | None = None,
+        offset: float | None = None,
+    ) -> None:
+        """Update a batch of plane-contact rows in one upload. Call once per
+        frame after animating plate state — avoids the GPU round-trip cost
+        that per-row updates would incur when 100+ rows share the plate.
+        """
+        if not handles:
+            return
+        self._flush()
+        # Keep a host-side mirror of c_rest / c_world_anchor so animation
+        # never needs to read back from the GPU.
+        if not hasattr(self, "_c_rest_host") or self._c_rest_host is None:
+            self._c_rest_host = self.c_rest.numpy().copy()
+        if not hasattr(self, "_c_world_anchor_host") or self._c_world_anchor_host is None:
+            self._c_world_anchor_host = self.c_world_anchor.numpy().copy()
+        idxs = np.fromiter((h.index for h in handles), dtype=np.int32)
+        if normal is not None:
+            n_arr = np.asarray(normal, dtype=np.float32)
+            n_arr = n_arr / (np.linalg.norm(n_arr) + 1e-20)
+            self._c_world_anchor_host[idxs] = n_arr
+            self.c_world_anchor.assign(self._c_world_anchor_host)
+        if offset is not None:
+            self._c_rest_host[idxs] = float(offset)
+            self.c_rest.assign(self._c_rest_host)
+
     # --- runtime perturbations (for interactive demos) -----------------------
 
     def set_velocity(self, body: Body, v: tuple[float, float, float]) -> None:
@@ -800,6 +938,29 @@ class Solver:
                 cursor[c.body_b] += 1
         return starts, indices
 
+    def _build_tet_adjacency(self) -> tuple[np.ndarray, np.ndarray]:
+        """CSR-like adjacency mapping body → tet entries that touch it. Each
+        adjacency entry encodes `(tet_id << 2) | slot` so the per-body loop in
+        primal_update can recover both. A body that's not part of any tet has
+        starts[b] == starts[b+1] (empty range), so the kernel does nothing
+        extra for it."""
+        n_bodies = len(self._bodies_x)
+        counts = np.zeros(n_bodies, dtype=np.int32)
+        for v0, v1, v2, v3, *_ in self._tets:
+            counts[v0] += 1
+            counts[v1] += 1
+            counts[v2] += 1
+            counts[v3] += 1
+        starts = np.zeros(n_bodies + 1, dtype=np.int32)
+        starts[1:] = np.cumsum(counts)
+        indices = np.zeros(int(starts[-1]) if n_bodies > 0 else 0, dtype=np.int32)
+        cursor = starts[:-1].copy()
+        for tid, (v0, v1, v2, v3, *_) in enumerate(self._tets):
+            for slot, b in enumerate((v0, v1, v2, v3)):
+                indices[cursor[b]] = (int(tid) << 2) | int(slot)
+                cursor[b] += 1
+        return starts, indices
+
     def _flush(self) -> None:
         if not self._dirty:
             return
@@ -840,11 +1001,18 @@ class Solver:
         self.inertial = wp.zeros(n_b, dtype=wp.vec3, device=dev)
 
         # Graph color the body adjacency so bodies with disjoint constraint
-        # neighbourhoods update in parallel inside one launch.
+        # neighbourhoods update in parallel inside one launch. For tet rows
+        # every pair of the 4 vertices must be different colors (K4 hyperedge),
+        # so we feed the 6 in-tet edges to the coloring as well.
+        tet_a: list[int] = []
+        tet_b: list[int] = []
+        for v0, v1, v2, v3, *_ in self._tets:
+            tet_a.extend([v0, v0, v0, v1, v1, v2])
+            tet_b.extend([v1, v2, v3, v2, v3, v3])
         adj = build_body_edges(
             n_b,
-            [c.body_a for c in self._constraints],
-            [c.body_b for c in self._constraints],
+            [c.body_a for c in self._constraints] + tet_a,
+            [c.body_b for c in self._constraints] + tet_b,
         )
         color_np = greedy_color(adj) if n_b > 0 else np.zeros(0, dtype=np.int32)
         self.num_colors = int(color_np.max() + 1) if n_b > 0 else 0
@@ -905,6 +1073,50 @@ class Solver:
         starts, indices = self._build_adjacency()
         self.body_con_starts = wp.array(starts, dtype=int, device=dev)
         self.body_con_indices = wp.array(indices, dtype=int, device=dev)
+
+        # --- Tet pool upload + adjacency ----------------------------------
+        n_t = len(self._tets)
+        # Preserve previous λ / penalty / active for already-existing tets
+        # (mid-sim _flush) — same idea as the regular pool's preservation.
+        cur_tet_lam = self.tet_lambda.numpy() if self.tet_lambda is not None else None
+        cur_tet_pen = self.tet_penalty.numpy() if self.tet_penalty is not None else None
+        cur_tet_act = self.tet_active.numpy() if self.tet_active is not None else None
+        n_t_prev = 0 if cur_tet_lam is None else int(cur_tet_lam.shape[0])
+        tet_lam_np = np.zeros(n_t, dtype=np.float32)
+        # Start tet penalty at PENALTY_MIN_TET (≈ 10) — matches kernel floor.
+        # tet_warmstart_duals will keep raising it as soon as |C| grows.
+        tet_pen_np = np.full(n_t, 10.0, dtype=np.float32)
+        tet_act_np = np.ones(n_t, dtype=np.int32)
+        n_t_keep = min(n_t_prev, n_t)
+        if n_t_keep > 0:
+            tet_lam_np[:n_t_keep] = cur_tet_lam[:n_t_keep]
+            tet_pen_np[:n_t_keep] = cur_tet_pen[:n_t_keep]
+            tet_act_np[:n_t_keep] = cur_tet_act[:n_t_keep]
+        if n_t:
+            v_arr = np.array([t[:4] for t in self._tets], dtype=np.int32)
+            rest_vol_np = np.array([t[4] for t in self._tets], dtype=np.float32)
+            stiff_np = np.array([t[5] for t in self._tets], dtype=np.float32)
+            frac_np = np.array([t[6] for t in self._tets], dtype=np.float32)
+        else:
+            v_arr = np.zeros((0, 4), dtype=np.int32)
+            rest_vol_np = np.zeros(0, dtype=np.float32)
+            stiff_np = np.zeros(0, dtype=np.float32)
+            frac_np = np.zeros(0, dtype=np.float32)
+        self.tet_v0 = wp.array(v_arr[:, 0] if n_t else v_arr.reshape(0), dtype=int, device=dev)
+        self.tet_v1 = wp.array(v_arr[:, 1] if n_t else v_arr.reshape(0), dtype=int, device=dev)
+        self.tet_v2 = wp.array(v_arr[:, 2] if n_t else v_arr.reshape(0), dtype=int, device=dev)
+        self.tet_v3 = wp.array(v_arr[:, 3] if n_t else v_arr.reshape(0), dtype=int, device=dev)
+        self.tet_rest_vol = wp.array(rest_vol_np, dtype=float, device=dev)
+        self.tet_stiffness = wp.array(stiff_np, dtype=float, device=dev)
+        self.tet_fracture = wp.array(frac_np, dtype=float, device=dev)
+        self.tet_lambda = wp.array(tet_lam_np, dtype=float, device=dev)
+        self.tet_penalty = wp.array(tet_pen_np, dtype=float, device=dev)
+        self.tet_alpha_C0 = wp.zeros(n_t, dtype=float, device=dev)
+        self.tet_active = wp.array(tet_act_np, dtype=int, device=dev)
+        tet_starts, tet_indices = self._build_tet_adjacency()
+        self.body_tet_starts = wp.array(tet_starts, dtype=int, device=dev)
+        self.body_tet_indices = wp.array(tet_indices, dtype=int, device=dev)
+
         self._dirty = False
 
     # ---- The step -----------------------------------------------------------
@@ -975,6 +1187,7 @@ class Solver:
             self.c_penalty = wp.array(pen_np, dtype=float, device=self.device)
         n_b = len(self._bodies_x)
         n_c = len(self._constraints)
+        n_t = len(self._tets)
         if n_b == 0:
             return
         dev = self.device
@@ -1013,6 +1226,28 @@ class Solver:
                 device=dev,
             )
 
+        # Tet pool: warm-start λ/k (Eq.19) and cache α·C₀ (Eq.18) once per step
+        if n_t > 0:
+            wp.launch(
+                K.tet_warmstart_duals,
+                dim=n_t,
+                inputs=[
+                    self.tet_lambda, self.tet_penalty, self.tet_stiffness,
+                    self.alpha, self.gamma, 1 if self.post_stabilize else 0,
+                ],
+                device=dev,
+            )
+            wp.launch(
+                K.tet_cache_alpha_C0,
+                dim=n_t,
+                inputs=[
+                    self.x, self.tet_v0, self.tet_v1, self.tet_v2, self.tet_v3,
+                    self.tet_rest_vol, self.tet_active, self.alpha,
+                ],
+                outputs=[self.tet_alpha_C0],
+                device=dev,
+            )
+
         total_iters = self.iterations + (1 if self.post_stabilize else 0)
         for it in range(total_iters):
             # Post-stabilization pass: drop the α·C₀ term so we drive C → 0 hard.
@@ -1027,6 +1262,18 @@ class Solver:
                         0.0,
                     ],
                     outputs=[self.c_alpha_C0],
+                    device=dev,
+                )
+            # Tet pool post-stab: same idea, drive C → 0.
+            if self.post_stabilize and it == self.iterations and n_t > 0:
+                wp.launch(
+                    K.tet_cache_alpha_C0,
+                    dim=n_t,
+                    inputs=[
+                        self.x, self.tet_v0, self.tet_v1, self.tet_v2, self.tet_v3,
+                        self.tet_rest_vol, self.tet_active, 0.0,
+                    ],
+                    outputs=[self.tet_alpha_C0],
                     device=dev,
                 )
 
@@ -1045,6 +1292,10 @@ class Solver:
                         self.c_sibling, self.c_friction,
                         self.c_off_a, self.c_off_b,
                         self.body_con_starts, self.body_con_indices,
+                        self.tet_v0, self.tet_v1, self.tet_v2, self.tet_v3,
+                        self.tet_rest_vol, self.tet_lambda, self.tet_penalty,
+                        self.tet_alpha_C0, self.tet_active,
+                        self.body_tet_starts, self.body_tet_indices,
                         self.dt, color_id,
                     ],
                     device=dev,
@@ -1067,7 +1318,49 @@ class Solver:
                     device=dev,
                 )
 
-            if it == self.iterations - 1:
+            # Tet dual update (Eqs.11+16) — skipped during the stabilization iter.
+            if n_t > 0 and it < self.iterations:
+                wp.launch(
+                    K.tet_dual_update,
+                    dim=n_t,
+                    inputs=[
+                        self.x, self.tet_v0, self.tet_v1, self.tet_v2, self.tet_v3,
+                        self.tet_rest_vol, self.tet_stiffness,
+                        self.tet_lambda, self.tet_penalty,
+                        self.tet_alpha_C0, self.tet_active, self.tet_fracture,
+                        self.beta,
+                    ],
+                    device=dev,
+                )
+
+            # BDF1 velocity finalize. WHEN this happens matters:
+            #
+            #   - Old-style (before post-stab, at last regular iter): velocity
+            #     reflects only the regular-iteration Δx. The post-stab pass
+            #     then snaps x to satisfy C exactly, but those mm-scale
+            #     position snaps DON'T propagate into v. For deformable bodies
+            #     with stiff volume constraints, those snaps can be large
+            #     (resolving deep simultaneous penetration of many tet verts),
+            #     and the position-velocity desync pumps energy on bounce.
+            #     The original bunny demo crashed by gaining 100+% mechanical
+            #     energy on a single floor impact this way.
+            #
+            #   - New-style (after post-stab): v = (x_after_post_stab − x_0)/dt
+            #     captures ALL position changes in the step. Energy-honest
+            #     for deformables. But for rigid bodies with one-sided
+            #     multi-corner contacts (e.g. 4-corner BOX_BOX_CONTACT on a
+            #     floor), post-stab corrects some corners up but can't pull
+            #     others down (fmax=0), producing a persistent small upward
+            #     kick that the new finalize captures and propagates as a
+            #     small hover.
+            #
+            # Gate: use the new timing only when tet constraints are present
+            # in the scene. This is the heuristic that distinguishes
+            # deformable scenes (need new) from rigid-only scenes (need old).
+            do_finalize_now = False
+            if it == self.iterations - 1 and n_t == 0:
+                do_finalize_now = True
+            if do_finalize_now:
                 wp.launch(
                     K.finalize_velocity,
                     dim=n_b,
@@ -1082,6 +1375,24 @@ class Solver:
                         inputs=[self.v, self.max_speed],
                         device=dev,
                     )
+
+        # Deformable path: finalize AFTER post-stab so the stabilisation Δx
+        # is reflected in v (see comment above).
+        if n_t > 0:
+            wp.launch(
+                K.finalize_velocity,
+                dim=n_b,
+                inputs=[self.x, self.initial, self.mass, self.dt],
+                outputs=[self.v, self.prev_v],
+                device=dev,
+            )
+            if self.max_speed > 0.0 and math.isfinite(self.max_speed):
+                wp.launch(
+                    K.cap_velocity,
+                    dim=n_b,
+                    inputs=[self.v, self.max_speed],
+                    device=dev,
+                )
 
         # Fix C tail: persist λ AND grown penalty for surviving sphere-sphere
         # contacts. Pairs whose contact has separated drop from the cache;

@@ -85,6 +85,32 @@ SPHERE_BOX_CONTACT = wp.constant(7)
 # One-sided clamp `fmin=-inf, fmax=0` (push-only) matches every other
 # normal-direction contact in this solver.
 BOX_BOX_CONTACT = wp.constant(8)
+# Per-tet volume preservation constraint (soft).
+#
+#   C = V(x) - V_rest,  V = (1/6) (x1-x0) · ((x2-x0) × (x3-x0))
+#
+# A scalar AVBD constraint coupling FOUR vertices (the tet vertices). Lives
+# in its own dedicated pool — the regular constraint pool only supports
+# 2-body rows. Each tet vertex sees the tet row via a separate per-body
+# tet adjacency (body_tet_starts / body_tet_indices) inside primal_update.
+# Stiffness `tet_stiffness` is a soft material bulk modulus; AVBD clamps
+# `tet_penalty` to this ceiling via the same Eq.16 growth rule as the
+# regular pool. Volume preservation alone doesn't give shear stiffness —
+# proper co-rotated FEM is the next milestone.
+TET_VOLUME = wp.constant(9)
+# Generalized half-space plane contact: one-sided push-only constraint
+# along an arbitrary unit normal n with signed plane offset d.
+#
+#   C = n · x - d,   J = n,   fmin = -inf, fmax = 0
+#
+# Particle is in violation when n·x < d (on the negative side of the plane);
+# λ becomes negative and the force λ·J = λ·n pushes it toward the +n side.
+# Storage convention:
+#   c_world_anchor[j] = unit normal n (vec3)
+#   c_rest[j]         = signed offset d (float)
+# At runtime, animate the plate by updating c_rest (and optionally
+# c_world_anchor for a moving direction).
+PLANE_CONTACT = wp.constant(10)
 
 # AVBD penalty clamps (paper §3.3, "we clamp penalty to [k_min, k_max]").
 # Two floors — one for the per-row clamp on normal / pin / distance constraints,
@@ -114,6 +140,18 @@ BOX_BOX_CONTACT = wp.constant(8)
 # which holds only when k ≪ M/dt². So tangent k MUST stay small.
 PENALTY_MIN = wp.constant(1.0e6)
 PENALTY_MIN_TANGENT = wp.constant(1.0)
+# Tet volume floor: a third penalty floor specifically for TET_VOLUME rows.
+# Volume constraints are SOFT (finite stiffness), with the strain formulation
+# C = V/V₀ - 1. Their Hessian magnitude is k·‖J‖² where ‖J‖ ≈ A_face/(3V₀)
+# (units 1/length), so even k=1.0 yields per-vertex Hessian on the order of
+# 1/length² ≈ 100 for a typical tet — already comparable to the body's mass
+# term M/dt². If we used the regular PENALTY_MIN=1e6 here the volume term
+# would dominate the linear solve from frame 0 and lock the bunny in place,
+# unable to fall under gravity. A soft floor lets gravity move the body
+# rigidly (which preserves V → C stays zero → penalty growth doesn't fire)
+# while Eq.16 still ramps k up to the material `tet_stiffness` ceiling when
+# contact does distort V.
+PENALTY_MIN_TET = wp.constant(10.0)
 PENALTY_MAX = wp.constant(1.0e9)
 
 
@@ -321,6 +359,20 @@ def primal_update(
     # body → constraint adjacency (CSR)
     body_con_starts: wp.array(dtype=int),
     body_con_indices: wp.array(dtype=int),
+    # tet pool: one TET_VOLUME constraint per tet, 4 vertices each
+    tet_v0: wp.array(dtype=int),
+    tet_v1: wp.array(dtype=int),
+    tet_v2: wp.array(dtype=int),
+    tet_v3: wp.array(dtype=int),
+    tet_rest_vol: wp.array(dtype=float),
+    tet_lambda: wp.array(dtype=float),
+    tet_penalty: wp.array(dtype=float),
+    tet_alpha_C0: wp.array(dtype=float),
+    tet_active: wp.array(dtype=int),
+    # body → tet adjacency (CSR). Each entry is (tet_id << 2) | slot
+    # where slot ∈ {0,1,2,3} is this body's vertex-slot in the tet.
+    body_tet_starts: wp.array(dtype=int),
+    body_tet_indices: wp.array(dtype=int),
     # params
     dt: float,
     current_color: int,
@@ -378,6 +430,12 @@ def primal_update(
             anchor = c_world_anchor[cj]
             J = wp.vec3(0.0, 1.0, 0.0)
             C = x[i][1] - anchor[1]
+        elif t == PLANE_CONTACT:
+            # Generalized push-only half-space: c_world_anchor = unit normal,
+            # c_rest = signed offset d.   C = n·x - d,   J = n.
+            n_hat = c_world_anchor[cj]
+            J = n_hat
+            C = wp.dot(n_hat, x[i]) - c_rest[cj]
         elif t == SPHERE_CONTACT:
             # Specialisation of VBD Eq. (12) / AVBD Eq. (15) normal row, with
             # per-side 3D sub-sphere offsets so a cube can collide as 1 inscribed
@@ -486,6 +544,61 @@ def primal_update(
             J[2]*J[0]*k_p, J[2]*J[1]*k_p, J[2]*J[2]*k_p,
         )
 
+    # --- Tet-pool inner loop (TET_VOLUME) ------------------------------------
+    # Constraint: C = V/V_rest - 1  — dimensionless volume ratio offset.
+    # The SIGNED reciprocal 1/V_rest is critical: if V_rest is negative (some
+    # tets in a Kuhn split have flipped orientation), using 1/|V_rest| would
+    # push the wrong way and inflate the wrong-handed volume into infinity.
+    # `J = inv_V0 · (1/6) · cross-grad` keeps the constraint direction sensible
+    # for both orientations.
+    tet_start = body_tet_starts[i]
+    tet_end = body_tet_starts[i + 1]
+    for kt in range(tet_start, tet_end):
+        enc = body_tet_indices[kt]
+        tid = enc >> 2
+        slot = enc & 3
+        if tet_active[tid] == 0:
+            continue
+        i0 = tet_v0[tid]
+        i1 = tet_v1[tid]
+        i2 = tet_v2[tid]
+        i3 = tet_v3[tid]
+        p0 = x[i0]
+        p1 = x[i1]
+        p2 = x[i2]
+        p3 = x[i3]
+        a_e = p1 - p0
+        b_e = p2 - p0
+        c_e = p3 - p0
+        V0 = tet_rest_vol[tid]
+        inv_V0 = 1.0 / V0  # SIGNED — preserves orientation
+        # Dimensionless volume ratio offset.
+        V = wp.dot(a_e, wp.cross(b_e, c_e)) * (1.0 / 6.0)
+        C_t = V * inv_V0 - 1.0 - tet_alpha_C0[tid]
+        # Gradient ∂C/∂x_slot = (1/(6·V0)) × the cross-product gradient (signed).
+        s_grad = (1.0 / 6.0) * inv_V0
+        if slot == 1:
+            J_t = wp.cross(b_e, c_e) * s_grad
+        elif slot == 2:
+            J_t = wp.cross(c_e, a_e) * s_grad
+        elif slot == 3:
+            J_t = wp.cross(a_e, b_e) * s_grad
+        else:  # slot == 0
+            g1 = wp.cross(b_e, c_e) * s_grad
+            g2 = wp.cross(c_e, a_e) * s_grad
+            g3 = wp.cross(a_e, b_e) * s_grad
+            J_t = -(g1 + g2 + g3)
+        # Soft constraint, no clamp (paper Sec.3.4 — finite-stiffness force
+        # uses λ_eff = 0, so f_t = k·C̃ here too).
+        k_t = tet_penalty[tid]
+        f_t = k_t * C_t
+        rhs = rhs + J_t * f_t
+        lhs = lhs + wp.mat33(
+            J_t[0]*J_t[0]*k_t, J_t[0]*J_t[1]*k_t, J_t[0]*J_t[2]*k_t,
+            J_t[1]*J_t[0]*k_t, J_t[1]*J_t[1]*k_t, J_t[1]*J_t[2]*k_t,
+            J_t[2]*J_t[0]*k_t, J_t[2]*J_t[1]*k_t, J_t[2]*J_t[2]*k_t,
+        )
+
     # Solve 3×3 SPD via inverse (cheap for 3×3, numerically OK since lhs is SPD)
     inv = wp.inverse(lhs)
     dx = inv * rhs
@@ -531,6 +644,8 @@ def dual_update(
         C = eval_distance(x[c_body_a[j]], x[c_body_b[j]], c_rest[j])
     elif t == FLOOR_CONTACT:
         C = x[c_body_a[j]][1] - c_world_anchor[j][1]
+    elif t == PLANE_CONTACT:
+        C = wp.dot(c_world_anchor[j], x[c_body_a[j]]) - c_rest[j]
     elif t == SPHERE_CONTACT:
         pa_off = x[c_body_a[j]] + c_off_a[j]
         pb_off = x[c_body_b[j]] + c_off_b[j]
@@ -649,6 +764,8 @@ def cache_alpha_C0(
         C0 = eval_distance(x[c_body_a[j]], x[c_body_b[j]], c_rest[j])
     elif t == FLOOR_CONTACT:
         C0 = x[c_body_a[j]][1] - c_world_anchor[j][1]
+    elif t == PLANE_CONTACT:
+        C0 = wp.dot(c_world_anchor[j], x[c_body_a[j]]) - c_rest[j]
     elif t == SPHERE_CONTACT:
         pa_off = x[c_body_a[j]] + c_off_a[j]
         pb_off = x[c_body_b[j]] + c_off_b[j]
@@ -678,3 +795,118 @@ def cache_alpha_C0(
         c_alpha_C0[j] = C0
         return
     c_alpha_C0[j] = alpha * C0
+
+
+# =============================================================================
+# Tet pool kernels (TET_VOLUME)
+# =============================================================================
+#
+# A single AVBD constraint per tet, coupling 4 vertices via the signed
+# volume:   C = V(x) - V_rest,  V = (1/6) (x1-x0) · ((x2-x0) × (x3-x0)).
+#
+# Lives in its own pool because the regular row-based constraint pool only
+# supports 2-body rows. Each tet has its own (λ, k, α·C₀, active) scalar
+# state. The kernels below mirror warmstart_duals / cache_alpha_C0 / dual_update
+# for the regular pool; the primal contribution is done inside the regular
+# `primal_update` kernel via a per-body tet adjacency.
+
+
+@wp.kernel
+def tet_warmstart_duals(
+    tet_lambda: wp.array(dtype=float),
+    tet_penalty: wp.array(dtype=float),
+    tet_stiffness: wp.array(dtype=float),
+    alpha: float,
+    gamma: float,
+    post_stabilize: int,
+):
+    """Eq.19 for the tet pool. Uses PENALTY_MIN_TET (much smaller than the
+    regular PENALTY_MIN) so the volume Hessian doesn't dominate the linear
+    solve from frame 0. The Eq.16 growth path in tet_dual_update ramps k
+    up to the material `tet_stiffness` ceiling as soon as C becomes nonzero.
+    """
+    t = wp.tid()
+    p = wp.clamp(tet_penalty[t] * gamma, PENALTY_MIN_TET, PENALTY_MAX)
+    if post_stabilize == 0:
+        tet_lambda[t] = tet_lambda[t] * alpha * gamma
+    s = tet_stiffness[t]
+    if not wp.isnan(s) and s < wp.inf:
+        p = wp.min(p, s)
+    tet_penalty[t] = p
+
+
+@wp.kernel
+def tet_cache_alpha_C0(
+    x: wp.array(dtype=wp.vec3),
+    tet_v0: wp.array(dtype=int),
+    tet_v1: wp.array(dtype=int),
+    tet_v2: wp.array(dtype=int),
+    tet_v3: wp.array(dtype=int),
+    tet_rest_vol: wp.array(dtype=float),
+    tet_active: wp.array(dtype=int),
+    alpha: float,
+    tet_alpha_C0: wp.array(dtype=float),
+):
+    """Eq.18 for the tet pool. C₀ = V(x_at_step_start) - V_rest, then α·C₀
+    is what we subtract from C during the iteration."""
+    t = wp.tid()
+    if tet_active[t] == 0:
+        tet_alpha_C0[t] = 0.0
+        return
+    p0 = x[tet_v0[t]]
+    p1 = x[tet_v1[t]]
+    p2 = x[tet_v2[t]]
+    p3 = x[tet_v3[t]]
+    V0 = tet_rest_vol[t]
+    V = wp.dot(p1 - p0, wp.cross(p2 - p0, p3 - p0)) * (1.0 / 6.0)
+    C0 = V / V0 - 1.0
+    tet_alpha_C0[t] = alpha * C0
+
+
+@wp.kernel
+def tet_dual_update(
+    x: wp.array(dtype=wp.vec3),
+    tet_v0: wp.array(dtype=int),
+    tet_v1: wp.array(dtype=int),
+    tet_v2: wp.array(dtype=int),
+    tet_v3: wp.array(dtype=int),
+    tet_rest_vol: wp.array(dtype=float),
+    tet_stiffness: wp.array(dtype=float),
+    tet_lambda: wp.array(dtype=float),
+    tet_penalty: wp.array(dtype=float),
+    tet_alpha_C0: wp.array(dtype=float),
+    tet_active: wp.array(dtype=int),
+    tet_fracture: wp.array(dtype=float),
+    beta: float,
+):
+    """Eqs.11 + 16 for the tet pool. TET_VOLUME is a SOFT constraint
+    (finite stiffness), so we use the Sec.3.4 path: lam_eff = 0, no clamp
+    bounds (fmin/fmax = ±∞), and penalty grows toward the material k* with
+    `k += β|C̃|` clamped to `min(PENALTY_MAX, tet_stiffness)`.
+    """
+    t = wp.tid()
+    if tet_active[t] == 0:
+        return
+    p0 = x[tet_v0[t]]
+    p1 = x[tet_v1[t]]
+    p2 = x[tet_v2[t]]
+    p3 = x[tet_v3[t]]
+    V0 = tet_rest_vol[t]
+    V = wp.dot(p1 - p0, wp.cross(p2 - p0, p3 - p0)) * (1.0 / 6.0)
+    C = V / V0 - 1.0 - tet_alpha_C0[t]
+    s = tet_stiffness[t]
+    # Soft constraint per Sec.3.4: λ doesn't carry across iterations as a
+    # Lagrange multiplier — it's the penalty force itself. We still keep
+    # the running λ around so adaptive warm-start (Eq.19) can decay it
+    # between frames, but the iteration force uses k·C only.
+    new_lam = tet_penalty[t] * C
+    tet_lambda[t] = new_lam
+    # Fracture by impulse magnitude (same convention as the regular pool).
+    if wp.abs(new_lam) >= tet_fracture[t]:
+        tet_active[t] = 0
+        tet_lambda[t] = 0.0
+        tet_penalty[t] = 0.0
+        return
+    # Penalty growth Eq.16, clamped to material stiffness.
+    upper = wp.min(PENALTY_MAX, s)
+    tet_penalty[t] = wp.min(tet_penalty[t] + beta * wp.abs(C), upper)

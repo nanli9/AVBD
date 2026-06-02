@@ -749,32 +749,73 @@ class DeformableViewer:
         except Exception:
             pass
 
-        # Deformable mode needs more iters than the rigid scene for the
-        # stiff tet network to converge. We default to 25 if the user
-        # hasn't overridden via --iterations, but always honour --iterations.
-        bunny_iters = int(args.iterations) if args.iterations != 25 else 25
-        # 25 here is the same as the default for rigid mode; user can bump
-        # via --iterations 35 if they crank resolution way up.
+        # Bunny mode follows the AVBD paper budget: iterations=4 per
+        # substep + multiple substeps per visual frame. If the user
+        # passed --iterations explicitly (anything other than the global
+        # default of 25), we honour that; otherwise we switch to 4.
+        # The shared --substeps arg controls how many AVBD substeps run
+        # per tick. At 4 iters × 8 substeps the effective work per frame
+        # matches the old 25-iters single-step setup but resolves plate
+        # contact penetration much better when squeezing hard.
+        bunny_iters = 4 if int(args.iterations) == 25 else int(args.iterations)
+        self._bunny_substeps = max(1, int(args.substeps))
+        # Gravity off by default in the bunny scene — the canonical demo is
+        # the two-plate squash, which reads cleaner with the bunny at rest
+        # between the plates rather than sitting on the floor under gravity.
+        # The slider stays exposed so the user can re-enable it.
         self.solver = Solver(
             dt=1.0 / 60.0,
             iterations=bunny_iters,
-            gravity=(0.0, -9.81, 0.0),
+            gravity=(0.0, 0.0, 0.0),
             post_stabilize=True,
             device=args.device,
         )
         print(f"[viewer] building tet bunny at resolution={args.bunny_resolution} ...")
         t0 = time.perf_counter()
+        # Squash demo defaults to a much softer volume preservation than the
+        # global --volume-stiffness=1e4. At 1e4 the bunny is effectively
+        # incompressible and the plates can't push verts past ~30 % of the
+        # bunny's natural x-extent without plate-contact penetration; at
+        # 1e3 the bunny visibly compresses to ~10 cm wide with only a few
+        # mm of plate penetration. The user can override with
+        # --volume-stiffness or via the live GUI slider.
+        bunny_vol_k = (1.0e3 if float(args.volume_stiffness) == 1.0e4
+                       else float(args.volume_stiffness))
+        self._bunny_vol_k = bunny_vol_k
         self.deform = make_bunny(
             self.solver,
             resolution=int(args.bunny_resolution),
             scale=float(args.bunny_scale),
             center=(0.0, float(args.bunny_drop_y), 0.0),
             edge_stiffness=float(args.edge_stiffness),
-            volume_stiffness=float(args.volume_stiffness),
+            volume_stiffness=bunny_vol_k,
             friction=float(args.friction),
             floor_y=0.0,
             surface_collide=False,
         )
+        # Anchor pin: when the plates close quickly the right plate can hit
+        # one side of the bunny before the left plate is fully resisting,
+        # and the resulting impulse pushes the whole body sideways past the
+        # other plate (AVBD only resolves a few iters per substep, so big
+        # constraint violations created by a single slider drag aren't
+        # fully snapped back in one frame). Anchor the tet vertex closest
+        # to the bunny's rest centre on all three axes via a soft pin —
+        # the surface verts are still free to compress in toward this
+        # anchor (and bulge in y/z) under the plate constraints, but the
+        # body as a whole can't drift off centre.
+        rest_positions = self.solver.positions().copy()
+        tet_rest = rest_positions[self.deform.indices]
+        bunny_center = np.array(
+            [0.0, float(args.bunny_drop_y), 0.0], dtype=np.float32)
+        center_tet_id = int(np.argmin(
+            np.linalg.norm(tet_rest - bunny_center, axis=1)))
+        self._anchor_pin = self.solver.add_pin_axes(
+            self.deform.bodies[center_tet_id],
+            world_point=tuple(map(float, tet_rest[center_tet_id])),
+            axes=(True, True, True),
+            stiffness=1.0e3,
+        )
+
         # Cache initial state for reset.
         self._initial_positions = self.solver.positions().copy()
         self._initial_velocities = self.solver.velocities().copy()
@@ -794,6 +835,73 @@ class DeformableViewer:
             "/grid", width=8.0, height=8.0, cell_size=0.5, plane="xz",
         )
 
+        # ---- Two transparent glass plates that squash the bunny ----------
+        # Each plate is a thin axis-aligned box with normal ±x, spanning
+        # the plate-height in y and plate-depth in z. Per surface vertex of
+        # the tet skin we register one PLANE_CONTACT row pointed inward;
+        # the inner-face separation is driven by a GUI slider (plate
+        # distance), so the user controls the squash directly instead of a
+        # canned animation loop.
+        self._plate_thickness = 0.04
+        # Plate height (y span) and depth (z span). Bunny in this scene
+        # uses scale=1.2 by default and its bbox is roughly that tall, so
+        # we make the plate substantially taller so it reads as a tall
+        # piece of glass even when the bunny stretches under squash.
+        self._plate_half_y = float(args.plate_height) * 0.5
+        self._plate_half_z = float(args.bunny_scale) * 1.5
+        # Allowed slider range, in metres (full distance between the
+        # inner faces — so 0 is "the plates touch"). The slider's max sits
+        # well outside the bunny so the starting state is fully open.
+        self._plate_min_distance = float(args.plate_min_distance)
+        self._plate_max_distance = float(args.bunny_scale) * 2.2
+        self._plate_initial_distance = self._plate_max_distance
+        # Plate vertical centre: keep it at the bunny's centre height so
+        # the squash band lines up with the body even after we make the
+        # plates much taller than before.
+        self._plate_center_y = float(args.bunny_drop_y)
+
+        # Bind one PLANE_CONTACT per surface vertex per plate. The
+        # surface_verts list is the tet-mesh boundary; deform.bodies is
+        # indexed the same way as the tet vertex array.
+        self._plate_left_handles: list = []
+        self._plate_right_handles: list = []
+        start_inner_x = 0.5 * self._plate_initial_distance
+        for sv in self.deform.tet.surface_verts:
+            body = self.deform.bodies[int(sv)]
+            self._plate_left_handles.append(
+                self.solver.add_plane_contact(
+                    body, normal=(1.0, 0.0, 0.0),
+                    offset=-start_inner_x,
+                )
+            )
+            self._plate_right_handles.append(
+                self.solver.add_plane_contact(
+                    body, normal=(-1.0, 0.0, 0.0),
+                    offset=-start_inner_x,
+                )
+            )
+        # Spawn the glass visuals. viser's add_box accepts opacity for
+        # standard-shader transparency.
+        half_t = 0.5 * self._plate_thickness
+        self._plate_left_handle_vis = self.server.scene.add_box(
+            "/plate_left",
+            dimensions=(self._plate_thickness,
+                        2.0 * self._plate_half_y,
+                        2.0 * self._plate_half_z),
+            position=(-(start_inner_x + half_t), self._plate_center_y, 0.0),
+            color=(170, 220, 255),
+            opacity=0.35,
+        )
+        self._plate_right_handle_vis = self.server.scene.add_box(
+            "/plate_right",
+            dimensions=(self._plate_thickness,
+                        2.0 * self._plate_half_y,
+                        2.0 * self._plate_half_z),
+            position=(+(start_inner_x + half_t), self._plate_center_y, 0.0),
+            color=(170, 220, 255),
+            opacity=0.35,
+        )
+
         # First render: surface mesh + vertex point cloud
         self._mesh_handle = None
         self._points_handle = None
@@ -805,10 +913,16 @@ class DeformableViewer:
                 "pause", initial_value=False)
             self.gui_iters = self.server.gui.add_slider(
                 "iterations", 1, 40, step=1,
-                initial_value=int(args.iterations))
+                initial_value=bunny_iters,
+                hint="AVBD primal/dual iterations per substep. Paper "
+                     "default is 4. Combined with the substep count "
+                     "(--substeps, default 8) this gives 32 effective "
+                     "work iters per visual frame.")
             self.gui_gravity = self.server.gui.add_slider(
                 "gravity (m/s²)", -30.0, 0.0, step=0.5,
-                initial_value=-9.81)
+                initial_value=0.0,
+                hint="0 by default in the bunny demo so the plate squash "
+                     "reads cleanly. Slide down to re-enable gravity.")
             self.gui_edge_k = self.server.gui.add_slider(
                 "edge stiffness (×1e4)", 0.1, 50.0, step=0.1,
                 initial_value=float(args.edge_stiffness) / 1e4,
@@ -816,6 +930,22 @@ class DeformableViewer:
                      "clamps each constraint's penalty to this ceiling. "
                      "Higher = stiffer body, more iterations needed to "
                      "converge.")
+            self.gui_vol_k = self.server.gui.add_slider(
+                "volume stiffness (×1e3)", 0.05, 30.0, step=0.05,
+                initial_value=self._bunny_vol_k / 1e3,
+                hint="Per-tet TET_VOLUME constraint stiffness — how hard "
+                     "the bunny resists compression. Lower this if you "
+                     "see plate-contact penetration during a tight "
+                     "squash; raise it for a stiffer rubbery body.")
+            self.gui_plate_distance = self.server.gui.add_slider(
+                "plate distance (m)",
+                self._plate_min_distance,
+                self._plate_max_distance,
+                step=0.01,
+                initial_value=self._plate_initial_distance,
+                hint="Inner-face gap between the two glass plates. Slide "
+                     "down to squash the bunny; slide back up to release. "
+                     "0 = plates touch at the centre.")
         with self.server.gui.add_folder("Rendering"):
             self.gui_show_mesh = self.server.gui.add_checkbox(
                 "show bunny mesh (high-res, skinned)",
@@ -887,6 +1017,8 @@ class DeformableViewer:
         self.gui_iters.on_update(self._iters_changed)
         self.gui_gravity.on_update(self._gravity_changed)
         self.gui_edge_k.on_update(self._edge_k_changed)
+        self.gui_vol_k.on_update(self._vol_k_changed)
+        self.gui_plate_distance.on_update(self._plate_distance_changed)
 
         self._frame = 0
         self._step_ms_window: list[float] = []
@@ -946,7 +1078,13 @@ class DeformableViewer:
                     vertices=render_verts,
                     faces=render_tris,
                     color=(220, 195, 175),  # warm parchment
-                    side="front",
+                    # The Stanford bunny has an open bottom (the original
+                    # scan didn't capture the base). With front-only culling
+                    # the camera ray enters the front and exits through that
+                    # hole onto the background, making the lower body look
+                    # transparent. Double-sided rendering draws the inside
+                    # of the front face too, so the silhouette stays closed.
+                    side="double",
                 )
                 if wireframe:
                     mesh_kwargs["wireframe"] = True
@@ -1001,6 +1139,11 @@ class DeformableViewer:
             self.solver.c_penalty = self._wp_scalar(np.ones(n_c, dtype=np.float32))
             n = len(self.solver._constraints)
             self.solver.c_active = self._wp_int(np.ones(n, dtype=np.int32))
+            # Snap plates back to fully open and reset the slider so the
+            # bunny re-settles without being trapped by a half-closed
+            # plate from the previous run.
+            self.gui_plate_distance.value = self._plate_initial_distance
+            self._apply_plate_distance(self._plate_initial_distance)
         self._frame = 0
 
     def _wp_scalar(self, arr: np.ndarray):
@@ -1028,13 +1171,68 @@ class DeformableViewer:
                 self.solver._constraints[h.index].stiffness = new_k
             self.solver._dirty = True
 
+    def _vol_k_changed(self, _evt):
+        """Live-update the per-tet volume preservation stiffness. Writes
+        directly to the GPU `tet_stiffness` array so the slider responds
+        without a _flush rebuild. AVBD clamps each tet's penalty to this
+        ceiling at the next warmstart, so lowering this softens the body
+        within one frame.
+        """
+        new_k = float(self.gui_vol_k.value) * 1e3
+        with self._solver_lock:
+            self.solver._flush()
+            if self.solver.tet_stiffness is None:
+                return
+            n_t = int(self.solver.tet_stiffness.shape[0])
+            import warp as wp
+            self.solver.tet_stiffness = wp.array(
+                np.full(n_t, new_k, dtype=np.float32),
+                dtype=float, device=self.solver.device)
+
+    # ----- plate squash (manual slider) ----------------------------------
+    def _apply_plate_distance(self, distance: float) -> None:
+        """Push the slider-set inner-face separation into both the
+        constraint pool (so the bunny gets pushed) and the viser visuals
+        (so the glass tracks). Distance is the total gap between the two
+        inner faces — half of it is the per-side x offset.
+        """
+        x_inner = 0.5 * max(float(distance), 0.0)
+        # Left plate normal=(+1,0,0): C = x − (−x_inner) ≥ 0 → x ≥ −x_inner.
+        # Right plate normal=(−1,0,0): C = −x − (−x_inner) ≥ 0 → x ≤ +x_inner.
+        self.solver.set_plane_contact_bulk(
+            self._plate_left_handles, offset=-x_inner)
+        self.solver.set_plane_contact_bulk(
+            self._plate_right_handles, offset=-x_inner)
+        # Box centre sits half-thickness outside the inner face so the
+        # visible glass surface aligns with the constraint plane.
+        half_t = 0.5 * self._plate_thickness
+        self._plate_left_handle_vis.position = (
+            -(x_inner + half_t), self._plate_center_y, 0.0)
+        self._plate_right_handle_vis.position = (
+            +(x_inner + half_t), self._plate_center_y, 0.0)
+
+    def _plate_distance_changed(self, _evt):
+        with self._solver_lock:
+            self._apply_plate_distance(float(self.gui_plate_distance.value))
+
     # ----- tick -----------------------------------------------------------
     def tick(self):
         if self.gui_pause.value:
             return
         with self._solver_lock:
+            # Manually substep the 3-DOF solver: each visual frame breaks
+            # into N AVBD substeps of dt/N. Plate-contact penetration at
+            # iterations=4 disappears with 8 substeps because the penalty
+            # has 8× as many chances to grow per visual frame.
+            full_dt = self.solver.dt
+            sub_dt = full_dt / float(self._bunny_substeps)
             t0 = time.perf_counter()
-            self.solver.step()
+            self.solver.dt = sub_dt
+            try:
+                for _ in range(self._bunny_substeps):
+                    self.solver.step()
+            finally:
+                self.solver.dt = full_dt
             dt = time.perf_counter() - t0
             pos = self.solver.positions().copy()
         # Refresh mesh + points
@@ -1115,6 +1313,15 @@ def main():
     p.add_argument("--bunny-scale", type=float, default=1.2,
                    help="World-space scale of the bunny (unit-bbox before "
                         "scaling).")
+    p.add_argument("--plate-height", type=float, default=4.0,
+                   help="Total height (y-span) of each glass plate, in "
+                        "metres. Default 4.0 so the plates clearly extend "
+                        "above and below the bunny even during the squash.")
+    p.add_argument("--plate-min-distance", type=float, default=0.0,
+                   help="Smallest inner-face gap reachable by the GUI "
+                        "slider, in metres. 0 lets the plates fully meet "
+                        "at the centre; raise this if you want to cap how "
+                        "hard the bunny can be squashed.")
     p.add_argument("--bunny-drop-y", type=float, default=1.5,
                    help="Initial y-centre of the bunny. The bunny falls "
                         "from here onto the floor at y=0.")
@@ -1128,11 +1335,72 @@ def main():
                         "pancaking under floor contact. Too high → contact "
                         "instability; 1e4 is a reasonable default for the "
                         "rubber-bunny look. Set to 0 to disable.")
+    p.add_argument("mode", nargs="?", default="interactive",
+                   choices=("interactive", "headless"),
+                   help="`interactive` (default) opens the viser browser viewer; "
+                        "`headless` skips rendering and prints a benchmark "
+                        "summary (avg step time, broadphase ms, body / row "
+                        "counts, color count). Used for parity + perf checks "
+                        "in CI and when comparing against the AVBD paper.")
+    p.add_argument("--headless-warmup", type=int, default=5,
+                   help="Headless-mode warmup frames (excluded from timing).")
+    p.add_argument("--headless-frames", type=int, default=30,
+                   help="Headless-mode timed frames.")
     args = p.parse_args()
+    if args.mode == "headless":
+        run_headless(args)
+        return
     if args.deformable_bunny:
         DeformableViewer(args).run()
     else:
         Viewer(args).run()
+
+
+def run_headless(args) -> None:
+    """Benchmark the default rigid scene with no rendering or server. Mirrors
+    the build_scene() output used by the interactive viewer so numbers are
+    directly comparable. See AVBD_PERFORMANCE_GAP.md for context."""
+    import time
+
+    solver, boxes, _ = build_scene(args)
+    n_b = len(boxes)
+    print(f"bodies:           {n_b}")
+    print(f"static rows:      {len(solver._rows)}")
+    print(f"device:           {solver.device}")
+    print(f"substeps:         {solver.substeps}")
+    print(f"iterations:       {solver.iterations}")
+    print(f"post_stabilize:   {solver.post_stabilize}")
+
+    # Trigger the one-time _flush + JIT compile inside the warmup window.
+    for _ in range(args.headless_warmup):
+        solver.step()
+    print(f"colors:           {solver.num_colors}")
+    print(f"total rows (cap): {solver._gpu_pool_n_capacity}")
+
+    n = max(1, int(args.headless_frames))
+    step_times = []
+    bp_times = []
+    t0_all = time.perf_counter()
+    for _ in range(n):
+        t0 = time.perf_counter()
+        solver.step()
+        step_times.append((time.perf_counter() - t0) * 1000.0)
+        bp_times.append(solver.broadphase_ms)
+    total_ms = (time.perf_counter() - t0_all) * 1000.0
+
+    step_times.sort()
+    avg = sum(step_times) / len(step_times)
+    p50 = step_times[len(step_times) // 2]
+    p95 = step_times[min(len(step_times) - 1, int(0.95 * len(step_times)))]
+    bp_avg = sum(bp_times) / len(bp_times)
+
+    n_active = int(solver.n_active_rows.numpy()[0])
+    print(f"active rows:      {n_active}")
+    print(f"avg step time:    {avg:.2f} ms")
+    print(f"p50 step time:    {p50:.2f} ms")
+    print(f"p95 step time:    {p95:.2f} ms")
+    print(f"avg broadphase:   {bp_avg:.2f} ms")
+    print(f"total {n} frames: {total_ms:.1f} ms")
 
 
 if __name__ == "__main__":
