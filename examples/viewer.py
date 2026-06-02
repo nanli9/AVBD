@@ -178,7 +178,9 @@ class Viewer:
 
         self.solver, self.boxes, self.pin_rows = build_scene(args)
 
-        # ground plane
+        # ground plane. Grid sits 1mm above the box top so the two
+        # surfaces don't Z-fight under camera motion (the ground box's
+        # top face is at y=0 and the grid defaults to y=0 too).
         self.server.scene.add_box(
             "/ground",
             dimensions=(8.0, 0.05, 8.0),
@@ -187,6 +189,7 @@ class Viewer:
         )
         self.server.scene.add_grid(
             "/grid", width=8.0, height=8.0, cell_size=0.5, plane="xz",
+            position=(0.0, 0.001, 0.0),
         )
 
         # body primitives
@@ -835,7 +838,8 @@ class DeformableViewer:
               f"edges={len(self.deform.edge_constraints)}  "
               f"surface_tris={len(self.deform.tet.surface_tris)}")
 
-        # Static scene: ground + grid
+        # Static scene: ground + grid. Grid sits 1mm above the box top
+        # to avoid Z-fighting (both surfaces are at y=0 otherwise).
         self.server.scene.add_box(
             "/ground",
             dimensions=(8.0, 0.05, 8.0),
@@ -844,6 +848,7 @@ class DeformableViewer:
         )
         self.server.scene.add_grid(
             "/grid", width=8.0, height=8.0, cell_size=0.5, plane="xz",
+            position=(0.0, 0.001, 0.0),
         )
 
         # ---- Two transparent glass plates that squash the bunny ----------
