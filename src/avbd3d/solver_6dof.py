@@ -305,8 +305,10 @@ class Solver6DOF:
         self._spatial_cell_size = 0.0
         # One-shot warning gate for row-pool overflow on dense clusters.
         self._row_overflow_warned = False
-        # Live-contact-graph coloring fingerprint — set by _maybe_recolor.
-        # `None` means "first substep, run the recolor unconditionally".
+        # Vestigial fingerprint from round-2 host-side coloring; round-3
+        # moved coloring fully to GPU and no longer reads it. Retained
+        # only because read_state_batched / external diagnostics may
+        # check the field.
         self._color_topology_sig: int | None = None
         # CUDA-graph cache for the per-substep kernel sequence (Phase B).
         # `None` means "recapture on next step" (also the CPU fallback).
@@ -472,75 +474,99 @@ class Solver6DOF:
         self._mf_off_ref = wp.zeros(cap * 4, dtype=wp.vec3, device=dev)
         self._mf_off_inc = wp.zeros(cap * 4, dtype=wp.vec3, device=dev)
 
-    def _maybe_recolor(self, n_active: int) -> None:
-        """Rebuild body coloring from the substep's live contact graph.
+    def _gpu_recolor(self, n_b: int, dev) -> None:
+        """Device-side body coloring (round 3 §A). Builds the body-body
+        adjacency CSR from the live `c_body_a` / `c_body_b` set written
+        by `_gpu_emit_dynamic_contacts`, runs Jones–Plassmann for
+        JP_ROUNDS rounds, then bucket-sorts bodies into `color_bodies` /
+        `color_starts`.
 
-        Coloring correctness requires the adjacency to match the constraint
-        set the primal sweep will see. Any static approximation (static
-        rows, inflated initial AABBs, parity hash) is structurally unsound
-        for a simulation where bodies move and new contacts form: two
-        bodies whose initial AABBs do not overlap can still collide later
-        and race in the per-color update.
-
-        Topology-hash short-circuit: when the (a, b) adjacency is unchanged
-        from the previous substep (the common case for settled stacks) we
-        skip the recolor — it stays a free no-op."""
-        if n_active <= 0:
+        No host-side readbacks; all of body_color, color_starts,
+        color_bodies live on the device. The host-side `num_colors` is
+        an upper bound (`MAX_COLORS`), not the achieved count — the
+        primal launch loop unrolls to MAX_COLORS and empty colors no-op
+        via a device-side bounds check."""
+        if n_b < 1:
             return
-        n_b = len(self._x)
-        if n_b < 2:
-            return
-        # Readback shares the bus with the n_active_rows readback we
-        # already do for overflow detection.
-        ba_full = self.c_body_a.numpy()
-        bb_full = self.c_body_b.numpy()
-        ct_full = self.c_type.numpy()
-        ba = ba_full[:n_active]
-        bb = bb_full[:n_active]
-        ct = ct_full[:n_active]
-        # PIN_6DOF re-uses c_body_b as an axis id (not a body), and
-        # negative indices encode "world / no second body".
-        mask = ((ct != PIN_6DOF) & (ba >= 0) & (bb >= 0) & (ba != bb))
-        a_edges = ba[mask].astype(np.int64, copy=False)
-        b_edges = bb[mask].astype(np.int64, copy=False)
-        if a_edges.size == 0:
-            # No body-body edges this substep — every body is its own
-            # color class. Leave coloring alone; the static seed from
-            # _flush is already a valid partition.
-            sig = 0
-        else:
-            # Canonical (min, max) packed into one int64 → topology key.
-            lo_e = np.minimum(a_edges, b_edges)
-            hi_e = np.maximum(a_edges, b_edges)
-            canon = np.sort((lo_e << 32) | hi_e)
-            sig = hash(canon.tobytes())
-        if sig == self._color_topology_sig:
-            return
-        self._color_topology_sig = sig
-
-        adj = build_body_edges(n_b, a_edges.tolist(), b_edges.tolist())
-        color_np = greedy_color(adj)
-        new_num_colors = int(color_np.max() + 1) if n_b > 0 else 0
-        color_bodies_np = np.argsort(color_np, kind="stable").astype(np.int32)
-        counts = np.bincount(
-            color_np, minlength=max(new_num_colors, 1)).astype(np.int32)
-        offsets = np.zeros(new_num_colors + 1, dtype=np.int32)
-        offsets[1:] = np.cumsum(counts[:new_num_colors])
-
-        dev = self.device
-        # Reuse the existing body_color Warp array (size n_b is fixed
-        # across substeps) but rebuild color_bodies on size change.
-        self.body_color.assign(color_np)
-        if (self.color_bodies is None
-                or self.color_bodies.shape[0] != color_bodies_np.shape[0]):
-            self.color_bodies = wp.array(color_bodies_np, dtype=int, device=dev)
-        else:
-            self.color_bodies.assign(color_bodies_np)
-        self._color_offsets_np = offsets
-        self.num_colors = new_num_colors
-        self.color_counts = color_summary(color_np)
-        # Per-color launch shape changed → invalidate any cached CUDA graph.
-        self._graph = None
+        max_colors = self._max_colors
+        # 1. Reset per-body counts + color sentinel + per-color histogram.
+        reset_dim = max(n_b, max_colors)
+        wp.launch(
+            K.gpu_body_adj_reset, dim=reset_dim,
+            inputs=[self.body_neighbor_counts,
+                    self.body_neighbor_cursor,
+                    self.body_color,
+                    self.color_counts_dev],
+            device=dev,
+        )
+        # 2. Histogram neighbor counts (per active row).
+        wp.launch(
+            K.gpu_body_adj_count, dim=self._gpu_pool_n_capacity,
+            inputs=[self.n_active_rows, self.c_type,
+                    self.c_body_a, self.c_body_b,
+                    self.body_neighbor_counts],
+            device=dev,
+        )
+        # 3. Prefix-sum counts → starts (reuse the CSR scan).
+        wp.launch(
+            K.gpu_csr_starts_from_counts, dim=1,
+            inputs=[self.body_neighbor_counts,
+                    self.body_neighbor_starts, n_b],
+            device=dev,
+        )
+        # 4. Scatter neighbor body ids into the CSR.
+        wp.launch(
+            K.gpu_body_adj_scatter, dim=self._gpu_pool_n_capacity,
+            inputs=[self.n_active_rows, self.c_type,
+                    self.c_body_a, self.c_body_b,
+                    self.body_neighbor_starts,
+                    self.body_neighbor_cursor,
+                    self.body_neighbor_indices],
+            device=dev,
+        )
+        # 5. Jones–Plassmann rounds. Each round colors one independent
+        # set; bounded loop fits cleanly inside graph capture.
+        jp_rounds = int(K.JP_ROUNDS.val) if hasattr(K.JP_ROUNDS, "val") \
+            else int(K.JP_ROUNDS)
+        for _ in range(jp_rounds):
+            wp.launch(
+                K.gpu_color_round, dim=n_b,
+                inputs=[self.body_priority,
+                        self.body_neighbor_starts,
+                        self.body_neighbor_counts,
+                        self.body_neighbor_indices,
+                        self.body_color],
+                device=dev,
+            )
+        # 6. Catch leftover uncolored bodies (very dense / tied graphs).
+        wp.launch(
+            K.gpu_color_finalize, dim=n_b,
+            inputs=[self.body_color], device=dev,
+        )
+        # 7. Bincount body_color → color_counts_dev.
+        wp.launch(
+            K.gpu_color_counts_bin, dim=n_b,
+            inputs=[self.body_color, self.color_counts_dev],
+            device=dev,
+        )
+        # 8. Prefix-sum color_counts → color_starts.
+        wp.launch(
+            K.gpu_csr_starts_from_counts, dim=1,
+            inputs=[self.color_counts_dev, self.color_starts, max_colors],
+            device=dev,
+        )
+        # 9. Reset color_cursor (reuse the start of color_counts_dev as
+        # the cursor — both have shape [max_colors]). We can't safely
+        # reuse color_counts_dev itself (still needed for the start
+        # indices), so zero color_cursor explicitly.
+        self.color_cursor.zero_()
+        # 10. Bucket-sort bodies into color_bodies.
+        wp.launch(
+            K.gpu_color_bodies_scatter, dim=n_b,
+            inputs=[self.body_color, self.color_starts,
+                    self.color_cursor, self.color_bodies],
+            device=dev,
+        )
 
     # ---- Runtime perturbations ---------------------------------------------
 
@@ -654,49 +680,50 @@ class Solver6DOF:
         self.inv_inertia_world = wp.zeros(n_b, dtype=wp.mat33, device=dev)
         self.inertia_world = wp.zeros(n_b, dtype=wp.mat33, device=dev)
 
-        # Body coloring — initial seed only. Edges from static body-body
-        # rows (e.g. floor/PIN don't qualify); the *runtime* coloring is
-        # rebuilt each substep by `_maybe_recolor` from the live
-        # `c_body_a` / `c_body_b` set after broadphase fills the dynamic
-        # region. Static seeding here gives the first substep a sane
-        # `num_colors` before the runtime recolor takes over.
+        # Body coloring — fully device-side via Jones–Plassmann (round 3).
+        # All coloring state lives on the GPU; the host only generates the
+        # one-shot random priority array at flush, then never reads body
+        # color or color_offsets back. `_step_one` launches the device
+        # coloring sequence each substep before the primal sweep.
         # spatial_8color() is intentionally NOT used — it can assign the
         # same color to two bodies that share a grid cell, violating the
         # Gauss-Seidel independence invariant.
+        max_colors = int(K.MAX_COLORS.val) if hasattr(K.MAX_COLORS, "val") \
+            else int(K.MAX_COLORS)
+        self._max_colors = max_colors
+        # Deterministic per-body priorities. Fixed across substeps so the
+        # device coloring is graph-capture-stable for a given contact set
+        # — bodies with the same neighborhood get the same color frame to
+        # frame, which keeps color_starts stable and lets the captured
+        # graph replay correctly.
         if n_b > 0:
-            body_body_a = [r.body_a for r in self._rows
-                           if r.type == BOX_BOX_CONTACT_6DOF]
-            body_body_b = [r.body_b for r in self._rows
-                           if r.type == BOX_BOX_CONTACT_6DOF]
-            adj = build_body_edges(n_b, body_body_a, body_body_b)
-            color_np = greedy_color(adj)
+            rng = np.random.default_rng(seed=0xA5BD)
+            prio_np = rng.uniform(0.0, 1.0, size=n_b).astype(np.float32)
         else:
-            color_np = np.zeros(0, dtype=np.int32)
-        # Reset the topology fingerprint so the first substep recolor
-        # always runs against the live contact graph.
+            prio_np = np.zeros(0, dtype=np.float32)
+        self.body_priority = wp.array(prio_np, dtype=float, device=dev)
+        # Body color (sentinel -1 = uncolored). Reset each substep.
+        self.body_color = wp.full(max(n_b, 1), -1, dtype=int, device=dev)
+        # Adjacency CSR built each substep from live contact graph.
+        # body_neighbor_indices upper-bounded by 2·n_cap (every row
+        # contributes one edge in each direction).
+        self.body_neighbor_counts = wp.zeros(max(n_b, 1), dtype=int, device=dev)
+        self.body_neighbor_starts = wp.zeros(max(n_b + 1, 2), dtype=int,
+                                              device=dev)
+        self.body_neighbor_cursor = wp.zeros(max(n_b, 1), dtype=int, device=dev)
+        self.body_neighbor_indices = wp.zeros(max(2 * n_cap, 1), dtype=int,
+                                               device=dev)
+        # Per-color histograms / buckets. Sized to MAX_COLORS once.
+        self.color_counts_dev = wp.zeros(max_colors, dtype=int, device=dev)
+        self.color_starts = wp.zeros(max_colors + 1, dtype=int, device=dev)
+        self.color_cursor = wp.zeros(max_colors, dtype=int, device=dev)
+        self.color_bodies = wp.zeros(max(n_b, 1), dtype=int, device=dev)
+        # Host-side metadata (no readbacks — kept only for the existing
+        # diagnostic API surface; .num_colors is the upper bound, not the
+        # actual achieved count).
+        self.num_colors = max_colors
+        self.color_counts = {}
         self._color_topology_sig = None
-        self.num_colors = int(color_np.max() + 1) if n_b > 0 else 0
-        self.color_counts = color_summary(color_np)
-        self.body_color = wp.array(color_np, dtype=int, device=dev)
-
-        # Build the per-color body bucket arrays the primal kernel indexes
-        # into. `color_bodies` is body ids sorted by color (stable);
-        # `color_offsets[c..c+1]` is the slice for color c. Each per-color
-        # primal launch uses dim = bucket size and color_offsets[c] as the
-        # base offset, so the kernel does no per-thread color filtering and
-        # launches no wasted threads.
-        if n_b > 0:
-            color_bodies_np = np.argsort(color_np, kind="stable").astype(np.int32)
-            color_counts_np = np.bincount(
-                color_np, minlength=max(self.num_colors, 1)
-            ).astype(np.int32)
-            color_offsets_np = np.zeros(self.num_colors + 1, dtype=np.int32)
-            color_offsets_np[1:] = np.cumsum(color_counts_np[: self.num_colors])
-        else:
-            color_bodies_np = np.zeros(0, dtype=np.int32)
-            color_offsets_np = np.zeros(1, dtype=np.int32)
-        self.color_bodies = wp.array(color_bodies_np, dtype=int, device=dev)
-        self._color_offsets_np = color_offsets_np
 
         # ---- c_* arrays at fixed capacity (no per-substep realloc) ---------
         # Static prefix [0, n_static) seeded from self._rows; dynamic
@@ -886,9 +913,14 @@ class Solver6DOF:
                 self._grow_row_pool(max(2 * self._gpu_pool_n_dyn_capacity,
                                           (n_active_raw - n_static) * 2))
             n_active = min(n_active_raw, cap)
-            # Live-contact-graph recolor (round 2 §1). Must run before the
-            # CSR build below uses self.color_bodies / _color_offsets_np.
-            self._maybe_recolor(n_active)
+
+        # Device-side body recolor (round 3 §A). Runs unconditionally so
+        # bodies without contacts (static scenes, single-body free fall)
+        # still get color 0 — the primal launch needs *some* color
+        # partition or its early-exit drops every body. With zero
+        # body-body edges the JP rounds settle in one pass (all bodies
+        # win, all pick color 0).
+        self._gpu_recolor(n_b, dev)
 
         # Post-Phase-A: row-side launches all use fixed dim=row_dim with
         # device-side bounds via `self.n_active_rows[0]`. Lets the inner
@@ -1001,18 +1033,22 @@ class Solver6DOF:
     def _current_graph_signature(self) -> tuple:
         """Snapshot of every Python-side scalar the capture region bakes
         into the recorded launches. Any change here means the cached
-        graph is stale and must be recaptured."""
+        graph is stale and must be recaptured.
+
+        With device-side coloring (round 3) the color partition lives in
+        `self.color_starts` / `self.color_bodies` on the GPU, so
+        per-color launch dims and bases are no longer Python ints — the
+        graph stays valid across topology changes without recapture."""
         return (
             int(self.iterations),
             int(self.post_stabilize),
-            int(self.num_colors),
+            int(self._max_colors),
             float(self.dt),
             float(self.alpha),
             float(self.beta),
             float(self.gamma),
             float(self.max_linear_speed),
             float(self.max_angular_speed),
-            tuple(self._color_offsets_np.tolist()),
         )
 
     def _graph_cuda_supported(self) -> bool:
@@ -1059,13 +1095,13 @@ class Solver6DOF:
                     device=dev,
                 )
 
-            for color_id in range(self.num_colors):
-                base = int(self._color_offsets_np[color_id])
-                count = int(self._color_offsets_np[color_id + 1]) - base
-                if count <= 0:
-                    continue
+            # Per-color primal launch — unrolled to MAX_COLORS so the
+            # launch count is fixed at graph-capture time. Empty colors
+            # no-op via the kernel's `tid >= end - base` early-exit
+            # (round 3 §A). `color_starts` is device-resident.
+            for color_id in range(self._max_colors):
                 wp.launch(
-                    K.primal_update_6dof, dim=count,
+                    K.primal_update_6dof, dim=n_b,
                     inputs=[self.x, self.q, self.mass,
                             self.inv_inertia_world, self.inertia_world,
                             self.x_inertial, self.q_inertial,
@@ -1078,7 +1114,8 @@ class Solver6DOF:
                             self.c_sibling, self.c_friction,
                             self.c_friction_static, self.c_was_static,
                             self.body_con_starts, self.body_con_indices,
-                            self.color_bodies, base, self.dt],
+                            self.color_starts, self.color_bodies,
+                            color_id, self.dt],
                     device=dev,
                 )
 

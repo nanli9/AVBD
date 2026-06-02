@@ -342,16 +342,21 @@ def primal_update_6dof(
     # adjacency
     body_con_starts: wp.array(dtype=int),
     body_con_indices: wp.array(dtype=int),
+    # Device-side color partition (round 3 §A). `color_bodies` is the
+    # body-id permutation bucket-sorted by color; `color_starts[c..c+1]`
+    # is the slice for color `c`. Launched at fixed dim=n_b for every
+    # color; threads past this color's slice early-return.
+    color_starts: wp.array(dtype=int),
     color_bodies: wp.array(dtype=int),
-    color_offset: int,
+    color_id: int,
     dt: float,
 ):
-    # color_bodies is the body-id permutation sorted by color; the launcher
-    # picks the slice for this color and launches at its size, so every
-    # thread maps to exactly one body in this color class (no wasted
-    # threads on bodies of the wrong color, no per-thread color filter).
-    # color_offset is the start of this color in color_bodies.
-    i = color_bodies[color_offset + wp.tid()]
+    tid = wp.tid()
+    base = color_starts[color_id]
+    end = color_starts[color_id + 1]
+    if tid >= end - base:
+        return
+    i = color_bodies[base + tid]
     m = mass[i]
     if m <= 0.0:
         return
@@ -1698,6 +1703,14 @@ def viewer_pack_rows_6dof(
 
 HASH_EMPTY = wp.constant(-1)
 GPU_POOL_C_PER_PAIR = wp.constant(4)
+# Upper bound on colors emitted by the device-side Jones-Plassmann
+# coloring. The primal-update loop unrolls to this many launches per
+# iteration; empty colors no-op via a device-side bounds check. Sized to
+# cover dense pile-ups (typical contact graphs need ≤16 colors).
+MAX_COLORS = wp.constant(32)
+# Jones-Plassmann rounds per substep. Each round colors one independent
+# set; the loop is bounded by ~log(n_b) for typical graphs.
+JP_ROUNDS = wp.constant(24)
 
 
 @wp.func
@@ -2108,3 +2121,207 @@ def gpu_pool_hash_collect(
             hash_state[base + 6] = float(was_t)
             hash_state[base + 7] = float(was_b)
             return
+
+
+# =========================================================================
+# Device-side body coloring (Jones–Plassmann parallel coloring).
+# =========================================================================
+# Rationale: round-1 coloring was static (initial AABB graph) and could
+# race once moving bodies collided. Round-2 lifted that by recoloring
+# each substep, but did so on the host with three full .numpy()
+# transfers — breaking GPU-residency. Round-3 rebuilds the body-body
+# adjacency CSR from the live `c_body_a`/`c_body_b` set and runs
+# Jones–Plassmann device-side. No per-substep readbacks.
+#
+# Per substep the host launches, in order:
+#   1. gpu_body_adj_reset           — zero counts/starts, mark all uncolored
+#   2. gpu_body_adj_count           — atomic histogram (per active row)
+#   3. gpu_csr_starts_from_counts   — single-thread serial scan (reused)
+#   4. gpu_body_adj_scatter         — atomic scatter of neighbor body ids
+#   5. gpu_color_round × JP_ROUNDS  — one Jones–Plassmann round each
+#   6. gpu_color_counts_bin         — bincount body_color → color_counts
+#   7. gpu_csr_starts_from_counts   — prefix sum → color_starts (reused)
+#   8. gpu_color_bodies_scatter     — bucket-sort body ids into color_bodies
+# All of these are fixed-dim launches that capture cleanly into a CUDA
+# graph; the priorities are uploaded once at _flush so the per-substep
+# coloring is deterministic and graph-replay-safe.
+
+
+@wp.kernel
+def gpu_body_adj_reset(
+    body_neighbor_counts: wp.array(dtype=int),
+    body_neighbor_cursor: wp.array(dtype=int),
+    body_color: wp.array(dtype=int),
+    color_counts: wp.array(dtype=int),
+):
+    """Zero per-body neighbor counts (input to the atomic histogram),
+    zero the per-body scatter cursor, and mark every body uncolored
+    (sentinel = -1). Launched at dim=max(n_b, MAX_COLORS) so the same
+    kernel also zeros the color_counts histogram in the same pass.
+
+    Threads 0..MAX_COLORS-1 zero the per-color count. Threads
+    0..n_b-1 zero the per-body fields. Bounds-check both."""
+    tid = wp.tid()
+    if tid < color_counts.shape[0]:
+        color_counts[tid] = 0
+    if tid < body_neighbor_counts.shape[0]:
+        body_neighbor_counts[tid] = 0
+        body_neighbor_cursor[tid] = 0
+        body_color[tid] = -1
+
+
+@wp.kernel
+def gpu_body_adj_count(
+    n_active_rows: wp.array(dtype=int),
+    c_type: wp.array(dtype=int),
+    c_body_a: wp.array(dtype=int),
+    c_body_b: wp.array(dtype=int),
+    body_neighbor_counts: wp.array(dtype=int),
+):
+    """For every active row that names two distinct bodies, atomically
+    bump both bodies' neighbor counts. PIN_6DOF excluded (its c_body_b
+    is an axis id, not a body). May over-count when a body pair has
+    multiple contacts; that's fine — duplicates don't break the
+    coloring round (color-used masks are idempotent under duplicates)."""
+    j = wp.tid()
+    if j >= n_active_rows[0]:
+        return
+    if c_type[j] == PIN_6DOF:
+        return
+    a = c_body_a[j]
+    b = c_body_b[j]
+    if a < 0 or b < 0 or a == b:
+        return
+    wp.atomic_add(body_neighbor_counts, a, 1)
+    wp.atomic_add(body_neighbor_counts, b, 1)
+
+
+@wp.kernel
+def gpu_body_adj_scatter(
+    n_active_rows: wp.array(dtype=int),
+    c_type: wp.array(dtype=int),
+    c_body_a: wp.array(dtype=int),
+    c_body_b: wp.array(dtype=int),
+    body_neighbor_starts: wp.array(dtype=int),
+    body_neighbor_cursor: wp.array(dtype=int),
+    body_neighbor_indices: wp.array(dtype=int),
+):
+    """Symmetric scatter: each active row contributes (a, b) into a's
+    neighbor list and (b, a) into b's. Cursor is per-body atomic so
+    threads don't trample each other."""
+    j = wp.tid()
+    if j >= n_active_rows[0]:
+        return
+    if c_type[j] == PIN_6DOF:
+        return
+    a = c_body_a[j]
+    b = c_body_b[j]
+    if a < 0 or b < 0 or a == b:
+        return
+    slot_a = wp.atomic_add(body_neighbor_cursor, a, 1)
+    body_neighbor_indices[body_neighbor_starts[a] + slot_a] = b
+    slot_b = wp.atomic_add(body_neighbor_cursor, b, 1)
+    body_neighbor_indices[body_neighbor_starts[b] + slot_b] = a
+
+
+@wp.kernel
+def gpu_color_round(
+    body_priority: wp.array(dtype=float),
+    body_neighbor_starts: wp.array(dtype=int),
+    body_neighbor_counts: wp.array(dtype=int),
+    body_neighbor_indices: wp.array(dtype=int),
+    body_color: wp.array(dtype=int),
+):
+    """One Jones–Plassmann round.
+
+    Each thread = one body. If we are still uncolored AND no uncolored
+    neighbor has a higher priority than us, we win this round: pick the
+    smallest color not used by any already-colored neighbor.
+
+    Convergence: with random priorities and bounded max degree d, a
+    body's expected number of rounds to be colored is O(log n / log(d))
+    — typically ≤ 8 for contact graphs we see. JP_ROUNDS=24 is a
+    generous worst-case bound; uncolored bodies after that fall through
+    with color 0 (a final-pass fallback in gpu_color_finalize)."""
+    i = wp.tid()
+    if i >= body_color.shape[0]:
+        return
+    if body_color[i] != -1:
+        return
+    my_pri = body_priority[i]
+    start = body_neighbor_starts[i]
+    end = start + body_neighbor_counts[i]
+    # Defer this round if any uncolored neighbor has a higher priority.
+    for k in range(start, end):
+        nb = body_neighbor_indices[k]
+        if body_color[nb] == -1 and body_priority[nb] >= my_pri:
+            # Tie-break by index so the (very unlikely) priority tie
+            # doesn't deadlock the round.
+            if body_priority[nb] > my_pri or nb < i:
+                return
+    # We're the winner — pick the smallest color not used by any
+    # *already-colored* neighbor. Bitmask over [0, MAX_COLORS).
+    used_lo = wp.uint32(0)   # bits 0..31 — covers MAX_COLORS ≤ 32
+    for k in range(start, end):
+        nb = body_neighbor_indices[k]
+        c = body_color[nb]
+        if c >= 0 and c < int(MAX_COLORS):
+            used_lo = used_lo | (wp.uint32(1) << wp.uint32(c))
+    # Scan for lowest unset bit in used_lo.
+    chosen = int(MAX_COLORS) - 1
+    for c in range(int(MAX_COLORS)):
+        if (used_lo & (wp.uint32(1) << wp.uint32(c))) == wp.uint32(0):
+            chosen = c
+            break
+    body_color[i] = chosen
+
+
+@wp.kernel
+def gpu_color_finalize(
+    body_color: wp.array(dtype=int),
+):
+    """Catch any body that wasn't reached in JP_ROUNDS rounds — pin it
+    to color 0. Only matters for pathological graphs (e.g. a very dense
+    clique with many priority ties); the safety net keeps the partition
+    well-defined even in those cases. Such a body becomes a
+    constraint-correctness risk only if it shares an edge with another
+    color-0 body, which is unlikely-but-possible — log if measured."""
+    i = wp.tid()
+    if i >= body_color.shape[0]:
+        return
+    if body_color[i] == -1:
+        body_color[i] = 0
+
+
+@wp.kernel
+def gpu_color_counts_bin(
+    body_color: wp.array(dtype=int),
+    color_counts: wp.array(dtype=int),
+):
+    """Histogram body_color → color_counts via atomic_add."""
+    i = wp.tid()
+    if i >= body_color.shape[0]:
+        return
+    c = body_color[i]
+    if c >= 0 and c < color_counts.shape[0]:
+        wp.atomic_add(color_counts, c, 1)
+
+
+@wp.kernel
+def gpu_color_bodies_scatter(
+    body_color: wp.array(dtype=int),
+    color_starts: wp.array(dtype=int),
+    color_cursor: wp.array(dtype=int),
+    color_bodies: wp.array(dtype=int),
+):
+    """Bucket-sort: each body atomically claims a slot in its color's
+    range of color_bodies. After this, primal_update can iterate the
+    per-color slice via color_bodies[color_starts[c] + tid]."""
+    i = wp.tid()
+    if i >= body_color.shape[0]:
+        return
+    c = body_color[i]
+    if c < 0 or c >= color_cursor.shape[0]:
+        return
+    slot = wp.atomic_add(color_cursor, c, 1)
+    color_bodies[color_starts[c] + slot] = i
