@@ -303,6 +303,13 @@ class Solver6DOF:
         self.hash_state = None       # wp.array(float, hash_cap*8)
         # Spatial coloring cell size, set during _init_gpu_pool.
         self._spatial_cell_size = 0.0
+        # One-shot warning gate for row-pool overflow on dense clusters.
+        self._row_overflow_warned = False
+        # CUDA-graph cache for the per-substep kernel sequence (Phase B).
+        # `None` means "recapture on next step" (also the CPU fallback).
+        self._graph = None
+        # Cached probe: does this Warp build expose graph capture?
+        self._graph_supported: bool | None = None
 
     # ---- Scene building -----------------------------------------------------
 
@@ -456,6 +463,34 @@ class Solver6DOF:
         self._mf_off_ref = wp.zeros(cap * 4, dtype=wp.vec3, device=dev)
         self._mf_off_inc = wp.zeros(cap * 4, dtype=wp.vec3, device=dev)
 
+    def _add_aabb_neighbors_inflated(
+        self,
+        adj: list[set[int]],
+        positions: np.ndarray,
+        half_extents: np.ndarray,
+        inflate: float,
+    ) -> None:
+        """Add an edge to `adj[i]` for every pair (i,j) whose initial AABBs
+        overlap when each half-extent is inflated by `inflate`. The result
+        is a conservative superset of every body pair that could produce
+        a dynamic contact between flushes — used to seed the body-coloring
+        adjacency graph so the per-color primal sweep stays
+        Gauss-Seidel-correct even as the broadphase rediscovers contacts.
+
+        O(n_b²) but only runs in _flush, not the hot path."""
+        n = positions.shape[0]
+        if n < 2:
+            return
+        lo = positions - (half_extents + inflate)
+        hi = positions + (half_extents + inflate)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if (lo[i, 0] <= hi[j, 0] and hi[i, 0] >= lo[j, 0]
+                        and lo[i, 1] <= hi[j, 1] and hi[i, 1] >= lo[j, 1]
+                        and lo[i, 2] <= hi[j, 2] and hi[i, 2] >= lo[j, 2]):
+                    adj[i].add(j)
+                    adj[j].add(i)
+
     # ---- Runtime perturbations ---------------------------------------------
 
     def set_position(self, body: RigidBody, p: tuple[float, float, float]) -> None:
@@ -568,15 +603,34 @@ class Solver6DOF:
         self.inv_inertia_world = wp.zeros(n_b, dtype=wp.mat33, device=dev)
         self.inertia_world = wp.zeros(n_b, dtype=wp.mat33, device=dev)
 
-        # Body coloring — spatial 8-color (AVBD_PERFORMANCE_GAP §5). Cell
-        # size = 2× the max half-extent so any two cubes touching cube-to-
-        # cube fall in adjacent grid cells with different colors. Computed
-        # once at init; never recomputed for dynamic contacts.
+        # Body coloring — Welsh-Powell greedy over the body-adjacency graph.
+        # Edges come from (a) every static row (pin / floor contact rows
+        # that name two bodies — rare but possible) and (b) the initial-
+        # AABB-overlap predicate, inflated by 2× the max half-extent so any
+        # pair that could ever produce a dynamic contact this _flush cycle
+        # is already in the same conflict set. The conservative inflation
+        # is what keeps the per-color primal sweep safe even though the
+        # contact graph itself is rebuilt each substep on the GPU.
+        # spatial_8color() is intentionally NOT used here — it can assign
+        # the same color to two bodies that share a grid cell, violating
+        # the Gauss-Seidel independence invariant.
         if n_b > 0:
             max_he = float(max(max(he) for he in self._half_extents))
-            cell = max(2.0 * max_he, 1e-3)
-            self._spatial_cell_size = cell
-            color_np = spatial_8color(x_np, cell)
+            # Only BOX_BOX_CONTACT_6DOF rows (type 3) have body_b as a body
+            # index. PIN_6DOF (type 2) re-purposes body_b for the axis id, so
+            # feeding it to build_body_edges would IndexError on n_b. Static
+            # rows in self._rows are FLOOR / PIN / TANGENT — none body-body.
+            body_body_a = [r.body_a for r in self._rows
+                           if r.type == BOX_BOX_CONTACT_6DOF]
+            body_body_b = [r.body_b for r in self._rows
+                           if r.type == BOX_BOX_CONTACT_6DOF]
+            adj = build_body_edges(n_b, body_body_a, body_body_b)
+            if self._self_collide and n_b >= 2:
+                self._add_aabb_neighbors_inflated(
+                    adj, x_np, np.asarray(self._half_extents, dtype=np.float32),
+                    inflate=2.0 * max_he,
+                )
+            color_np = greedy_color(adj)
         else:
             color_np = np.zeros(0, dtype=np.int32)
         self.num_colors = int(color_np.max() + 1) if n_b > 0 else 0
@@ -706,6 +760,8 @@ class Solver6DOF:
         self._gpu_pool_max_pairs = max_pairs
         self._gpu_pool_ready = True
         self._dirty = False
+        # Layout changed → previous capture (if any) is invalid.
+        self._graph = None
 
     # ---- The step -----------------------------------------------------------
 
@@ -769,14 +825,37 @@ class Solver6DOF:
         if self._self_collide and n_b >= 2:
             self._gpu_emit_dynamic_contacts(n_b)
             # Single int readback — sizes the row-kernel launches below.
-            n_active = int(self.n_active_rows.numpy()[0])
+            # n_active_rows is the *reservation* counter; the kernel-side
+            # guard rejects contacts that would write past _gpu_pool_n_capacity
+            # but still bumps the counter. Clamp before using as a launch dim,
+            # and grow the c_* arrays next substep on overflow so the rejected
+            # contacts get a slot.
+            n_active_raw = int(self.n_active_rows.numpy()[0])
+            cap = self._gpu_pool_n_capacity
+            if n_active_raw > cap:
+                if not self._row_overflow_warned:
+                    import warnings
+                    warnings.warn(
+                        f"avbd3d row pool overflow: reserved {n_active_raw} "
+                        f"rows > capacity {cap}; growing for next substep. "
+                        "Tune solver._gpu_pool_n_dyn_capacity if frequent.",
+                        RuntimeWarning, stacklevel=2)
+                    self._row_overflow_warned = True
+                self._grow_row_pool(max(2 * self._gpu_pool_n_dyn_capacity,
+                                          (n_active_raw - n_static) * 2))
+            n_active = min(n_active_raw, cap)
+
+        # Post-Phase-A: row-side launches all use fixed dim=row_dim with
+        # device-side bounds via `self.n_active_rows[0]`. Lets the inner
+        # solve loop be CUDA-graph-captured (see Phase B below).
+        row_dim = self._gpu_pool_n_capacity
 
         # ---- 5. Rebuild body→constraint CSR adjacency on GPU ----
         # 3 passes: atomic histogram → serial scan → atomic scatter.
         # (Step 1 above already zeroed body_con_counts.)
         if n_active > 0:
             wp.launch(
-                K.gpu_csr_count, dim=n_active,
+                K.gpu_csr_count, dim=row_dim,
                 inputs=[self.n_active_rows, self.c_type,
                         self.c_body_a, self.c_body_b, self.body_con_counts],
                 device=dev,
@@ -788,7 +867,7 @@ class Solver6DOF:
             )
             wp.copy(self.body_con_cursor, self.body_con_starts, count=n_b)
             wp.launch(
-                K.gpu_csr_scatter, dim=n_active,
+                K.gpu_csr_scatter, dim=row_dim,
                 inputs=[self.n_active_rows, self.c_type,
                         self.c_body_a, self.c_body_b,
                         self.body_con_cursor, self.body_con_indices],
@@ -812,8 +891,9 @@ class Solver6DOF:
             # Fused warmstart_duals + update_static_friction + cache_alpha_C0.
             main_alpha = 1.0 if self.post_stabilize else self.alpha
             wp.launch(
-                K.substep_prelude_6dof, dim=n_active,
-                inputs=[self.x_initial, self.q_initial,
+                K.substep_prelude_6dof, dim=row_dim,
+                inputs=[self.n_active_rows,
+                        self.x_initial, self.q_initial,
                         self.c_type, self.c_body_a, self.c_body_b,
                         self.c_world_anchor, self.c_off_a, self.c_off_b,
                         self.c_rest, self.c_stiffness,
@@ -827,11 +907,81 @@ class Solver6DOF:
             )
 
         total_iters = self.iterations + (1 if self.post_stabilize else 0)
+        # Phase B — CUDA-graph capture for the inner solve loop. On CUDA
+        # the iter loop is ~234 individual launches (26 iters × 9 colors
+        # + duals); capturing once and replaying with `wp.capture_launch`
+        # collapses that into a single host dispatch. On CPU Warp graph
+        # capture is unsupported (per Warp 1.13 docs) — fall back to the
+        # uncaptured launch sequence, which is what was running before.
+        # The capture region launches at fixed dims that all bound against
+        # device-side counts (Phase A), so the same graph replays correctly
+        # across substeps with varying `n_active_rows[0]`.
+        use_graph = (n_active > 0
+                     and str(dev).startswith("cuda")
+                     and self._graph_cuda_supported())
+        if use_graph:
+            if self._graph is None:
+                with wp.ScopedCapture(device=dev) as cap:
+                    self._run_iter_loop(total_iters, row_dim, n_b, dev)
+                self._graph = cap.graph
+            wp.capture_launch(self._graph)
+        else:
+            self._run_iter_loop(total_iters, row_dim, n_b, dev)
+
+        # ---- 7. Refresh pair hash for next-substep warm-start ----
+        if self._self_collide and self._gpu_pool_hash_cap > 0:
+            wp.launch(K.gpu_pool_hash_clear, dim=self._gpu_pool_hash_cap,
+                      inputs=[self.hash_keys], device=dev)
+            wp.launch(
+                K.gpu_pool_hash_collect, dim=self._gpu_pool_pool_max,
+                inputs=[self.pool_count,
+                        self.pool_idx_n, self.pool_idx_t,
+                        self.pool_idx_b, self.pool_idx_c,
+                        self.c_body_a, self.c_body_b,
+                        self.c_lambda, self.c_penalty,
+                        self.c_active, self.c_was_static,
+                        self._gpu_pool_hash_cap,
+                        self.hash_keys, self.hash_state],
+                device=dev,
+            )
+
+    def _graph_cuda_supported(self) -> bool:
+        """Whether the current Warp build can capture a CUDA graph. Caches
+        the answer so we don't probe `wp.ScopedCapture` on every step."""
+        if self._graph_supported is not None:
+            return self._graph_supported
+        supported = False
+        try:
+            supported = hasattr(wp, "ScopedCapture") and hasattr(
+                wp, "capture_launch")
+        except Exception:
+            supported = False
+        self._graph_supported = supported
+        return supported
+
+    def _run_iter_loop(self, total_iters: int, row_dim: int,
+                        n_b: int, dev) -> None:
+        """The capture-eligible inner solve loop: cache_alpha_C0 (post-stab
+        only), per-color primal_update, dual_update, and the final
+        finalize_and_cap. All launches use fixed dims (Phase A); device-side
+        counts come from `self.n_active_rows[0]` / `c_active[j]`. No Python
+        readbacks inside — safe to enclose in `wp.ScopedCapture`."""
+        if (self.max_linear_speed > 0.0
+                and math.isfinite(self.max_linear_speed)
+                and self.max_angular_speed > 0.0
+                and math.isfinite(self.max_angular_speed)):
+            max_lin = float(self.max_linear_speed)
+            max_ang = float(self.max_angular_speed)
+        else:
+            max_lin = math.inf
+            max_ang = math.inf
+
         for it in range(total_iters):
-            if self.post_stabilize and it == self.iterations and n_active > 0:
+            if self.post_stabilize and it == self.iterations:
                 wp.launch(
-                    K.cache_alpha_C0_6dof, dim=n_active,
-                    inputs=[self.x, self.q, self.x_initial, self.q_initial,
+                    K.cache_alpha_C0_6dof, dim=row_dim,
+                    inputs=[self.n_active_rows,
+                            self.x, self.q, self.x_initial, self.q_initial,
                             self.c_type, self.c_body_a, self.c_body_b,
                             self.c_world_anchor, self.c_off_a, self.c_off_b,
                             self.c_rest, self.c_active, 0.0],
@@ -862,10 +1012,11 @@ class Solver6DOF:
                     device=dev,
                 )
 
-            if n_active > 0 and it < self.iterations:
+            if it < self.iterations:
                 wp.launch(
-                    K.dual_update_6dof, dim=n_active,
-                    inputs=[self.x, self.q,
+                    K.dual_update_6dof, dim=row_dim,
+                    inputs=[self.n_active_rows,
+                            self.x, self.q,
                             self.c_type, self.c_body_a, self.c_body_b,
                             self.c_world_anchor, self.c_off_a, self.c_off_b,
                             self.c_rest, self.c_stiffness,
@@ -879,15 +1030,6 @@ class Solver6DOF:
                 )
 
             if it == self.iterations - 1:
-                if (self.max_linear_speed > 0.0
-                        and math.isfinite(self.max_linear_speed)
-                        and self.max_angular_speed > 0.0
-                        and math.isfinite(self.max_angular_speed)):
-                    max_lin = float(self.max_linear_speed)
-                    max_ang = float(self.max_angular_speed)
-                else:
-                    max_lin = math.inf
-                    max_ang = math.inf
                 wp.launch(
                     K.finalize_and_cap_6dof, dim=n_b,
                     inputs=[self.x, self.q, self.x_initial, self.q_initial,
@@ -896,35 +1038,117 @@ class Solver6DOF:
                     device=dev,
                 )
 
-        # ---- 7. Refresh pair hash for next-substep warm-start ----
-        if self._self_collide and self._gpu_pool_hash_cap > 0:
-            wp.launch(K.gpu_pool_hash_clear, dim=self._gpu_pool_hash_cap,
-                      inputs=[self.hash_keys], device=dev)
-            wp.launch(
-                K.gpu_pool_hash_collect, dim=self._gpu_pool_pool_max,
-                inputs=[self.pool_count,
-                        self.pool_idx_n, self.pool_idx_t,
-                        self.pool_idx_b, self.pool_idx_c,
-                        self.c_body_a, self.c_body_b,
-                        self.c_lambda, self.c_penalty,
-                        self.c_active, self.c_was_static,
-                        self._gpu_pool_hash_cap,
-                        self.hash_keys, self.hash_state],
-                device=dev,
-            )
+    def _ensure_pair_buffers(self, cap: int) -> None:
+        """Allocate or grow the broadphase pair-buffer set to at least `cap`.
+        Sets `self._bp_max_pairs` to the new capacity. Buffers are zeroed
+        on grow — counts are reset at the top of each step via the fused
+        reset kernel, so callers don't need to re-zero."""
+        if (self._bp_pair_a is not None
+                and self._bp_pair_a.shape[0] >= cap):
+            return
+        dev = self.device
+        self._bp_pair_a = wp.zeros(cap, dtype=int, device=dev)
+        self._bp_pair_b = wp.zeros(cap, dtype=int, device=dev)
+        self._bp_pair_overlap = wp.zeros(cap, dtype=int, device=dev)
+        self._bp_pair_sat_idx = wp.zeros(cap, dtype=int, device=dev)
+        self._bp_pair_n_hat = wp.zeros(cap, dtype=wp.vec3, device=dev)
+        self._bp_pair_depth = wp.zeros(cap, dtype=float, device=dev)
+        self._bp_max_pairs = cap
+
+    def _grow_row_pool(self, new_dyn_capacity: int) -> None:
+        """Grow the dynamic tail of every `c_*` array to fit at least
+        `new_dyn_capacity` rows past `n_static`. Preserves the static
+        prefix [0, n_static) verbatim. Called after a row-pool overflow
+        so the *next* substep has the headroom that this one lacked.
+
+        Also grows pool_idx_* to match (pool_max scales with max_pairs)."""
+        n_static = self._gpu_pool_n_static
+        new_cap = n_static + new_dyn_capacity
+        if new_cap <= self._gpu_pool_n_capacity:
+            return
+        dev = self.device
+
+        def _grow_int(arr):
+            old = arr.numpy()
+            buf = np.zeros(new_cap, dtype=np.int32)
+            buf[: old.shape[0]] = old
+            return wp.array(buf, dtype=int, device=dev)
+
+        def _grow_f32(arr):
+            old = arr.numpy()
+            buf = np.zeros(new_cap, dtype=np.float32)
+            buf[: old.shape[0]] = old
+            return wp.array(buf, dtype=float, device=dev)
+
+        def _grow_vec3(arr):
+            old = arr.numpy()
+            buf = np.zeros((new_cap, 3), dtype=np.float32)
+            buf[: old.shape[0]] = old
+            return wp.array(buf, dtype=wp.vec3, device=dev)
+
+        # Scalar int / float / vec3 row arrays.
+        self.c_type = _grow_int(self.c_type)
+        self.c_body_a = _grow_int(self.c_body_a)
+        self.c_body_b = _grow_int(self.c_body_b)
+        self.c_world_anchor = _grow_vec3(self.c_world_anchor)
+        self.c_off_a = _grow_vec3(self.c_off_a)
+        self.c_off_b = _grow_vec3(self.c_off_b)
+        self.c_rest = _grow_f32(self.c_rest)
+        self.c_stiffness = _grow_f32(self.c_stiffness)
+        self.c_fmin = _grow_f32(self.c_fmin)
+        self.c_fmax = _grow_f32(self.c_fmax)
+        self.c_fracture = _grow_f32(self.c_fracture)
+        self.c_friction = _grow_f32(self.c_friction)
+        self.c_friction_static = _grow_f32(self.c_friction_static)
+        self.c_lambda = _grow_f32(self.c_lambda)
+        self.c_penalty = _grow_f32(self.c_penalty)
+        self.c_alpha_C0 = _grow_f32(self.c_alpha_C0)
+        self.c_active = _grow_int(self.c_active)
+        self.c_was_static = _grow_int(self.c_was_static)
+        # sibling / partner default to -1 in the grown tail.
+        sib_np = np.full(new_cap, -1, dtype=np.int32)
+        old_sib = self.c_sibling.numpy()
+        sib_np[: old_sib.shape[0]] = old_sib
+        self.c_sibling = wp.array(sib_np, dtype=int, device=dev)
+        par_np = np.full(new_cap, -1, dtype=np.int32)
+        old_par = self.c_partner.numpy()
+        par_np[: old_par.shape[0]] = old_par
+        self.c_partner = wp.array(par_np, dtype=int, device=dev)
+        # body→constraint CSR scratch grows in step.
+        self.body_con_indices = wp.zeros(max(2 * new_cap, 1), dtype=int,
+                                         device=dev)
+
+        self._gpu_pool_n_dyn_capacity = new_dyn_capacity
+        self._gpu_pool_n_capacity = new_cap
+        # Pool_idx_* sizing: 1 pool entry per emitted contact (≤ 4 per pair).
+        new_pool_max = max(self._gpu_pool_pool_max, self._bp_max_pairs * 4)
+        if new_pool_max > self._gpu_pool_pool_max:
+            self.pool_idx_n = wp.zeros(new_pool_max, dtype=int, device=dev)
+            self.pool_idx_t = wp.zeros(new_pool_max, dtype=int, device=dev)
+            self.pool_idx_b = wp.zeros(new_pool_max, dtype=int, device=dev)
+            self.pool_idx_c = wp.zeros(new_pool_max, dtype=int, device=dev)
+            self._gpu_pool_pool_max = new_pool_max
+        # Force re-capture next step if graph caching is wired up.
+        self._graph = None
 
     def _gpu_emit_dynamic_contacts(self, n_b: int) -> None:
         """One-substep GPU pipeline: broadphase → SAT → manifold → emit rows.
         Atomically appends BOX_BOX + tangent rows into the dynamic region of
-        c_* and records pool entries for the post-solve hash collect. No
-        Python row construction; no per-substep array reallocation."""
+        c_* and records pool entries for the post-solve hash collect.
+
+        Robustness: broadphase can overshoot `_bp_max_pairs` when a body
+        cluster forms (or after a sudden coincident drop). On overflow we
+        grow `_bp_*` and re-run broadphase up to `MAX_PAIR_RETRIES` times
+        before clamping. The kernel-side guard in `gpu_pool_emit_rows`
+        keeps the c_* writes in-bounds even if the host bookkeeping is
+        ever a step behind."""
         import time as _t
         t_bp0 = _t.perf_counter()
         dev = self.device
         margin = 0.005
+        MAX_PAIR_RETRIES = 2
 
-        # Reuse _bp_* and _mf_* buffers from the legacy emitter; allocator
-        # logic was already structured for a fixed-capacity pair pool.
+        # AABB inputs are body state; they don't depend on the pair cap.
         he_np = np.asarray(self._half_extents, dtype=np.float32).reshape(-1, 3)
         if (self._bp_half_extents is None
                 or self._bp_half_extents.shape[0] != n_b):
@@ -934,15 +1158,8 @@ class Solver6DOF:
         else:
             self._bp_half_extents.assign(he_np)
 
-        cap_target = max(256, 16 * n_b)
-        if self._bp_max_pairs < cap_target:
-            self._bp_max_pairs = cap_target
-            self._bp_pair_a = wp.zeros(cap_target, dtype=int, device=dev)
-            self._bp_pair_b = wp.zeros(cap_target, dtype=int, device=dev)
-            self._bp_pair_overlap = wp.zeros(cap_target, dtype=int, device=dev)
-            self._bp_pair_sat_idx = wp.zeros(cap_target, dtype=int, device=dev)
-            self._bp_pair_n_hat = wp.zeros(cap_target, dtype=wp.vec3, device=dev)
-            self._bp_pair_depth = wp.zeros(cap_target, dtype=float, device=dev)
+        # Initial pair-buffer sizing matches the _flush heuristic.
+        self._ensure_pair_buffers(max(256, 16 * n_b))
 
         wp.launch(
             K.compute_body_aabb_6dof, dim=n_b,
@@ -953,44 +1170,63 @@ class Solver6DOF:
         constructor = "lbvh" if str(dev).startswith("cuda") else "sah"
         self._bp_bvh = wp.Bvh(self._bp_aabb_lo, self._bp_aabb_hi,
                               constructor=constructor)
-        wp.launch(
-            K.bvh_broadphase_pairs, dim=n_b,
-            inputs=[self._bp_bvh.id, self._bp_aabb_lo, self._bp_aabb_hi,
-                    self.mass, self._bp_pair_count,
-                    self._bp_pair_a, self._bp_pair_b, self._bp_max_pairs],
-            device=dev,
-        )
-        n_pairs = int(self._bp_pair_count.numpy()[0])
+
+        n_pairs = 0
+        for attempt in range(MAX_PAIR_RETRIES + 1):
+            self._bp_pair_count.zero_()
+            wp.launch(
+                K.bvh_broadphase_pairs, dim=n_b,
+                inputs=[self._bp_bvh.id, self._bp_aabb_lo, self._bp_aabb_hi,
+                        self.mass, self._bp_pair_count,
+                        self._bp_pair_a, self._bp_pair_b, self._bp_max_pairs],
+                device=dev,
+            )
+            n_pairs = int(self._bp_pair_count.numpy()[0])
+            if n_pairs <= self._bp_max_pairs or attempt == MAX_PAIR_RETRIES:
+                break
+            # Grow and retry — the BVH itself is unaffected by the cap.
+            self._ensure_pair_buffers(max(2 * self._bp_max_pairs,
+                                           n_pairs * 2))
+            # Pair cap changed → emit-side row pool may need a re-capture.
+            self._graph = None
+
         if n_pairs == 0:
             self.broadphase_ms = (_t.perf_counter() - t_bp0) * 1000.0
             return
-        if n_pairs > self._bp_max_pairs:
-            self._bp_max_pairs = max(2 * self._bp_max_pairs, n_pairs * 2)
-            n_pairs = self._bp_max_pairs
+        # Post-Phase-A: bounds for SAT / manifold / emit come from the
+        # device-side `_bp_pair_count` array, not a Python scalar. We launch
+        # at the *upper bound* `_bp_max_pairs` so the launch dim is fixed at
+        # graph-capture time; threads past `pair_count[0]` early-return.
+        # Trailing-tail wasted threads on CPU are negligible.
+        launch_dim = self._bp_max_pairs
+
         wp.launch(
-            K.obb_sat_pairs, dim=n_pairs,
+            K.obb_sat_pairs, dim=launch_dim,
             inputs=[self.x, self.q, self._bp_half_extents,
-                    self._bp_pair_a, self._bp_pair_b, n_pairs, margin],
+                    self._bp_pair_a, self._bp_pair_b,
+                    self._bp_pair_count, margin],
             outputs=[self._bp_pair_overlap, self._bp_pair_sat_idx,
                      self._bp_pair_n_hat, self._bp_pair_depth],
             device=dev,
         )
         self._ensure_manifold_buffers(self._bp_max_pairs)
         wp.launch(
-            K.obb_contact_manifold_6dof, dim=n_pairs,
+            K.obb_contact_manifold_6dof, dim=launch_dim,
             inputs=[self.x, self.q, self._bp_half_extents,
                     self._bp_pair_a, self._bp_pair_b,
                     self._bp_pair_overlap, self._bp_pair_sat_idx,
                     self._bp_pair_n_hat,
-                    n_pairs, margin, self._mf_poly_scratch],
+                    self._bp_pair_count, margin, self._mf_poly_scratch],
             outputs=[self._mf_contact_count, self._mf_ref_is_a,
                      self._mf_n_hat, self._mf_t_hat, self._mf_b_hat,
                      self._mf_off_ref, self._mf_off_inc],
             device=dev,
         )
         wp.launch(
-            K.gpu_pool_emit_rows, dim=n_pairs,
-            inputs=[n_pairs,
+            K.gpu_pool_emit_rows, dim=launch_dim,
+            inputs=[self._bp_pair_count,
+                    self._gpu_pool_n_capacity,
+                    self._gpu_pool_pool_max,
                     self._bp_pair_a, self._bp_pair_b,
                     self._mf_contact_count, self._mf_ref_is_a,
                     self._mf_n_hat, self._mf_t_hat, self._mf_b_hat,
@@ -1066,7 +1302,14 @@ class Solver6DOF:
         (caller hit it before the first step()).
         """
         n_b = len(self._x)
-        n_c = len(self._rows)
+        # n_c = LIVE row count (static + dynamic from the GPU pool). After
+        # gap-#1 the dynamic rows live in c_* GPU arrays — `self._rows` is
+        # only the static prefix and would severely under-count contacts.
+        n_c_static = len(self._rows)
+        if self.n_active_rows is not None:
+            n_c = int(self.n_active_rows.numpy()[0])
+        else:
+            n_c = n_c_static
         if n_b == 0 or self.x is None:
             return {
                 "positions": np.array(self._x, dtype=np.float32).reshape(-1, 3),
@@ -1076,20 +1319,24 @@ class Solver6DOF:
                 "active": np.ones(n_c, dtype=np.int32),
                 "was_static": np.zeros(n_c, dtype=np.int32),
                 "c_type": np.zeros(n_c, dtype=np.int32),
+                "n_rows": n_c,
             }
         dev = self.device
-        # Reuse staging buffers across frames; reallocate only on count change.
+        # Reuse staging buffers across frames; size the row buffer to total
+        # row capacity (not the per-frame n_c) so dynamic-contact churn
+        # doesn't reallocate.
+        n_cap_alloc = max(self._gpu_pool_n_capacity, n_c_static)
         if (self._viewer_pack_bodies is None
                 or self._viewer_pack_bodies_n != n_b):
             self._viewer_pack_bodies = wp.zeros(n_b * 10, dtype=float,
                                                 device=dev)
             self._viewer_pack_bodies_n = n_b
         if (self._viewer_pack_rows is None
-                or self._viewer_pack_rows_n != n_c):
-            self._viewer_pack_rows = (wp.zeros(n_c * 3, dtype=float,
+                or self._viewer_pack_rows_n != n_cap_alloc):
+            self._viewer_pack_rows = (wp.zeros(n_cap_alloc * 3, dtype=float,
                                                device=dev)
-                                      if n_c > 0 else None)
-            self._viewer_pack_rows_n = n_c
+                                      if n_cap_alloc > 0 else None)
+            self._viewer_pack_rows_n = n_cap_alloc
         wp.launch(
             K.viewer_pack_bodies_6dof, dim=n_b,
             inputs=[self.x, self.q, self.omega],
@@ -1106,7 +1353,9 @@ class Solver6DOF:
             )
         bod = self._viewer_pack_bodies.numpy().reshape(n_b, 10)
         if n_c > 0:
-            row = self._viewer_pack_rows.numpy().reshape(n_c, 3)
+            # Pack buffer is sized to n_cap_alloc; slice the live n_c prefix.
+            row_full = self._viewer_pack_rows.numpy().reshape(n_cap_alloc, 3)
+            row = row_full[:n_c]
             lam = row[:, 0].astype(np.float32, copy=True)
             act = row[:, 1].astype(np.int32, copy=False)
             ws_type = row[:, 2].astype(np.int32, copy=False)
@@ -1125,4 +1374,5 @@ class Solver6DOF:
             "active": act,
             "was_static": was,
             "c_type": ctype,
+            "n_rows": n_c,
         }

@@ -58,3 +58,33 @@ def color_summary(color: np.ndarray) -> dict[int, int]:
     for c in color:
         out[int(c)] = out.get(int(c), 0) + 1
     return out
+
+
+def spatial_8color(
+    positions: np.ndarray,
+    cell_size: float,
+) -> np.ndarray:
+    """Topology-independent 8-coloring keyed on body AABB centers.
+
+    WARNING — NOT constraint-safe for arbitrary body layouts. Two bodies
+    that share a grid cell receive the same color (their cell-parity bits
+    are identical), so if they are in contact the per-color primal sweep
+    will solve their constraint concurrently, violating Gauss-Seidel
+    independence. `Solver6DOF` intentionally uses `greedy_color()` on an
+    inflated-AABB adjacency graph instead. This function is retained for
+    diagnostics and for callers who can *prove* their bodies are at most
+    one per cell (e.g. perfectly grid-aligned configurations).
+
+    Hash each position into a 3D grid of side `cell_size`, then color by the
+    parity of (cx, cy, cz). Two bodies in 26-adjacent grid cells fall in
+    different color classes.
+
+    `cell_size` should be ~2× the largest body half-extent.
+    """
+    positions = np.asarray(positions, dtype=np.float32).reshape(-1, 3)
+    n = positions.shape[0]
+    if n == 0:
+        return np.zeros(0, dtype=np.int32)
+    cells = np.floor(positions / max(cell_size, 1e-6)).astype(np.int64)
+    parity = (cells & 1).astype(np.int32)
+    return (parity[:, 0] | (parity[:, 1] << 1) | (parity[:, 2] << 2)).astype(np.int32)

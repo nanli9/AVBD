@@ -633,7 +633,7 @@ class Viewer:
             act = state["active"]
             was_static = state["was_static"]
             c_type = state["c_type"]
-            n_rows_total = len(self.solver._rows)
+            n_rows_total = int(state.get("n_rows", len(lam)))
             n_colors = int(self.solver.num_colors)
             bp_ms = float(self.solver.broadphase_ms)
             # Static-friction occupancy — c_was_static is per-row but only
@@ -644,6 +644,12 @@ class Viewer:
                 # FLOOR_CONTACT_6DOF = 0, BOX_BOX_CONTACT_6DOF = 3
                 mask = (c_type == 0) | (c_type == 3)
                 n_static = int((was_static[mask] != 0).sum())
+            # Snapshot the boxes list under the lock — bodies whose index
+            # is past `len(pos)` would IndexError below. `_drop_box`
+            # appends to self.boxes inside the solver lock, so taking
+            # this snapshot here pins the visible-body set to the same
+            # point in time as `pos` / `qs` / `w`.
+            boxes_snapshot = list(self.boxes)
         # End of lock — pos/qs/w/lam/act are now plain numpy/lists owned by
         # this thread. Scene writes and GUI text updates don't need the lock.
         drag_mode = bool(self.gui_drag_mode.value)
@@ -651,8 +657,13 @@ class Viewer:
         now = time.perf_counter()
         try:
             with self.server.atomic():
-                for vb in self.boxes:
+                for vb in boxes_snapshot:
                     i = vb.body.index
+                    if i >= len(pos):
+                        # Defensive: the box was added after the snapshot
+                        # (shouldn't happen given the snapshot-under-lock,
+                        # but keeps us robust if the locking ever drifts).
+                        continue
                     p_solver = pos[i]
                     p_render = (float(p_solver[0]), float(p_solver[1]), float(p_solver[2]))
                     wxyz = warp_q_to_viser_wxyz(qs[i])

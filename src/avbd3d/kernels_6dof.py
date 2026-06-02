@@ -573,6 +573,8 @@ def primal_update_6dof(
 # -----------------------------------------------------------------------------
 @wp.kernel
 def dual_update_6dof(
+    # Device-side row count — host launches at dim=_gpu_pool_n_capacity.
+    n_active_rows: wp.array(dtype=int),
     x: wp.array(dtype=wp.vec3),
     q: wp.array(dtype=wp.quat),
     c_type: wp.array(dtype=int),
@@ -597,6 +599,8 @@ def dual_update_6dof(
     beta: float,
 ):
     j = wp.tid()
+    if j >= n_active_rows[0]:
+        return
     if c_active[j] == 0:
         return
     t = c_type[j]
@@ -683,6 +687,8 @@ def dual_update_6dof(
 #      cache_alpha_C0_6dof launch — see _step_one).
 @wp.kernel
 def substep_prelude_6dof(
+    # Device-side row count — host launches at dim=_gpu_pool_n_capacity.
+    n_active_rows: wp.array(dtype=int),
     # state (read-only)
     x_initial: wp.array(dtype=wp.vec3),
     q_initial: wp.array(dtype=wp.quat),
@@ -711,6 +717,8 @@ def substep_prelude_6dof(
     main_alpha: float,
 ):
     j = wp.tid()
+    if j >= n_active_rows[0]:
+        return
     # --- 1. warmstart decay (Eq 19) ---
     k_floor = PENALTY_MIN
     if c_type[j] == CONTACT_TANGENT_6DOF:
@@ -847,6 +855,8 @@ def update_static_friction_6dof(
 # -----------------------------------------------------------------------------
 @wp.kernel
 def cache_alpha_C0_6dof(
+    # Device-side row count — host launches at dim=_gpu_pool_n_capacity.
+    n_active_rows: wp.array(dtype=int),
     x: wp.array(dtype=wp.vec3),
     q: wp.array(dtype=wp.quat),
     x_initial: wp.array(dtype=wp.vec3),
@@ -863,6 +873,8 @@ def cache_alpha_C0_6dof(
     c_alpha_C0: wp.array(dtype=float),
 ):
     j = wp.tid()
+    if j >= n_active_rows[0]:
+        return
     if c_active[j] == 0:
         c_alpha_C0[j] = 0.0
         return
@@ -1106,7 +1118,11 @@ def obb_sat_pairs(
     half_extents: wp.array(dtype=wp.vec3),
     pair_a: wp.array(dtype=int),
     pair_b: wp.array(dtype=int),
-    n_pairs: int,
+    # Device-side pair count (was `n_pairs: int`). The host launches this at
+    # dim=_bp_max_pairs and the runtime count comes from broadphase via
+    # `pair_count[0]`. Required for CUDA-graph capture: kernel arguments
+    # cannot depend on per-substep host scalars.
+    pair_count: wp.array(dtype=int),
     margin: float,
     # outputs (one entry per pair)
     pair_overlap: wp.array(dtype=int),    # 1 if within margin, 0 otherwise
@@ -1118,7 +1134,7 @@ def obb_sat_pairs(
     in solver_6dof.py but vectorized across pairs. Output is fed into the
     Python face-clip pipeline for the actual contact-point emission."""
     p = wp.tid()
-    if p >= n_pairs:
+    if p >= pair_count[0]:
         return
     i = pair_a[p]
     j = pair_b[p]
@@ -1335,7 +1351,8 @@ def obb_contact_manifold_6dof(
     pair_overlap: wp.array(dtype=int),
     pair_sat_idx: wp.array(dtype=int),
     pair_n_hat: wp.array(dtype=wp.vec3),
-    n_pairs: int,
+    # Device-side pair count (was `n_pairs: int`); see obb_sat_pairs above.
+    pair_count: wp.array(dtype=int),
     margin: float,
     # scratch: 16 vec3 slots per pair for SH polygon double-buffer
     poly_scratch: wp.array(dtype=wp.vec3),
@@ -1350,9 +1367,9 @@ def obb_contact_manifold_6dof(
     out_off_inc: wp.array(dtype=wp.vec3),
 ):
     p = wp.tid()
-    out_contact_count[p] = 0
-    if p >= n_pairs:
+    if p >= pair_count[0]:
         return
+    out_contact_count[p] = 0
     if pair_overlap[p] == 0:
         return
     sat_idx = pair_sat_idx[p]
@@ -1792,8 +1809,12 @@ def gpu_csr_scatter(
 
 @wp.kernel
 def gpu_pool_emit_rows(
-    # manifold outputs (per pair)
-    n_pairs: int,
+    # Device-side pair count (was `n_pairs: int`); host launches at
+    # dim=_bp_max_pairs.
+    pair_count: wp.array(dtype=int),
+    # row + pool capacity (host-side; emit drops contacts past these)
+    n_cap_total: int,
+    pool_cap: int,
     pair_a: wp.array(dtype=int),
     pair_b: wp.array(dtype=int),
     mf_contact_count: wp.array(dtype=int),
@@ -1848,7 +1869,7 @@ def gpu_pool_emit_rows(
     Replaces the legacy CPU readback + Python _Row append loop. No data
     leaves the GPU during emission."""
     p = wp.tid()
-    if p >= n_pairs:
+    if p >= pair_count[0]:
         return
     n_contacts = mf_contact_count[p]
     if n_contacts == 0:
@@ -1887,6 +1908,11 @@ def gpu_pool_emit_rows(
         if mu <= 0.0:
             rows_per_contact = 1
         row_base = wp.atomic_add(n_active_rows, 0, rows_per_contact)
+        # Capacity guard — host grows the pool next substep on overflow.
+        # The reservation stays in n_active_rows so the host can detect it
+        # (it is clamped against n_cap_total on readback).
+        if row_base + rows_per_contact > n_cap_total:
+            return
 
         # ----- Normal row -----
         n_idx = row_base
@@ -1993,6 +2019,8 @@ def gpu_pool_emit_rows(
 
         # ----- Pool entry (for hash_collect after solve) -----
         pool_id = wp.atomic_add(pool_count, 0, 1)
+        if pool_id >= pool_cap:
+            continue
         pool_idx_n[pool_id] = n_idx
         pool_idx_t[pool_id] = t_idx
         pool_idx_b[pool_id] = b_idx
