@@ -383,3 +383,74 @@ def test_bvh_broadphase_scales_to_27_bodies():
         top_y = positions[tower * 3 + 2][1]
         assert 4.5 * h < top_y < 5.5 * h, \
             f"tower {tower} top y={top_y}, expected ~{5*h}"
+
+
+def test_edge_edge_contact_two_rotated_boxes_separate():
+    """Two boxes set up so their separating axis is an edge×edge cross
+    product (neither face-normal wins SAT). Drop them onto each other
+    in zero-g with closing velocity: a proper edge-edge contact should
+    arrest penetration. Before the closest-segment-pair fix, the
+    single-point fallback would emit a stray near-coplanar contact and
+    let boxes pass through edge-on.
+    """
+    s = Solver6DOF(dt=1.0 / 240.0, iterations=20, substeps=2,
+                   gravity=(0., 0., 0.))
+    s.enable_self_collision(True, default_friction=0.0)
+    h = 0.25
+    # Box A: rotated 45° about Z so its X-edge points along (1,1,0)/√2.
+    qz45 = (0., 0., math.sin(math.pi / 8), math.cos(math.pi / 8))
+    a = s.add_box((0., 0., 0.), (h, h, h), mass=1.0,
+                  orientation=qz45, friction=0.0)
+    # Box B: rotated 45° about X so its X-edge points along (1, 0, 0) still,
+    # but its Y/Z edges are rotated. Place above-and-offset so the contact
+    # ends up between an X-edge of A and a Y-edge of B (edge×edge).
+    qx45 = (math.sin(math.pi / 8), 0., 0., math.cos(math.pi / 8))
+    b = s.add_box((0.0, 0.6, 0.0), (h, h, h), mass=1.0,
+                  orientation=qx45, friction=0.0,
+                  velocity=(0., -2.0, 0.))
+    # Run a few hundred sub-steps so they collide and bounce.
+    for _ in range(120):
+        s.step()
+    # Final separation: gap between the two body centres should be > 2h
+    # (no interpenetration). A bad edge-edge fallback would have let them
+    # overlap along the y axis to gap ≈ 0.4.
+    p = s.positions()
+    gap = abs(p[1][1] - p[0][1])
+    assert gap > 2 * h - 0.05, f"boxes overlap (gap y={gap}, expected > {2*h})"
+    # And neither should have tunneled or NaN'd.
+    assert np.all(np.isfinite(s.positions()))
+    assert np.all(np.isfinite(s.velocities()))
+
+
+def test_eq14_hessian_rescaling_settles_box_on_floor():
+    """AVBD Eq.14 says when a constraint force saturates at its bound,
+    replace k_j in the LHS only by k̃ = |bound − (kC+λ)|/|C|. For a box
+    settling on the floor, the four bottom-corner FLOOR_CONTACT rows
+    saturate at fmax = 0 once the box is at rest — i.e. their lam_plus
+    becomes positive (signed gap times penalty) but the contact-force is
+    clamped to zero. Eq.14's rescaling shrinks the LHS contribution in
+    proportion, avoiding the over-correction that would lift the resting
+    box off the floor. This test pins that resting state stays put.
+    """
+    h = 0.3
+    s = Solver6DOF(dt=1.0 / 60.0, iterations=15, gravity=(0., -9.81, 0.))
+    b = s.add_box((0., 1.5, 0.), (h, h, h), mass=1.0, friction=0.5)
+    s.add_floor_contact_box(b, friction=0.5)
+    # Drop and settle.
+    for _ in range(180):
+        s.step()
+    y_settled = s.positions()[0][1]
+    # Now let it run another 120 frames; y should NOT drift.
+    ys = []
+    for _ in range(120):
+        s.step()
+        ys.append(s.positions()[0][1])
+    drift = max(ys) - min(ys)
+    assert drift < 2.0e-3, (
+        f"resting box wandered by {drift*1000:.2f} mm — Eq.14 rescaling "
+        "should keep saturated contact rows quiet"
+    )
+    # And the box should be flat on the floor (one corner radius above y=0).
+    assert abs(y_settled - h) < 2.0e-3, (
+        f"settled y={y_settled} expected ~{h} (half-extent on floor)"
+    )

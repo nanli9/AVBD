@@ -6,55 +6,105 @@ the real-time brittle fracture project — the AVBD-native dual variable `λ` is
 intended to double as the cohesive-interface traction estimate (see
 `../formal_model_to_energy_accounting.md` and `../project_roadmap.md`).
 
-The structure mirrors the 2D reference at
-[savant117/avbd-demo2d](https://github.com/savant117/avbd-demo2d) (rigid bodies
-in 2D), extended to **3D point particles + scalar constraints**. Rigid-body
-6-DOF and cohesive-interface constraints are queued for the next iteration.
+The repo ships **two solvers**, mirroring the structure of the 2D reference at
+[savant117/avbd-demo2d](https://github.com/savant117/avbd-demo2d):
 
-## What's implemented
+- **`Solver`** — 3-DOF point particles + scalar constraints (CPU broad phase,
+  AABB box collision). Original port; useful for chains, particle scenes,
+  fracture-graph prototyping.
+- **`Solver6DOF`** — full SE(3) rigid bodies with quaternion orientation,
+  rotated inertia, GPU LBVH broad phase, full 15-axis OBB SAT narrow phase,
+  static/dynamic friction switch, and per-substep stepping.
 
-| Piece | Status | Notes |
+## What's implemented (AVBD paper coverage)
+
+| Paper requirement | 3-DOF `Solver` | 6-DOF `Solver6DOF` |
 |---|---|---|
-| Predict + adaptive warm-start (Eq. 2, VBD §4.2) | ✅ | `predict_inertial` kernel |
-| Warm-started λ, penalty (Eq. 19) | ✅ | `warmstart_duals` kernel |
-| α·C₀ stabilization caching (Eq. 18) | ✅ | `cache_alpha_C0` kernel |
-| Per-body primal solve (Eqs. 4, 13, 17) | ✅ | `primal_update` kernel, 3×3 SPD inverse |
-| Dual update (Eqs. 11, 16) | ✅ | `dual_update` kernel |
-| Velocity finalise (BDF1) | ✅ | `finalize_velocity` kernel |
-| Post-stabilization extra pass | ✅ | matches 2D reference default |
-| Greedy graph coloring (Welsh-Powell) | ✅ | `coloring.py` — uses (max_deg + 1) colors |
-| Fracture via |λ| ≥ threshold | ✅ | AVBD-native impulse criterion (matches 2D ref `force->fracture`) |
-| PIN (3-scalar) and DISTANCE constraints | ✅ | other constraint types added by following the same pattern |
-| 6-DOF rigid bodies (quaternions, inertia tensor) | ❌ | next iteration |
-| Cohesive interface (CZM) constraint for fracture | ❌ | next iteration |
-| Griffith energy break criterion `E_i ≥ G_c · ΔA_i` | ❌ | next iteration |
-| I3D-2018 Δv impulse transfer on break | ❌ | next iteration |
-| Box-box / particle-plane collision | ❌ | next iteration |
+| Predict + inertial target (Eq. 2) | ✅ `predict_inertial` (with adaptive gravity-weighted guess) | ✅ `predict_inertial_6dof` (linear + `exp_q(ω·dt)`) |
+| Warm-start λ, penalty (Eq. 19) | ✅ `warmstart_duals` | ✅ fused in `substep_prelude_6dof` |
+| C̃ = C − α·C₀ stabilization (Eq. 18) | ✅ `cache_alpha_C0` | ✅ `cache_alpha_C0_6dof` |
+| Per-body primal solve (Eqs. 4, 13, 17) | ✅ 3×3 SPD inverse | ✅ 6×6 via 3×3 Schur complement |
+| Dual update (Eqs. 11, 16) | ✅ `dual_update` | ✅ `dual_update_6dof` |
+| Diagonal geometric stiffness G̃ (Sec. 3.5) | ⚠️ set to 0 (paper-noncompliant for DISTANCE/SPHERE/BOX rows — stable but a deviation) | ✅ `geom_stiffness_diag` |
+| Eq. 14 Hessian rescaling on clamp saturation | ❌ uses raw k | ✅ `k̃ = \|bound − λ⁺\|/\|C\|` for LHS only |
+| Proper edge-edge OBB contact (Ericson §5.1.9) | n/a (AABB only) | ✅ closest-segment-pair, was deepest-vertex fallback |
+| `TET_VOLUME` soft volume preservation for deformables | ✅ new tet pool + adjacency | n/a |
+| Post-stabilization extra pass (α → 0) | ✅ | ✅ |
+| BDF1 velocity finalize | ✅ | ✅ (world-frame ω via `quat_to_rotvec`) |
+| Greedy graph coloring (Sec. 4) | ✅ Welsh-Powell | ✅ same |
+| LBVH broad phase (Sec. 4) | ❌ brute O(N²) on CPU | ✅ `wp.Bvh` + GPU SAT kernel |
+| Eq. 15 contact form `[t̂ b̂ n̂]ᵀ(r_a − r_b)` | ✅ | ✅ |
+| Square-cone friction `|λ_t| ≤ μ\|λ_n\|` (Sec. 3.3) | ✅ per-row | ✅ + **isotropic disk static-stick + μ_s/μ_d switch** (beyond paper) |
+| Quaternion rigid update (Eqs. 20–21), always quasi-Newton for rigids | n/a | ✅ |
+| Persistent λ across frames (manifold caching) | ✅ `_contact_state_cache` | ✅ `_contact_cache` (5 mm quantized key) |
+| Breakable hard constraint by max-force (paper Fig. 13) | ✅ `\|λ\| ≥ fracture` | ✅ same |
+| Substepping | ❌ | ✅ |
+| Joint constraints (ball-socket, hinge, motor, angular spring) shown in paper Figs. 5/7/9 | ❌ only PIN + DISTANCE | ❌ only PIN |
+
+### Constraint type catalog
+
+`Solver` (3-DOF particles) — codes in `solver.py`:
+`PIN_X/Y/Z`, `DISTANCE`, `FLOOR_CONTACT`, `SPHERE_CONTACT`,
+`CONTACT_TANGENT`, `SPHERE_BOX_CONTACT` (analytical closest-point-on-AABB),
+`BOX_BOX_CONTACT` (AABB SAT + face clip ≤4 contacts).
+
+`Solver6DOF` (rigid bodies) — codes in `solver_6dof.py`:
+`FLOOR_CONTACT_6DOF` (per-corner), `CONTACT_TANGENT_6DOF` (with static-stick
+flag, μ_s and μ_d), `PIN_6DOF` (3-axis), `BOX_BOX_CONTACT_6DOF` (full
+15-axis OBB SAT + Sutherland-Hodgman face clip ≤4 contacts; edge-edge cases
+fall back to a single deepest-vertex contact).
+
+### Fracture roadmap (NOT in the paper)
+
+These items belong to the brittle-fracture project, not the AVBD paper.
+AVBD's only failure mechanism (Fig. 13 "wall break") is the |λ|-threshold
+hard-constraint break, which is implemented.
+
+| Item | Status |
+|---|---|
+| `\|λ\| ≥ threshold` breakable constraint | ✅ (matches paper Fig. 13) |
+| Cohesive interface (CZM) constraint | ❌ |
+| Griffith energy criterion `E_i ≥ G_c · ΔA_i` | ❌ |
+| I3D-2018 Δv impulse transfer on break | ❌ |
+| Voronoi prefracture → candidate graph | ❌ |
 
 ## Layout
 
 ```
 src/avbd3d/
 ├── __init__.py
-├── solver.py            # Solver class + step() loop
-├── kernels.py           # Warp kernels (every equation cited)
-├── coloring.py          # greedy body-graph coloring
-└── scene.py             # Body / ConstraintHandle dataclasses
+├── solver.py          # 3-DOF particle Solver (CPU broadphase, AABB box collision)
+├── kernels.py         # Warp kernels for the 3-DOF solver
+├── solver_6dof.py     # 6-DOF rigid Solver6DOF (GPU LBVH, OBB SAT)
+├── kernels_6dof.py    # Warp kernels for the 6-DOF solver
+├── coloring.py        # greedy body-graph coloring (Welsh-Powell)
+├── deformable.py      # Stanford bunny → tet lattice → particles + DISTANCE rows
+└── scene.py           # Body / ConstraintHandle / Shape dataclasses
 
 examples/
 ├── smoke_test.py            # single particle free fall → confirms BDF1
-├── pin_only.py              # particle pinned at world point → λ_y → −m·g
-├── hanging_chain.py         # N-link chain (use --plot for matplotlib PNG)
-├── chain_break.py           # chain with |λ| ≥ threshold breakage (lands on floor)
-├── swinging_chain_anim.py   # 3D animated GIF: swinging + breaking + λ panel
-├── interactive_demo.py      # LIVE matplotlib window with keyboard control
-└── viewer.py                # browser-based 3D viewer (viser) — DRAGGABLE bodies,
-                             #   sphere / cube / pillar primitives, ground plane,
-                             #   GUI controls (kick, threshold, gravity, reset, drop)
+├── pin_only.py              # pinned particle, λ_y → −m·g
+├── hanging_chain.py         # N-link chain (--plot for PNG)
+├── chain_break.py           # |λ| ≥ threshold breakage
+├── swinging_chain_anim.py   # 3D GIF: swinging + breaking + λ panel
+├── spinning_box_6dof.py     # 6-DOF: spinning cube falls + lands, friction brakes spin
+├── interactive_demo.py      # matplotlib live window
+├── viewer.py                # viser browser viewer for Solver6DOF stacks
+└── viewer_particles.py      # viser browser viewer for the 3-DOF Solver
 
 tests/
-└── test_solver.py           # 11 pytest tests (BDF1, pin, distance, chain, warm-start,
-                             #                   fracture, coloring, no-NaN)
+├── test_solver.py          # 24 tests — BDF1, pin, distance, chain, fracture,
+│                           #   coloring, sphere/box/box-box contact, friction
+│                           #   sliding, pillar stack, broken-pair re-collide
+├── test_solver_6dof.py     # 20 tests — free-fall/spin, OBB SAT, cube stacks,
+│                           #   corner pin, static stick, kinetic slip, BVH
+│                           #   counts, geom_stiffness_diag, Eq.14 resting
+│                           #   contact stability, edge-edge OBB contact
+└── test_deformable.py      # 10 tests — tet-lattice topology, resolution
+                            #   scaling, edge rest = init length, floor only
+                            #   on surface verts, mass distribution, TET_VOLUME
+                            #   constraint emission + on/off behaviour,
+                            #   volume preservation prevents tet inversion
 ```
 
 ## Quickstart
@@ -64,102 +114,142 @@ tests/
 uv sync
 uv pip install -e .
 
-# run tests
-uv run pytest tests/ -v          # 11 passed in ~1.3 s
+# run tests (both solvers + deformable pipeline)
+uv run pytest tests/ -v
 
-# headless examples (text + PNG/GIF output)
+# 3-DOF demos (particles + scalar constraints)
 uv run python examples/smoke_test.py
 uv run python examples/hanging_chain.py --n 6 --frames 600 --plot
 uv run python examples/chain_break.py --n 5 --threshold 30
 uv run python examples/swinging_chain_anim.py --n 8 --heavy-mass 15 --threshold 80
-
-# live window with keyboard controls (matplotlib)
 uv run python examples/interactive_demo.py
 
-# REAL interactive 3D viewer with mouse drag + 3D primitives + ground (viser)
-uv run python examples/viewer.py
-# then open the printed URL (default http://localhost:8080) in a browser:
-#   - DRAG body gizmos to move bodies around in 3D
-#   - SLIDERS: iterations, gravity, fracture threshold
-#   - BUTTONS: pause, reset, kick all, drop a cube
-#   SPACE  random sideways kick on every body
-#   K      hard kick on a single body
-#   B / H  lower / raise the fracture threshold of every link
-#   R      reset
-#   + / -  add / remove a solver iteration per step
-#   ESC    quit
+# 6-DOF demo (spinning rigid box + floor friction)
+uv run python examples/spinning_box_6dof.py
+
+# Browser viewers (viser)
+uv run python examples/viewer.py                       # 6-DOF rigid stacks + dominoes
+uv run python examples/viewer.py --deformable-bunny    # deformable Stanford bunny (tet mass-spring)
+uv run python examples/viewer_particles.py             # 3-DOF particle viewer
+# open the printed URL (default http://localhost:8080) in a browser
 ```
 
-## Tests
+### Deformable bunny mode
 
-`uv run pytest tests/ -v` covers:
+`viewer.py --deformable-bunny` switches the scene to a soft Stanford bunny
+driven by the 3-DOF particle `Solver`:
 
-| Test | What it pins |
-|---|---|
-| `test_free_fall_matches_bdf1` | unconstrained integration = closed-form BDF1 |
-| `test_static_body_stays_put` | `mass=0` ⇒ kinematic |
-| `test_pin_holds_against_gravity` | pinned particle stays put; λ → −m·g |
-| `test_distance_constraint_settles` | two-body distance error < 2 mm |
-| `test_chain_distance_errors_small` | 5-link chain avg error < 5% link |
-| `test_warmstart_reduces_iteration_load` | λ is non-trivial across frames |
-| `test_fracture_breaks_top_link_first` | highest tension breaks first |
-| `test_no_fracture_when_threshold_is_inf` | default fracture=∞ never breaks |
-| `test_coloring_is_valid_for_chain` | adjacent bodies have distinct colors; path graph ⇒ 2 colors |
-| `test_coloring_complete_graph` | K_n needs n colors |
-| `test_no_nans_in_chain_simulation` | no NaN/inf in positions/velocities/λ over 300 steps |
+- one particle per tet vertex (the actual AVBD 3-DOF block)
+- one `DISTANCE` constraint per unique tet edge (length-spring network)
+- one `TET_VOLUME` constraint per tet (soft volume preservation,
+  `C = V/V₀ − 1`) — this is what stops the bunny pancaking under floor
+  contact when many surface verts simultaneously hit the floor
+- the deformed surface (tet-boundary triangulation) AND the vertex point
+  cloud are both re-emitted to viser each frame
 
-## Math <-> kernel mapping
+The bunny OBJ is fetched once from `alecjacobson/common-3d-test-models`
+and cached under `~/.cache/avbd3d/`. A coarse axis-aligned voxel grid is
+intersected with the surface via trimesh's inside-test, then each kept
+voxel is split into 6 tets via the Kuhn diagonal subdivision. Default
+`--bunny-resolution 10` gives ~350 vertices, ~1700 edges, ~1700 tets.
+
+Useful flags:
+- `--bunny-resolution N` — voxel grid resolution along the longest bbox
+  axis. 8 ≈ 200 verts, 12 ≈ 700 verts, 16 ≈ 1500 verts (slow on CPU).
+- `--bunny-scale s` — world-space size (unit bbox before scaling).
+- `--bunny-drop-y h` — initial centre height; bunny falls onto floor at y=0.
+- `--edge-stiffness k` — AVBD penalty clamp ceiling per edge constraint
+  (default 5e4).
+- `--volume-stiffness k` — AVBD penalty clamp ceiling per `TET_VOLUME`
+  row (default 1e4). Set to 0 to disable volume preservation entirely;
+  too high → contact instability.
+
+GUI panel exposes: iterations slider, gravity slider, edge stiffness
+slider, toggles for mesh/wireframe/point-cloud, point size, and **shake
+/ squish / lift / reset** action buttons.
+
+> **Next milestone:** the constraint pool currently combines edge springs
+> (`DISTANCE`) with volume preservation (`TET_VOLUME`). Paper-faithful
+> AVBD/VBD deformables also include per-element strain energy
+> (co-rotated linear FEM / Neo-Hookean / StVK) with `wp.svd3` polar
+> decomposition for shear stiffness. Edge + volume is enough to keep the
+> bunny shaped under contact; shear stiffness is what would let it
+> resist twisting like a real rubber object.
+
+## Math ↔ kernel mapping
 
 Every equation cited is from the AVBD SIGGRAPH 2025 paper unless noted.
 
-| Equation | Where |
-|---|---|
-| Eq. 1 (objective) | implicit in `primal_update` LHS/RHS assembly |
-| Eq. 2 (inertial target `y`) | `predict_inertial` |
-| Eq. 4 (per-body local solve) | `primal_update`: `dx = inv(lhs) * rhs; x -= dx` |
-| Eq. 8 (constraint energy form) | `primal_update`: `f = clamp(k*C + λ, fmin, fmax)` |
-| Eq. 11 (dual update) | `dual_update`: `λ ← clamp(k*C + λ, fmin, fmax)` |
-| Eq. 13 (force accumulation) | `primal_update`: `rhs += J * f` |
-| Eq. 16 (penalty growth + clamp) | `dual_update`: `k += β·|C|`, clamped to material |
-| Eq. 17 (Hessian assembly) | `primal_update`: `lhs += outer(J, J) * k` |
-| Eq. 18 (C̃ = C − α·C₀) | `cache_alpha_C0` + use inside `primal_update` |
-| Eq. 19 (warm start) | `warmstart_duals` |
+| Equation | 3-DOF kernel | 6-DOF kernel |
+|---|---|---|
+| Eq. 1 (objective) | implicit in `primal_update` LHS/RHS | implicit in `primal_update_6dof` |
+| Eq. 2 (inertial target `y`) | `predict_inertial` | `predict_inertial_6dof` |
+| Eq. 4 (per-body local solve) | `primal_update`: `dx = inv(lhs)·rhs` | `primal_update_6dof`: Schur complement on 3×3 blocks |
+| Eq. 8 (constraint energy form) | `primal_update`: `f = clamp(k·C + λ, fmin, fmax)` | same |
+| Eq. 11 (dual clamp) | `dual_update` | `dual_update_6dof` |
+| Eqs. 12/16 (penalty growth + clamp) | `dual_update`: `k ← min(k + β\|C\|, k*)` only when λ in-bounds | same |
+| Eq. 15 (contact form) | `SPHERE_CONTACT` + `CONTACT_TANGENT` rows | `BOX_BOX_CONTACT_6DOF` + `CONTACT_TANGENT_6DOF` |
+| Eq. 17 (Hessian assembly) | `primal_update`: `lhs += k·outer(J, J)` (no G term) | `primal_update_6dof`: `lhs += k·outer(J,J) + diag(g)` |
+| Eq. 18 (C̃ = C − α·C₀) | `cache_alpha_C0` | `cache_alpha_C0_6dof` |
+| Eq. 19 (warm start) | `warmstart_duals` | fused in `substep_prelude_6dof` |
+| Eqs. 20–21 (quaternion rigid update) | n/a | `quat_from_rotvec`, `quat_to_rotvec` + `primal_update_6dof` |
 
-Reference 2D implementation lines that drove this port:
-[savant117/avbd-demo2d `solver.cpp` step()](https://github.com/savant117/avbd-demo2d/blob/main/source/solver.cpp).
+Reference 2D implementation that drove the port:
+[savant117/avbd-demo2d `solver.cpp`](https://github.com/savant117/avbd-demo2d/blob/main/source/solver.cpp).
 
 ## Known issues & sharp edges
 
-- **Apple Silicon ⇒ CPU-only Warp.** All demos run on CPU; switch `device="cuda:0"`
-  when on an NVIDIA machine. Kernels are GPU-clean already.
-- **Coloring is greedy Welsh-Powell.** Fine for static graphs; for dynamic
-  topology (e.g. after a break) we re-flush and re-color on the next step.
-  Gaia's GPU coloring (incremental, partition-based) is the eventual target
-  if we need to re-color every frame at scale.
-- **Integration is BDF1.** Adds modest numerical damping; expected for AVBD.
-  No extra viscous term is wired in yet — the hanging-chain plot shows
-  un-damped oscillation around steady state, which is correct (not a bug).
-- **Constraints are scalar-per-row.** A pin is 3 separate scalar
-  constraints. This is what makes the Warp arrays flat. The 2D reference
-  groups rows in a `MAX_ROWS=4` struct; the trade-off here is more
-  constraints but simpler memory layout.
+- **Apple Silicon ⇒ CPU-only Warp.** All demos run on CPU; switch
+  `device="cuda:0"` when on an NVIDIA machine. Kernels are GPU-clean already.
+  The 6-DOF solver's LBVH falls back to a SAH BVH on CPU.
+- **3-DOF box collision is AABB**, not OBB — the 3-DOF `Solver` was written
+  for particles + scalar constraints, so cubes don't rotate there. The full
+  OBB SAT lives in `Solver6DOF`.
+- **3-DOF G term in the Hessian is zero.** Paper Sec. 3.5 says to use a
+  diagonal G̃ from `λ⁺·∂²C/∂x²`. For DISTANCE/SPHERE_CONTACT/SPHERE_BOX/
+  BOX_BOX rows this is paper-noncompliant. Stable on the demos but a real
+  deviation. The 6-DOF solver implements G̃ via `geom_stiffness_diag`.
+- **Eq. 14 saturated-Hessian rescaling** is implemented in `Solver6DOF`
+  (`primal_update_6dof` rescales `k` in the LHS only to
+  `|bound − λ⁺| / |C|` when force clamps). The 3-DOF `primal_update`
+  still uses raw `c_penalty[j]`.
+- **Edge-edge OBB contact** in `Solver6DOF` now does the proper
+  closest-segment-pair on the two edges that produced the SAT axis
+  (Ericson §5.1.9, `solver_6dof._emit_obb_edge_edge`). The 3-DOF
+  AABB-only box path stays single-feature.
+- **Integration is BDF1.** Adds modest numerical damping; expected for
+  AVBD. The hanging-chain demo's un-damped oscillation around steady state
+  is correct (no extra viscous term wired in).
+- **3-DOF constraints are scalar-per-row.** A pin is 3 scalar
+  constraints. The 2D reference groups rows in a `MAX_ROWS=4` struct; this
+  port trades layout simplicity for more constraints.
+- **No revolute / spherical / motor joints**, no angular springs.
+  Paper showcases these (Figs. 5/7/9) using the same Eq. 8 hard-constraint
+  energy with a bespoke `C` — straightforward to add but not done.
 
-## Next iteration
+## Next steps for the fracture project
 
-Implementation roadmap is in `../project_roadmap.md`. The next milestones for
-this codebase specifically are:
+Implementation roadmap is in `../project_roadmap.md`. The next milestones:
 
-1. **6-DOF rigid bodies.** Add per-body quaternion, world-frame ω, inverse
-   inertia tensor. Per-body block becomes 6×6. Generalize all constraint
-   Jacobians to map from twist (Δp, Δθ) ∈ ℝ⁶ to scalar C.
-2. **Cohesive interface constraint** (`CohesiveInterface`): a 2-row
-   constraint between two rigid fragments. Row 0 = normal separation δ_n,
-   row 1+2 = tangential δ_t. Stiffness from `k_n = E·A/h` calibrated against
-   AVBD's penalty clamp (Gap M1.1 in the audit).
-3. **Energy criterion** in the dual update path: in addition to the
-   |λ| ≥ fracture impulse check, also evaluate `E_i = ½k_n δ_n² + ½k_t‖δ_t‖²`
-   and break when `E_i ≥ G_c·ΔA_i`.
-4. **I3D-2018 Δv impulse**: on break, apply `μ = √(2α·E_release·m_eff)` along
-   the interface normal with Newton-Euler distribution to both fragments.
-5. **Offline candidate-graph generation** (Voronoi prefracture → ΔA, n_i,
+1. **Cohesive interface constraint** (`CohesiveInterface`): a 3-row
+   constraint between two rigid fragments (1 normal + 2 tangential).
+   Stiffness from `k_n = E·A/h` calibrated against AVBD's penalty clamp
+   (Gap M1.1 in the audit).
+2. **Griffith energy criterion** alongside the |λ|-threshold check:
+   evaluate `E_i = ½k_n δ_n² + ½k_t‖δ_t‖²` and break when
+   `E_i ≥ G_c·ΔA_i`.
+3. **I3D-2018 Δv impulse**: on break, apply
+   `μ = √(2α·E_release·m_eff)` along the interface normal with
+   Newton-Euler distribution to both fragments.
+4. **Offline candidate-graph generation** (Voronoi prefracture → ΔA, n_i,
    t_i, adjacency).
+
+And separately, to close the remaining AVBD-paper gaps:
+
+5. Implement **Eq. 14 Hessian rescaling** for saturated constraints in
+   both solvers.
+6. Wire **diagonal G̃** into the 3-DOF `primal_update` for DISTANCE /
+   SPHERE / BOX rows.
+7. Replace 3-DOF brute O(N²) broad phase with `wp.Bvh`.
+8. Add revolute / ball-socket joints if the fracture demo ever needs
+   articulated bodies.
