@@ -454,3 +454,127 @@ def test_eq14_hessian_rescaling_settles_box_on_floor():
     assert abs(y_settled - h) < 2.0e-3, (
         f"settled y={y_settled} expected ~{h} (half-extent on floor)"
     )
+
+
+def _cuda_available():
+    try:
+        import warp as wp
+        return wp.is_cuda_available()
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _cuda_available(),
+                    reason="graph-capture path is CUDA-only")
+def test_set_velocity_writes_buffer_owned_by_captured_graph():
+    """Regression for the viewer 'kick all' bug.
+
+    On CUDA the inner solve loop is CUDA-graph captured; the captured graph
+    bakes in the *device pointers* of self.x/q/v/omega (finalize_and_cap_6dof
+    writes self.v / self.omega each substep). If `set_velocity` rebinds
+    `self.v` to a fresh allocation instead of writing the existing buffer in
+    place, the captured finalize keeps writing the OLD, orphaned buffer while
+    `velocities()` / predict read the NEW one — they desync. The tell-tale
+    symptom: after a step, `self.v` is FROZEN at exactly the value we set
+    (finalize never touched the buffer it points to), so gravity's per-step
+    integration is silently lost and kicked bodies float away.
+
+    We assert the opposite invariant: after set_velocity + one step, the live
+    velocity buffer has been updated by the solve (it is no longer the exact
+    value we wrote). The mid-sim add_box + _flush in between recaptures the
+    graph against the post-flush arrays, matching the viewer's drop-then-kick
+    sequence that surfaced the bug.
+    """
+    h = 0.15
+    s = Solver6DOF(dt=1/60, iterations=15, substeps=4, gravity=(0., -9.81, 0.),
+                   post_stabilize=True, device="cuda")
+    s.enable_self_collision(True, default_friction=0.5)
+    # Two resting cubes provide the static contact rows that make
+    # n_active > 0, so the inner loop is actually graph-captured.
+    for k in range(2):
+        b = s.add_box((0., h + 2 * h * k + 0.02 * k, 0.), (h, h, h),
+                      mass=1.0, friction=0.5)
+        s.add_floor_contact_box(b, friction=0.5)
+    for _ in range(60):  # settle + capture graph
+        s.step()
+
+    # Drop a fresh box mid-sim (flush rebinds arrays + nulls the graph), then
+    # step so the graph recaptures against the new array set — exactly the
+    # viewer's "drop a fresh box" before "kick all".
+    nb = s.add_box((0.3, 2.0, 0.3), (h, h, h), mass=1.0, friction=0.5)
+    s.add_floor_contact_box(nb, friction=0.5)
+    s._flush()
+    for _ in range(60):  # let it land + recapture
+        s.step()
+
+    # Kick a resting body to a distinctive velocity, then step once.
+    target = (1.7, 2.3, -1.1)
+    body0 = type("B", (), {"index": 0})()
+    s.set_velocity(body0, target)
+    s.step()
+
+    v_after = s.velocities()[0]
+    # On the buggy (rebind) path the captured finalize writes the orphaned
+    # buffer, so v_after == target exactly. On the fixed (in-place) path the
+    # solve integrates gravity + contact into the live buffer, so it differs.
+    assert not np.allclose(v_after, target, atol=1e-4), (
+        f"velocity frozen at the kicked value {target} after a step — the "
+        "captured graph is writing a stale buffer (set_velocity rebound the "
+        "array instead of assigning in place)"
+    )
+    assert np.all(np.isfinite(s.positions()))
+    assert np.all(np.isfinite(s.velocities()))
+
+
+@pytest.mark.skipif(not _cuda_available(),
+                    reason="graph-capture path is CUDA-only")
+def test_kick_all_after_midsim_add_box_settles_under_gravity():
+    """End-to-end form of the viewer bug: build a small stack, drop a fresh
+    box mid-sim, kick every body, and confirm gravity still wins — bodies
+    fall back down instead of floating away."""
+    h = 0.12
+    s = Solver6DOF(dt=1/60, iterations=20, substeps=6, gravity=(0., -9.81, 0.),
+                   post_stabilize=True, device="cuda")
+    s.enable_self_collision(True, default_friction=0.5)
+    # 2x2 grid of 3-tall towers — enough bodies for floating to be obvious.
+    for ix in range(2):
+        for iz in range(2):
+            for k in range(3):
+                b = s.add_box((0.5 * ix, h + 2 * h * k, 0.5 * iz),
+                              (h, h, h), mass=1.0, friction=0.5)
+                s.add_floor_contact_box(b, friction=0.5)
+    for _ in range(80):  # settle + capture graph
+        s.step()
+
+    nb = s.add_box((0.25, 2.0, 0.25), (h, h, h), mass=1.0, friction=0.5)
+    s.add_floor_contact_box(nb, friction=0.5)
+    s._flush()
+    for _ in range(80):  # land the dropped box + recapture graph
+        s.step()
+
+    rng = np.random.default_rng(0)
+    for i in range(s.positions().shape[0]):
+        body = type("B", (), {"index": i})()
+        v = s.velocities()[i]
+        w = s.angular_velocities()[i]
+        s.set_velocity(body, tuple(float(v[j] + rng.uniform(-2.5, 2.5))
+                                   for j in range(3)))
+        s.set_angular_velocity(body, tuple(float(w[j] + rng.uniform(-3., 3.))
+                                           for j in range(3)))
+
+    for _ in range(120):  # 2 s — gravity should pull everything back down
+        s.step()
+
+    pos = s.positions()
+    vel = s.velocities()
+    assert np.all(np.isfinite(pos)) and np.all(np.isfinite(vel))
+    max_y = float(pos[:, 1].max())
+    mean_speed = float(np.linalg.norm(vel, axis=1).mean())
+    assert max_y < 1.2, (
+        f"a body floated to y={max_y:.2f} after the post-drop kick — gravity "
+        "was lost (captured graph writing a stale velocity buffer)"
+    )
+    assert mean_speed < 0.6, (
+        f"bodies still drifting (mean speed {mean_speed:.2f} m/s) — should "
+        "have settled back to the floor"
+    )

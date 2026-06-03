@@ -570,29 +570,41 @@ class Solver6DOF:
 
     # ---- Runtime perturbations ---------------------------------------------
 
+    # NOTE: these setters write into the EXISTING device buffer with
+    # `.assign()` rather than rebinding `self.x/q/v/omega` to a fresh
+    # `wp.array`. The captured CUDA graph in `_run_iter_loop` bakes in the
+    # device pointers of these arrays (e.g. finalize_and_cap_6dof writes
+    # self.v / self.omega; primal_update_6dof read/writes self.x / self.q).
+    # Rebinding would leave the graph writing the old, orphaned buffer while
+    # predict_inertial_6dof (outside the graph) reads the new one — they
+    # desync, finalize's integrated velocity never reaches the array the next
+    # predict reads, and gravity's correction is silently lost (bodies float).
+    # In-place assign keeps the buffer the graph references valid, so no
+    # recapture is needed. Regression: test_solver_6dof.py
+    # ::test_set_velocity_writes_buffer_owned_by_captured_graph.
     def set_position(self, body: RigidBody, p: tuple[float, float, float]) -> None:
         self._flush()
         xs = self.x.numpy().copy()
         xs[body.index] = np.array(p, dtype=np.float32)
-        self.x = wp.array(xs, dtype=wp.vec3, device=self.device)
+        self.x.assign(xs)
 
     def set_orientation(self, body: RigidBody, q_xyzw: tuple[float, float, float, float]) -> None:
         self._flush()
         qs = self.q.numpy().copy()
         qs[body.index] = np.array(q_xyzw, dtype=np.float32)
-        self.q = wp.array(qs, dtype=wp.quat, device=self.device)
+        self.q.assign(qs)
 
     def set_velocity(self, body: RigidBody, v: tuple[float, float, float]) -> None:
         self._flush()
         vs = self.v.numpy().copy()
         vs[body.index] = np.array(v, dtype=np.float32)
-        self.v = wp.array(vs, dtype=wp.vec3, device=self.device)
+        self.v.assign(vs)
 
     def set_angular_velocity(self, body: RigidBody, w: tuple[float, float, float]) -> None:
         self._flush()
         ws = self.omega.numpy().copy()
         ws[body.index] = np.array(w, dtype=np.float32)
-        self.omega = wp.array(ws, dtype=wp.vec3, device=self.device)
+        self.omega.assign(ws)
 
     # ---- Warp upload --------------------------------------------------------
 
