@@ -2325,3 +2325,140 @@ def gpu_color_bodies_scatter(
         return
     slot = wp.atomic_add(color_cursor, c, 1)
     color_bodies[color_starts[c] + slot] = i
+
+
+@wp.kernel
+def gpu_max_color(
+    body_color: wp.array(dtype=int),
+    out_max_color: wp.array(dtype=int),   # shape [1], pre-zeroed
+):
+    """Reduce max(body_color) into out_max_color[0] (pre-zeroed by the
+    caller). The *achieved* color count is out_max_color[0] + 1: colors
+    are 0-based and both Jones–Plassmann and the speculative-greedy
+    coloring assign a contiguous, gap-free range starting at 0, so the
+    highest used color + 1 is exactly the number of non-empty colors.
+
+    This is read back once per substep to bound the per-color primal loop
+    (no point launching the empty tail up to MAX_COLORS) and to key the
+    CUDA-graph signature so a changed count forces a recapture."""
+    i = wp.tid()
+    if i >= body_color.shape[0]:
+        return
+    c = body_color[i]
+    if c >= 0:
+        wp.atomic_max(out_max_color, 0, c)
+
+
+# ---- Speculative ("Jacobi") greedy coloring (A2) ------------------------
+# An alternative to Jones–Plassmann, switchable at runtime. Each round colors
+# *every* uncolored body at once (Jacobi sweep) by first-fit, then un-colors
+# the loser of any same-color adjacency. Converges in O(few) rounds for the
+# sparse contact graphs we see and packs colors more tightly than JP, so the
+# achieved color count (and thus the primal serialization chain) is usually
+# smaller. Produces a valid (conflict-free) partition exactly like JP; only
+# the assignment strategy differs — the AVBD solve that consumes it is
+# unchanged. Shares the adjacency CSR and the bincount/scatter tail.
+@wp.kernel
+def gpu_color_spec_assign(
+    body_neighbor_starts: wp.array(dtype=int),
+    body_neighbor_counts: wp.array(dtype=int),
+    body_neighbor_indices: wp.array(dtype=int),
+    body_color: wp.array(dtype=int),
+):
+    """Assign phase: every still-uncolored body picks (in parallel, from
+    the same snapshot) the smallest color not used by an already-colored
+    neighbor. Two adjacent uncolored bodies may collide on a color this
+    round — gpu_color_spec_resolve un-colors the lower-priority one."""
+    i = wp.tid()
+    if i >= body_color.shape[0]:
+        return
+    if body_color[i] != -1:
+        return
+    start = body_neighbor_starts[i]
+    end = start + body_neighbor_counts[i]
+    used_lo = wp.uint32(0)   # bits 0..31 — covers MAX_COLORS ≤ 32
+    for k in range(start, end):
+        nb = body_neighbor_indices[k]
+        c = body_color[nb]
+        if c >= 0 and c < int(MAX_COLORS):
+            used_lo = used_lo | (wp.uint32(1) << wp.uint32(c))
+    chosen = int(MAX_COLORS) - 1
+    for c in range(int(MAX_COLORS)):
+        if (used_lo & (wp.uint32(1) << wp.uint32(c))) == wp.uint32(0):
+            chosen = c
+            break
+    body_color[i] = chosen
+
+
+@wp.kernel
+def gpu_color_spec_resolve(
+    body_priority: wp.array(dtype=float),
+    body_neighbor_starts: wp.array(dtype=int),
+    body_neighbor_counts: wp.array(dtype=int),
+    body_neighbor_indices: wp.array(dtype=int),
+    body_color: wp.array(dtype=int),        # post-assign snapshot (in)
+    body_color_next: wp.array(dtype=int),   # survivor coloring (out)
+):
+    """Conflict-resolution phase: reads the post-assign snapshot and
+    writes survivors into `body_color_next` (double-buffered to avoid an
+    in-place read/write race). A body keeps its color unless it shares it
+    with a higher-priority neighbor (tie-break by lower index), in which
+    case it is un-colored (-1) to retry next round. Exactly one body of
+    each conflicting pair loses, so the survivors are conflict-free."""
+    i = wp.tid()
+    if i >= body_color.shape[0]:
+        return
+    ci = body_color[i]
+    body_color_next[i] = ci
+    if ci < 0:
+        return
+    my_pri = body_priority[i]
+    start = body_neighbor_starts[i]
+    end = start + body_neighbor_counts[i]
+    for k in range(start, end):
+        nb = body_neighbor_indices[k]
+        if body_color[nb] == ci:
+            if body_priority[nb] > my_pri or (body_priority[nb] == my_pri
+                                              and nb < i):
+                body_color_next[i] = -1
+                return
+
+
+@wp.kernel
+def gpu_count_uncolored(
+    body_color: wp.array(dtype=int),
+    out_count: wp.array(dtype=int),   # shape [1], pre-zeroed
+):
+    """Count bodies still uncolored (body_color == -1) into out_count[0].
+    Drives the speculative-coloring convergence loop: stop once zero."""
+    i = wp.tid()
+    if i >= body_color.shape[0]:
+        return
+    if body_color[i] == -1:
+        wp.atomic_add(out_count, 0, 1)
+
+
+@wp.kernel
+def gpu_count_color_conflicts(
+    n_active_rows: wp.array(dtype=int),
+    c_type: wp.array(dtype=int),
+    c_body_a: wp.array(dtype=int),
+    c_body_b: wp.array(dtype=int),
+    body_color: wp.array(dtype=int),
+    out_conflicts: wp.array(dtype=int),   # shape [1], pre-zeroed
+):
+    """Diagnostic: count active body-body rows whose two bodies share a
+    color (a coloring race in primal_update). Must be 0 for any valid
+    coloring. Mirrors the edge definition in gpu_body_adj_count (skips
+    PIN rows, whose c_body_b is an axis id, and self/invalid pairs)."""
+    j = wp.tid()
+    if j >= n_active_rows[0]:
+        return
+    if c_type[j] == PIN_6DOF:
+        return
+    a = c_body_a[j]
+    b = c_body_b[j]
+    if a < 0 or b < 0 or a == b:
+        return
+    if body_color[a] == body_color[b]:
+        wp.atomic_add(out_conflicts, 0, 1)

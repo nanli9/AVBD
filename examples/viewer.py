@@ -66,9 +66,10 @@ def random_orientation(rng: np.random.Generator) -> tuple[float, float, float, f
 
 
 def build_scene(args) -> tuple[Solver6DOF, list[ViewerBox], list[int]]:
-    """Build a 6-DOF scene: pinned anchor + a grid of cube towers + a row
-    of standing domino slabs. Stresses the OBB-OBB contact + persistent
-    augmented-Lagrangian warm-start that AVBD relies on for stable stacks.
+    """Build a 6-DOF scene: a grid of cube towers + a row of standing
+    domino slabs (the pinned anchor box was removed — see git history).
+    Stresses the OBB-OBB contact + persistent augmented-Lagrangian
+    warm-start that AVBD relies on for stable stacks.
     Returns solver, list of viewer boxes, list of pin-row indices."""
     s = Solver6DOF(
         dt=1.0 / 60.0,
@@ -78,6 +79,7 @@ def build_scene(args) -> tuple[Solver6DOF, list[ViewerBox], list[int]]:
         device=args.device,
         substeps=int(args.substeps),
         friction_static_mult=float(args.static_mult),
+        coloring_mode=str(getattr(args, "coloring", "jones_plassmann")),
     )
     s.enable_self_collision(True, default_friction=args.friction)
     boxes: list[ViewerBox] = []
@@ -92,19 +94,10 @@ def build_scene(args) -> tuple[Solver6DOF, list[ViewerBox], list[int]]:
         return [(value, t, p), (q_v, value, p), (p, value, t),
                 (p, q_v, value), (t, p, value), (value, p, q_v)][i % 6]
 
-    # --- 1. Pinned anchor box (off to the side so it doesn't hit towers) ----
-    h_anchor = (0.16, 0.16, 0.16)
-    anchor_world_pin = (-2.0, args.top_y, -2.0)
-    pos_anchor = (
-        anchor_world_pin[0] - h_anchor[0],
-        anchor_world_pin[1] - h_anchor[1],
-        anchor_world_pin[2] - h_anchor[2],
-    )
-    anchor = s.add_box(pos_anchor, h_anchor, mass=1.0, friction=args.friction)
-    s.add_pin_corner(anchor, body_local=h_anchor, world_point=anchor_world_pin)
-    s.add_floor_contact_box(anchor, friction=args.friction)
-    boxes.append(ViewerBox(body=anchor, handle=None, tc=None,
-                           color=(0.9, 0.25, 0.25)))
+    # --- 1. Pinned anchor box: removed for now (see git history to restore).
+    # It was a pin-constrained box off to the side; it never touched the
+    # towers, so dropping it doesn't change tower behaviour. (--top-y, which
+    # set its pin height, is now unused.)
 
     # --- 2. Grid of cube towers ---------------------------------------------
     # 3×3 layout, each tower is `tower_height` cubes tall. Cube half-extent
@@ -197,9 +190,8 @@ class Viewer:
             self._add_box_primitive(vb, name=f"/bodies/{i}")
 
         # transform controls — hidden by default (toggle via "drag mode")
+        # (Every box is draggable now that the pinned anchor is gone.)
         for i, vb in enumerate(self.boxes):
-            if i == 0:
-                continue  # pinned anchor isn't draggable
             tc = self.server.scene.add_transform_controls(
                 f"/drag/{i}",
                 position=tuple(self.solver.positions()[vb.body.index]),
@@ -218,6 +210,19 @@ class Viewer:
             self.gui_pause = self.server.gui.add_checkbox("pause", initial_value=False)
             self.gui_iters = self.server.gui.add_slider("iterations", 1, 40,
                                                        step=1, initial_value=args.iterations)
+            self.gui_substeps = self.server.gui.add_slider(
+                "substeps", 1, 20, step=1, initial_value=int(args.substeps),
+                hint="AVBD substeps per visual frame. The augmented-Lagrangian "
+                     "penalty grows once per substep, so more substeps "
+                     "stabilise stiff stacks better than more iterations "
+                     "(paper Fig. 6 uses 5). Higher = stabler but slower.")
+            self.gui_coloring = self.server.gui.add_dropdown(
+                "coloring", ("jones_plassmann", "jacobi"),
+                initial_value=self.solver.coloring_mode,
+                hint="Graph-coloring algorithm for the per-color primal "
+                     "updates. 'jacobi' (speculative greedy) usually packs "
+                     "fewer colors → shorter serialization chain. Physics is "
+                     "identical; switch live to compare colors/speed.")
             self.gui_gravity = self.server.gui.add_slider("gravity (m/s²)", -30.0, 0.0,
                                                          step=0.5, initial_value=-9.81)
             self.gui_friction = self.server.gui.add_slider(
@@ -309,6 +314,8 @@ class Viewer:
         self.gui_snap.on_click(lambda _: self._snap_gizmos())
         self.gui_reset.on_click(lambda _: self._reset())
         self.gui_iters.on_update(self._iters_changed)
+        self.gui_substeps.on_update(self._substeps_changed)
+        self.gui_coloring.on_update(self._coloring_changed)
         self.gui_gravity.on_update(self._gravity_changed)
         self.gui_drag_mode.on_update(self._drag_mode_changed)
         self.gui_friction.on_update(self._friction_changed)
@@ -339,6 +346,14 @@ class Viewer:
         self._step_ms_window: list[float] = []
         self._wall_tick_ms_window: list[float] = []
         self._last_tick_t = time.perf_counter()
+        # B1: per-row HUD diagnostics (max λ, active/total, sticking) are
+        # read back only every Nth tick — they feed text, not rendering, so
+        # ~10 Hz is plenty. Between refreshes the cached strings are reused,
+        # dropping 2 of the 3 per-tick stream syncs on the common path.
+        self._hud_row_interval = 6
+        self._hud_maxlam = "0.0"
+        self._hud_constraints = "0/0 active"
+        self._hud_static = "0 sticking"
 
     # ----- helpers --------------------------------------------------------
     def _add_box_primitive(self, vb: ViewerBox, name: str):
@@ -508,8 +523,6 @@ class Viewer:
         for i, vb in enumerate(self.boxes):
             self._add_box_primitive(vb, f"/bodies/{i}")
         for i, vb in enumerate(self.boxes):
-            if i == 0:
-                continue
             tc = self.server.scene.add_transform_controls(
                 f"/drag/{i}",
                 position=tuple(positions_after_build[vb.body.index]),
@@ -521,12 +534,23 @@ class Viewer:
             vb.tc = tc
             self._wire_drag(vb)
         self._iters_changed(None)
+        self._substeps_changed(None)
         self._gravity_changed(None)
         self._frame = 0
 
     def _iters_changed(self, _evt):
         with self._solver_lock:
             self.solver.iterations = int(self.gui_iters.value)
+
+    def _substeps_changed(self, _evt):
+        with self._solver_lock:
+            # Plain int attribute; the next step() re-derives sub_dt and the
+            # graph signature picks up the new dt, forcing a clean recapture.
+            self.solver.substeps = max(1, int(self.gui_substeps.value))
+
+    def _coloring_changed(self, _evt):
+        with self._solver_lock:
+            self.solver.coloring_mode = str(self.gui_coloring.value)
 
     def _gravity_changed(self, _evt):
         g = float(self.gui_gravity.value)
@@ -628,7 +652,9 @@ class Viewer:
             # AVBD_PERFORMANCE_GAP §6: this cuts the per-tick stream syncs
             # from ~7 to 2 by packing everything the HUD + scene update
             # needs into two pre-allocated Warp buffers.
-            state = self.solver.read_state_batched()
+            # B1: only pull the HUD-only per-row diagnostics every Nth tick.
+            want_rows = (self._frame % self._hud_row_interval) == 0
+            state = self.solver.read_state_batched(include_rows=want_rows)
             pos = state["positions"]
             qs = state["orientations"]
             w = state["angular_velocities"]
@@ -642,11 +668,13 @@ class Viewer:
             # Static-friction occupancy — c_was_static is per-row but only
             # meaningful on NORMAL contact rows (FLOOR / BOX_BOX). Counting
             # those gives "how many contacts are currently sticking".
-            n_static = 0
-            if was_static is not None and len(was_static):
-                # FLOOR_CONTACT_6DOF = 0, BOX_BOX_CONTACT_6DOF = 3
-                mask = (c_type == 0) | (c_type == 3)
-                n_static = int((was_static[mask] != 0).sum())
+            if want_rows:
+                n_static = 0
+                if was_static is not None and len(was_static):
+                    # FLOOR_CONTACT_6DOF = 0, BOX_BOX_CONTACT_6DOF = 3
+                    mask = (c_type == 0) | (c_type == 3)
+                    n_static = int((was_static[mask] != 0).sum())
+                self._hud_static = f"{n_static} sticking"
             # Snapshot the boxes list under the lock — bodies whose index
             # is past `len(pos)` would IndexError below. `_drop_box`
             # appends to self.boxes inside the solver lock, so taking
@@ -702,8 +730,10 @@ class Viewer:
         self.gui_time.value = f"{self._frame * self.solver.dt:.2f}"
         max_w = float(np.linalg.norm(w, axis=1).max()) if len(w) else 0.0
         self.gui_maxw.value = f"{max_w:.2f}"
-        max_lam = float(np.abs(lam).max()) if len(lam) else 0.0
-        self.gui_maxlam.value = f"{max_lam:.1f}"
+        if want_rows:
+            max_lam = float(np.abs(lam).max()) if len(lam) else 0.0
+            self._hud_maxlam = f"{max_lam:.1f}"
+        self.gui_maxlam.value = self._hud_maxlam
 
         # Performance
         self._step_ms_window.append(dt * 1000.0)
@@ -721,13 +751,19 @@ class Viewer:
         self.gui_perf_capacity.value = f"{1000.0/max(step_ms, 1e-3):.0f} Hz"
         self.gui_perf_wall.value = f"{1000.0/max(wall_ms, 1e-3):.0f} Hz"
         self.gui_perf_bodies.value = str(len(self.boxes))
-        n_active = int(act.sum()) if len(act) else 0
-        self.gui_perf_constraints.value = f"{n_active}/{n_rows_total} active"
-        per_color = (len(self.boxes) / max(n_colors, 1)) if n_colors else 0.0
-        self.gui_perf_colors.value = f"{n_colors}  (~{per_color:.1f} bodies/color)"
+        if want_rows:
+            n_active = int(act.sum()) if len(act) else 0
+            self._hud_constraints = f"{n_active}/{n_rows_total} active"
+        self.gui_perf_constraints.value = self._hud_constraints
+        n_active_colors = int(self.solver.num_active_colors)
+        per_color = (len(self.boxes) / max(n_active_colors, 1)) \
+            if n_active_colors else 0.0
+        self.gui_perf_colors.value = (
+            f"{n_active_colors} active / {n_colors} cap  "
+            f"(~{per_color:.1f} bodies/color, {self.solver.coloring_mode})")
         self.gui_perf_broadphase.value = (
             f"{bp_ms:.2f} ms  ({100*bp_ms/max(step_ms,1e-3):.0f}% of step)")
-        self.gui_perf_static_n.value = f"{n_static} sticking"
+        self.gui_perf_static_n.value = self._hud_static
 
     def run(self):
         target_dt = self.solver.dt
@@ -1313,6 +1349,13 @@ def main():
                    help="Number of inner sub-steps per solver.step(). Stiff "
                         "stacking needs ≥8 to converge without bouncing "
                         "(AVBD paper Fig. 6 uses 5).")
+    p.add_argument("--coloring", type=str, default="jones_plassmann",
+                   choices=("jones_plassmann", "jacobi"),
+                   help="Graph-coloring algorithm used to parallelize the "
+                        "per-color primal updates. 'jacobi' (speculative "
+                        "greedy) packs colors tighter than Jones–Plassmann, "
+                        "shrinking the serialization chain. Switchable live "
+                        "in the GUI; the AVBD solve is identical either way.")
     # ---- Deformable-bunny mode flags ----------------------------------------
     p.add_argument("--deformable-bunny", action="store_true",
                    help="Replace the rigid-body scene with a deformable "
@@ -1386,11 +1429,13 @@ def run_headless(args) -> None:
     print(f"substeps:         {solver.substeps}")
     print(f"iterations:       {solver.iterations}")
     print(f"post_stabilize:   {solver.post_stabilize}")
+    print(f"coloring mode:    {solver.coloring_mode}")
 
     # Trigger the one-time _flush + JIT compile inside the warmup window.
     for _ in range(args.headless_warmup):
         solver.step()
-    print(f"colors:           {solver.num_colors}")
+    print(f"colors (cap):     {solver.num_colors}")
+    print(f"colors (active):  {solver.num_active_colors}")
     print(f"total rows (cap): {solver._gpu_pool_n_capacity}")
 
     n = max(1, int(args.headless_frames))

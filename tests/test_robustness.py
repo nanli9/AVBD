@@ -76,6 +76,83 @@ def test_coloring_safety_for_stack():
             f"stack bodies {i} and {i+1} share color {colors[i]}")
 
 
+@pytest.mark.parametrize("mode", ["jones_plassmann", "jacobi"])
+def test_coloring_mode_conflict_free(mode):
+    """Both coloring algorithms (Jones–Plassmann and the speculative
+    'jacobi' greedy, A2) must produce a conflict-free partition — no two
+    bodies sharing an active constraint may share a color, else
+    primal_update would race. A dense overlapping stack forces several
+    colors so the check is meaningful."""
+    s = Solver6DOF(gravity=(0, -9.8, 0), iterations=4, coloring_mode=mode)
+    for i in range(6):
+        s.add_box(position=(0.0, 0.5 + i * 0.85, 0.0),
+                  half_extents=(0.5, 0.5, 0.5), mass=1.0, friction=0.3)
+    s.enable_self_collision(True)
+    s.step()
+    assert s.coloring_mode == mode
+    assert s.count_color_conflicts() == 0, (
+        f"{mode} coloring produced adjacent same-color bodies")
+    assert 1 <= s.num_active_colors <= s._max_colors
+
+
+def test_coloring_mode_switch_takes_effect_at_runtime():
+    """Switching `coloring_mode` mid-sim must actually re-partition the
+    bodies, not just relabel the attribute. Regression for the A4 gate
+    bug: the setter left `_color_dirty` False, so `_step_one` reused the
+    prior (still conflict-free) coloring and the new method never ran
+    until a contact change happened to force a recolor.
+
+    Uses the dense overlapping stack where Jones–Plassmann needs 3 colors
+    but the speculative 'jacobi' greedy packs into 2 — so a switch that
+    truly takes effect is observable as a drop in `num_active_colors`."""
+    def make(mode):
+        s = Solver6DOF(gravity=(0, -9.8, 0), iterations=4, coloring_mode=mode)
+        for i in range(6):
+            s.add_box(position=(0.0, 0.5 + i * 0.85, 0.0),
+                      half_extents=(0.5, 0.5, 0.5), mass=1.0, friction=0.3)
+        s.enable_self_collision(True)
+        return s
+
+    s = make("jones_plassmann")
+    s.step()
+    jp_colors = s.num_active_colors
+    # Steady state: the gate has settled and would skip a recolor.
+    assert s._color_dirty is False
+
+    # The precise regression guard: the setter must arm a recolor.
+    s.coloring_mode = "jacobi"
+    assert s._color_dirty is True, (
+        "switching coloring_mode did not mark the coloring dirty — the "
+        "live switch would be a no-op until contacts change")
+
+    s.step()
+    assert s.coloring_mode == "jacobi"
+    assert s.count_color_conflicts() == 0
+    # The jacobi partition actually ran: it packs no worse than JP did.
+    assert s.num_active_colors <= jp_colors
+
+    # Setting the same mode again is a no-op — must NOT force a needless
+    # recolor on an already-settled stack.
+    s.step()
+    assert s._color_dirty is False
+    s.coloring_mode = "jacobi"
+    assert s._color_dirty is False
+
+
+def test_jacobi_coloring_packs_no_worse_than_jp():
+    """The speculative ('jacobi') coloring is first-fit, so on a chain it
+    should use no more colors than Jones–Plassmann (typically fewer)."""
+    def colors_for(mode):
+        s = Solver6DOF(gravity=(0, -9.8, 0), iterations=4, coloring_mode=mode)
+        for i in range(6):
+            s.add_box(position=(0.0, 0.5 + i * 0.85, 0.0),
+                      half_extents=(0.5, 0.5, 0.5), mass=1.0, friction=0.3)
+        s.enable_self_collision(True)
+        s.step()
+        return s.num_active_colors
+    assert colors_for("jacobi") <= colors_for("jones_plassmann")
+
+
 def test_coloring_after_dynamic_contact():
     """Two bodies start far enough apart that their initial AABBs
     (inflated or not) do not overlap, then move into contact. Before

@@ -179,9 +179,17 @@ class Solver6DOF:
         max_angular_speed: float = 50.0,
         substeps: int = 1,
         friction_static_mult: float = 1.5,
+        coloring_mode: str = "jones_plassmann",
     ):
         wp.init()
         self.device = device
+        # Graph-coloring algorithm used to parallelize the per-color primal
+        # updates: "jones_plassmann" (default) or "jacobi" (speculative
+        # greedy). Switchable at runtime — coloring runs outside the captured
+        # graph, and a changed achieved color count recaptures via the
+        # signature. Only the *assignment* differs; the AVBD solve is identical.
+        self._coloring_mode = "jones_plassmann"
+        self.coloring_mode = coloring_mode
         self.dt = float(dt)
         self.iterations = int(iterations)
         self.gravity = tuple(float(g) for g in gravity)
@@ -214,6 +222,9 @@ class Solver6DOF:
         self._inv_I_local: list[np.ndarray] = []  # 3×3 each
         self._I_local: list[np.ndarray] = []      # 3×3 each (forward, for primal opt)
         self._half_extents: list[tuple[float, float, float]] = []
+        # Set when the body set changes; gates the broadphase half-extent
+        # re-upload (A5) so static half-extents aren't re-copied each substep.
+        self._he_dirty = True
         self._friction: list[float] = []
 
         self._rows: list[_Row] = []
@@ -232,6 +243,9 @@ class Solver6DOF:
         self.x_initial = self.q_initial = None
         self.x_inertial = self.q_inertial = None
         self.body_color = None
+        self.body_color_next = None
+        self.uncolored_dev = None
+        self.color_conflicts_dev = None
         self.c_type = self.c_body_a = self.c_body_b = None
         self.c_world_anchor = self.c_off_a = self.c_off_b = None
         self.c_rest = self.c_stiffness = None
@@ -241,6 +255,16 @@ class Solver6DOF:
         self.c_friction_static = self.c_partner = self.c_was_static = None
         self.body_con_starts = self.body_con_indices = None
         self.num_colors = 0
+        # Achieved color count (highest used color + 1), populated each
+        # recolor. Distinct from num_colors, which is the MAX_COLORS cap.
+        self.num_active_colors = 0
+        self._n_active_colors = 0
+        self.n_active_colors_dev = None
+        # Forces a full recolor on the next substep (set on any body-set
+        # change / flush). Between forced recolors the existing coloring is
+        # reused as long as it stays conflict-free against the live contacts
+        # (A4 — skip recolor when the contact graph is stable).
+        self._color_dirty = True
         # Broadphase scratch (AVBD Alg 1 line 1 — LBVH on device-side AABBs).
         # See _gpu_emit_dynamic_contacts for the per-substep pipeline.
         self._bp_half_extents = None    # wp.array(vec3) — body half-extents
@@ -345,6 +369,7 @@ class Solver6DOF:
         self._mass.append(float(mass))
         hx, hy, hz = float(half_extents[0]), float(half_extents[1]), float(half_extents[2])
         self._half_extents.append((hx, hy, hz))
+        self._he_dirty = True
         self._inv_I_local.append(box_inv_inertia_local(mass, hx, hy, hz))
         self._I_local.append(box_inertia_local_or_zero(mass, hx, hy, hz))
         self._friction.append(max(0.0, float(friction)))
@@ -474,18 +499,48 @@ class Solver6DOF:
         self._mf_off_ref = wp.zeros(cap * 4, dtype=wp.vec3, device=dev)
         self._mf_off_inc = wp.zeros(cap * 4, dtype=wp.vec3, device=dev)
 
+    _COLORING_MODES = ("jones_plassmann", "jacobi")
+
+    @property
+    def coloring_mode(self) -> str:
+        """Graph-coloring algorithm: 'jones_plassmann' or 'jacobi'
+        (speculative greedy). Settable at runtime (e.g. from the viewer)."""
+        return self._coloring_mode
+
+    @coloring_mode.setter
+    def coloring_mode(self, mode: str) -> None:
+        m = str(mode).strip().lower()
+        # Tolerate a few friendly aliases from GUI dropdowns.
+        if m in ("jp", "jones-plassmann", "jones plassmann"):
+            m = "jones_plassmann"
+        elif m in ("speculative", "speculative_greedy", "greedy"):
+            m = "jacobi"
+        if m not in self._COLORING_MODES:
+            raise ValueError(
+                f"coloring_mode must be one of {self._COLORING_MODES}, got {mode!r}")
+        if m != self._coloring_mode:
+            self._coloring_mode = m
+            # Force a recolor on the next step. Without this the A4 gate in
+            # `_step_one` only recolors when the *existing* partition has a
+            # conflict — but switching method leaves the old (still
+            # conflict-free) coloring in place, so the new method would not
+            # take effect until a contact change happened to force a recolor.
+            # A live switch must visibly re-partition, so we mark dirty.
+            self._color_dirty = True
+
     def _gpu_recolor(self, n_b: int, dev) -> None:
         """Device-side body coloring (round 3 §A). Builds the body-body
         adjacency CSR from the live `c_body_a` / `c_body_b` set written
-        by `_gpu_emit_dynamic_contacts`, runs Jones–Plassmann for
-        JP_ROUNDS rounds, then bucket-sorts bodies into `color_bodies` /
-        `color_starts`.
+        by `_gpu_emit_dynamic_contacts`, runs the coloring rounds for the
+        active `coloring_mode` (Jones–Plassmann or speculative 'jacobi'),
+        then bucket-sorts bodies into `color_bodies` / `color_starts`.
 
         No host-side readbacks; all of body_color, color_starts,
         color_bodies live on the device. The host-side `num_colors` is
-        an upper bound (`MAX_COLORS`), not the achieved count — the
-        primal launch loop unrolls to MAX_COLORS and empty colors no-op
-        via a device-side bounds check."""
+        an upper bound (`MAX_COLORS`), not the achieved count. A0/A1 reads
+        back the achieved count into `_n_active_colors` after this runs, and
+        the primal launch loop is bounded by that count (not unrolled to
+        MAX_COLORS), so the empty color tail is never launched."""
         if n_b < 1:
             return
         max_colors = self._max_colors
@@ -524,21 +579,12 @@ class Solver6DOF:
                     self.body_neighbor_indices],
             device=dev,
         )
-        # 5. Jones–Plassmann rounds. Each round colors one independent
-        # set; bounded loop fits cleanly inside graph capture.
-        jp_rounds = int(K.JP_ROUNDS.val) if hasattr(K.JP_ROUNDS, "val") \
-            else int(K.JP_ROUNDS)
-        for _ in range(jp_rounds):
-            wp.launch(
-                K.gpu_color_round, dim=n_b,
-                inputs=[self.body_priority,
-                        self.body_neighbor_starts,
-                        self.body_neighbor_counts,
-                        self.body_neighbor_indices,
-                        self.body_color],
-                device=dev,
-            )
-        # 6. Catch leftover uncolored bodies (very dense / tied graphs).
+        # 5-6. Coloring rounds (mode-dependent) + uncolored fallback.
+        if self._coloring_mode == "jacobi":
+            self._color_rounds_jacobi(n_b, dev)
+        else:
+            self._color_rounds_jp(n_b, dev)
+        # Catch leftover uncolored bodies (very dense / tied graphs).
         wp.launch(
             K.gpu_color_finalize, dim=n_b,
             inputs=[self.body_color], device=dev,
@@ -567,6 +613,92 @@ class Solver6DOF:
                     self.color_cursor, self.color_bodies],
             device=dev,
         )
+        # 11. Achieved-color-count reduction (A0): max(body_color) → dev[0].
+        # _step_one reads dev[0]+1 to bound the primal loop (A1).
+        self.n_active_colors_dev.zero_()
+        wp.launch(
+            K.gpu_max_color, dim=n_b,
+            inputs=[self.body_color, self.n_active_colors_dev],
+            device=dev,
+        )
+
+    def _color_rounds_jp(self, n_b: int, dev) -> None:
+        """Jones–Plassmann coloring rounds. Each round colors one
+        independent set (local priority maxima), so the partition is valid
+        without conflict resolution. JP_ROUNDS is a generous worst-case
+        bound; stragglers fall through to gpu_color_finalize."""
+        jp_rounds = int(K.JP_ROUNDS.val) if hasattr(K.JP_ROUNDS, "val") \
+            else int(K.JP_ROUNDS)
+        for _ in range(jp_rounds):
+            wp.launch(
+                K.gpu_color_round, dim=n_b,
+                inputs=[self.body_priority,
+                        self.body_neighbor_starts,
+                        self.body_neighbor_counts,
+                        self.body_neighbor_indices,
+                        self.body_color],
+                device=dev,
+            )
+
+    def _color_rounds_jacobi(self, n_b: int, dev) -> None:
+        """Speculative ('Jacobi') greedy coloring (A2). Each round colors
+        every uncolored body by first-fit (assign), then un-colors the
+        loser of any same-color adjacency (resolve, double-buffered). Loops
+        until no body is uncolored — adaptive, so sparse graphs finish in a
+        few rounds (vs JP's fixed JP_ROUNDS). The recolor runs outside the
+        captured graph, so the per-round host readback of the uncolored
+        count is safe. Capped at MAX_COLORS rounds; any residual is handled
+        by the shared gpu_color_finalize fallback."""
+        for _ in range(self._max_colors):
+            wp.launch(
+                K.gpu_color_spec_assign, dim=n_b,
+                inputs=[self.body_neighbor_starts,
+                        self.body_neighbor_counts,
+                        self.body_neighbor_indices,
+                        self.body_color],
+                device=dev,
+            )
+            wp.launch(
+                K.gpu_color_spec_resolve, dim=n_b,
+                inputs=[self.body_priority,
+                        self.body_neighbor_starts,
+                        self.body_neighbor_counts,
+                        self.body_neighbor_indices,
+                        self.body_color],
+                outputs=[self.body_color_next],
+                device=dev,
+            )
+            # Swap so body_color holds the survivor coloring for next round.
+            self.body_color, self.body_color_next = (
+                self.body_color_next, self.body_color)
+            # Converged once no body is uncolored. One int readback/round;
+            # ~2-4 rounds for our sparse contact graphs.
+            self.uncolored_dev.zero_()
+            wp.launch(
+                K.gpu_count_uncolored, dim=n_b,
+                inputs=[self.body_color, self.uncolored_dev],
+                device=dev,
+            )
+            if int(self.uncolored_dev.numpy()[0]) == 0:
+                break
+
+    def count_color_conflicts(self) -> int:
+        """Diagnostic (not in the hot path): number of active body-body
+        constraint rows whose two bodies share a color. Must be 0 for a
+        valid coloring in either mode — a nonzero count means primal_update
+        would race. Forces a device sync; call sparingly (tests / asserts)."""
+        if self.color_conflicts_dev is None or self.body_color is None:
+            return 0
+        dev = self.device
+        self.color_conflicts_dev.zero_()
+        wp.launch(
+            K.gpu_count_color_conflicts, dim=self._gpu_pool_n_capacity,
+            inputs=[self.n_active_rows, self.c_type,
+                    self.c_body_a, self.c_body_b, self.body_color,
+                    self.color_conflicts_dev],
+            device=dev,
+        )
+        return int(self.color_conflicts_dev.numpy()[0])
 
     # ---- Runtime perturbations ---------------------------------------------
 
@@ -730,10 +862,22 @@ class Solver6DOF:
         self.color_starts = wp.zeros(max_colors + 1, dtype=int, device=dev)
         self.color_cursor = wp.zeros(max_colors, dtype=int, device=dev)
         self.color_bodies = wp.zeros(max(n_b, 1), dtype=int, device=dev)
+        # Speculative ('jacobi') coloring scratch (A2): double-buffer for the
+        # conflict-resolution swap, an uncolored-count for convergence, and a
+        # conflict counter for the once-per-run validity check.
+        self.body_color_next = wp.zeros(max(n_b, 1), dtype=int, device=dev)
+        self.uncolored_dev = wp.zeros(1, dtype=int, device=dev)
+        self.color_conflicts_dev = wp.zeros(1, dtype=int, device=dev)
+        # Achieved-color-count reduction target (A0). max(body_color) lands
+        # here each recolor; _step_one reads it back as the host-side
+        # n_active_colors that bounds the primal loop (A1).
+        self.n_active_colors_dev = wp.zeros(1, dtype=int, device=dev)
         # Host-side metadata (no readbacks — kept only for the existing
         # diagnostic API surface; .num_colors is the upper bound, not the
-        # actual achieved count).
+        # actual achieved count, which is .num_active_colors).
         self.num_colors = max_colors
+        self.num_active_colors = max_colors
+        self._n_active_colors = max_colors
         self.color_counts = {}
         self._color_topology_sig = None
 
@@ -841,6 +985,8 @@ class Solver6DOF:
         self._gpu_pool_max_pairs = max_pairs
         self._gpu_pool_ready = True
         self._dirty = False
+        # Body set changed → force a full recolor and invalidate the capture.
+        self._color_dirty = True
         # Layout changed → previous capture (if any) is invalid.
         self._graph = None
 
@@ -932,7 +1078,26 @@ class Solver6DOF:
         # partition or its early-exit drops every body. With zero
         # body-body edges the JP rounds settle in one pass (all bodies
         # win, all pick color 0).
-        self._gpu_recolor(n_b, dev)
+        # A4: reuse the existing coloring when it is still conflict-free
+        # against the live contact set — only recolor when a newly-formed
+        # body-body edge would make two same-color bodies race. The conflict
+        # check is one launch + one int readback, far cheaper than a full
+        # recolor (adjacency build + coloring rounds + bucket sort). The
+        # _color_dirty short-circuit forces a recolor on the first substep
+        # after any flush (body_color is all -1 then) and skips the check on
+        # that path. Removing contacts never invalidates a coloring, so a
+        # resting/stable stack recolors once and then reuses every substep.
+        if self._color_dirty or self.count_color_conflicts() > 0:
+            self._gpu_recolor(n_b, dev)
+            self._color_dirty = False
+            # A0/A1: read back the achieved color count (highest used color
+            # + 1), clamped to [1, MAX_COLORS]. Bounds the per-color primal
+            # loop so the empty tail is never launched, and feeds the graph
+            # signature so a changed count recaptures.
+            n_active_colors = int(self.n_active_colors_dev.numpy()[0]) + 1
+            self._n_active_colors = max(1, min(n_active_colors,
+                                               self._max_colors))
+            self.num_active_colors = self._n_active_colors
 
         # Post-Phase-A: row-side launches all use fixed dim=row_dim with
         # device-side bounds via `self.n_active_rows[0]`. Lets the inner
@@ -1055,6 +1220,7 @@ class Solver6DOF:
             int(self.iterations),
             int(self.post_stabilize),
             int(self._max_colors),
+            int(self._n_active_colors),
             float(self.dt),
             float(self.alpha),
             float(self.beta),
@@ -1107,11 +1273,12 @@ class Solver6DOF:
                     device=dev,
                 )
 
-            # Per-color primal launch — unrolled to MAX_COLORS so the
-            # launch count is fixed at graph-capture time. Empty colors
-            # no-op via the kernel's `tid >= end - base` early-exit
-            # (round 3 §A). `color_starts` is device-resident.
-            for color_id in range(self._max_colors):
+            # Per-color primal launch — unrolled to the *achieved* color
+            # count (A1), not MAX_COLORS, so the empty tail is never
+            # launched. The count is baked into the graph signature, so a
+            # change recaptures. Within the captured graph the launch count
+            # is fixed. `color_starts` is device-resident.
+            for color_id in range(self._n_active_colors):
                 wp.launch(
                     K.primal_update_6dof, dim=n_b,
                     inputs=[self.x, self.q, self.mass,
@@ -1267,15 +1434,21 @@ class Solver6DOF:
         margin = 0.005
         MAX_PAIR_RETRIES = 2
 
-        # AABB inputs are body state; they don't depend on the pair cap.
-        he_np = np.asarray(self._half_extents, dtype=np.float32).reshape(-1, 3)
+        # AABB inputs are body state; they don't depend on the pair cap. The
+        # half-extents themselves are static between substeps — only add_box
+        # changes them (and sets _he_dirty) — so rebuild + re-upload only when
+        # the body set changed (A5), not every substep.
         if (self._bp_half_extents is None
                 or self._bp_half_extents.shape[0] != n_b):
+            he_np = np.asarray(self._half_extents, dtype=np.float32).reshape(-1, 3)
             self._bp_half_extents = wp.array(he_np, dtype=wp.vec3, device=dev)
             self._bp_aabb_lo = wp.zeros(n_b, dtype=wp.vec3, device=dev)
             self._bp_aabb_hi = wp.zeros(n_b, dtype=wp.vec3, device=dev)
-        else:
+            self._he_dirty = False
+        elif self._he_dirty:
+            he_np = np.asarray(self._half_extents, dtype=np.float32).reshape(-1, 3)
             self._bp_half_extents.assign(he_np)
+            self._he_dirty = False
 
         # Initial pair-buffer sizing matches the _flush heuristic.
         self._ensure_pair_buffers(max(256, 16 * n_b))
@@ -1403,7 +1576,7 @@ class Solver6DOF:
 
     # ---- Batched readback (AVBD_PERFORMANCE_GAP §6) ------------------------
 
-    def read_state_batched(self) -> dict[str, np.ndarray]:
+    def read_state_batched(self, include_rows: bool = True) -> dict[str, np.ndarray]:
         """Pack everything the interactive viewer needs into TWO contiguous
         Warp arrays, then issue a single .numpy() per packed buffer. Replaces
         seven separate stream-syncing .numpy() calls with two.
@@ -1417,6 +1590,13 @@ class Solver6DOF:
             was_static         (n_c,)   int32
             c_type             (n_c,)   int32
 
+        `include_rows=False` (B1) skips the per-row diagnostics entirely —
+        the `n_active_rows` scalar sync and the row pack + readback — and
+        returns empty lambdas/active/was_static/c_type. Those feed HUD text
+        only (not rendering), so the viewer can request them at a throttled
+        rate and reuse cached values in between, cutting the per-tick syncs
+        from 3 to 1 on the common path.
+
         Falls back to the per-array readers if the solver hasn't flushed yet
         (caller hit it before the first step()).
         """
@@ -1425,7 +1605,9 @@ class Solver6DOF:
         # gap-#1 the dynamic rows live in c_* GPU arrays — `self._rows` is
         # only the static prefix and would severely under-count contacts.
         n_c_static = len(self._rows)
-        if self.n_active_rows is not None:
+        if not include_rows:
+            n_c = 0
+        elif self.n_active_rows is not None:
             n_c = int(self.n_active_rows.numpy()[0])
         else:
             n_c = n_c_static
