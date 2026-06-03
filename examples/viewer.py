@@ -79,7 +79,7 @@ def build_scene(args) -> tuple[Solver6DOF, list[ViewerBox], list[int]]:
         device=args.device,
         substeps=int(args.substeps),
         friction_static_mult=float(args.static_mult),
-        coloring_mode=str(getattr(args, "coloring", "jones_plassmann")),
+        coloring_mode=str(getattr(args, "coloring", "jacobi")),
     )
     s.enable_self_collision(True, default_friction=args.friction)
     boxes: list[ViewerBox] = []
@@ -217,12 +217,14 @@ class Viewer:
                      "stabilise stiff stacks better than more iterations "
                      "(paper Fig. 6 uses 5). Higher = stabler but slower.")
             self.gui_coloring = self.server.gui.add_dropdown(
-                "coloring", ("jones_plassmann", "jacobi"),
+                "coloring", ("jacobi", "jones_plassmann"),
                 initial_value=self.solver.coloring_mode,
                 hint="Graph-coloring algorithm for the per-color primal "
-                     "updates. 'jacobi' (speculative greedy) usually packs "
-                     "fewer colors → shorter serialization chain. Physics is "
-                     "identical; switch live to compare colors/speed.")
+                     "updates. 'jacobi' (parallel-Jacobi greedy) is the "
+                     "default and matches the AVBD paper (§4); it usually "
+                     "packs fewer colors → shorter serialization chain. "
+                     "'jones_plassmann' is an off-paper alternative. Physics "
+                     "is identical; switch live to compare colors/speed.")
             self.gui_gravity = self.server.gui.add_slider("gravity (m/s²)", -30.0, 0.0,
                                                          step=0.5, initial_value=-9.81)
             self.gui_friction = self.server.gui.add_slider(
@@ -1349,11 +1351,12 @@ def main():
                    help="Number of inner sub-steps per solver.step(). Stiff "
                         "stacking needs ≥8 to converge without bouncing "
                         "(AVBD paper Fig. 6 uses 5).")
-    p.add_argument("--coloring", type=str, default="jones_plassmann",
-                   choices=("jones_plassmann", "jacobi"),
+    p.add_argument("--coloring", type=str, default="jacobi",
+                   choices=("jacobi", "jones_plassmann"),
                    help="Graph-coloring algorithm used to parallelize the "
-                        "per-color primal updates. 'jacobi' (speculative "
-                        "greedy) packs colors tighter than Jones–Plassmann, "
+                        "per-color primal updates. 'jacobi' (parallel-Jacobi "
+                        "greedy) is the default and matches the AVBD paper "
+                        "(§4); it packs colors tighter than Jones–Plassmann, "
                         "shrinking the serialization chain. Switchable live "
                         "in the GUI; the AVBD solve is identical either way.")
     # ---- Deformable-bunny mode flags ----------------------------------------

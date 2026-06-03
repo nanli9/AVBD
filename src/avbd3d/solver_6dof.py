@@ -179,16 +179,19 @@ class Solver6DOF:
         max_angular_speed: float = 50.0,
         substeps: int = 1,
         friction_static_mult: float = 1.5,
-        coloring_mode: str = "jones_plassmann",
+        coloring_mode: str = "jacobi",
     ):
         wp.init()
         self.device = device
         # Graph-coloring algorithm used to parallelize the per-color primal
-        # updates: "jones_plassmann" (default) or "jacobi" (speculative
-        # greedy). Switchable at runtime — coloring runs outside the captured
-        # graph, and a changed achieved color count recaptures via the
-        # signature. Only the *assignment* differs; the AVBD solve is identical.
-        self._coloring_mode = "jones_plassmann"
+        # updates: "jacobi" (default — the parallel-Jacobi greedy coloring the
+        # AVBD paper specifies, §4 / Alg. 1 line 2: assign each body the
+        # smallest colour not used by its lower-indexed neighbours, with
+        # double-buffered updates) or "jones_plassmann" (off-paper alternative).
+        # Switchable at runtime — coloring runs outside the captured graph, and
+        # a changed achieved color count recaptures via the signature. Only the
+        # *assignment* differs; the AVBD solve is identical.
+        self._coloring_mode = None  # real value set by the property setter below
         self.coloring_mode = coloring_mode
         self.dt = float(dt)
         self.iterations = int(iterations)
