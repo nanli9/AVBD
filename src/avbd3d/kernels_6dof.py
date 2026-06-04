@@ -30,6 +30,15 @@ Math references (verified against the 2D demo + AVBD paper):
 
 import warp as wp
 
+# This solver is forward-only (VBD/AVBD is not autodiff-based — nothing in the
+# package builds a wp.Tape or reads gradients). Disable adjoint codegen for the
+# whole module: it halves JIT/compile work, and — critically — lets us use
+# `@wp.func_native` (the __shfl_down_sync reduction, which has no adjoint
+# snippet) without breaking the module's backward compilation. With backward
+# enabled, Warp tries to differentiate the func_native call and fails to find
+# the adjoint symbol, which cascades to every kernel's _backward in the module.
+wp.set_module_options({"enable_backward": False})
+
 # Constraint type codes — must match solver_6dof.py.
 # Start above the 3-DOF codes to make co-existence easier in mixed scenes.
 FLOOR_CONTACT_6DOF = wp.constant(0)     # C = y(x + R·off_a) − floor_y, fmax=0 (push-up)
@@ -571,6 +580,570 @@ def primal_update_6dof(
     x[i] = x[i] - d_x
     dq = quat_from_rotvec(-d_theta)
     q[i] = wp.normalize(dq * q[i])
+
+
+# -----------------------------------------------------------------------------
+# Warp-per-body primal update (perf: same AVBD math, cooperative reduction)
+# -----------------------------------------------------------------------------
+# `primal_update_6dof` runs ONE thread per body. On large scenes colored
+# Gauss-Seidel launches only ~n_bodies/n_colors threads per color (e.g. 221 of
+# 414 → 0.5% of the GPU), and each thread serially loops ~32 incident
+# constraints — latency-bound at <1% occupancy (see avbd-stress-profile).
+#
+# This pair splits the SAME update across a *group* of G lanes per body:
+#   1. primal_accumulate_6dof: dim=(n_b, G). Lane `l` strides the body's
+#      constraint list (k = start+l, start+l+G, …), evaluates the IDENTICAL
+#      per-constraint contribution as the serial kernel into local registers,
+#      then ONE atomic_add per block folds the lane partials into per-body
+#      scratch (A/B/D Hessian blocks + r_lin/r_ang gradient). The inertial
+#      terms are NOT added here — they're per-body, added once in the solve.
+#   2. primal_solve_6dof: dim=n_b. Per body, add the inertial init, run the
+#      identical Schur-complement solve, apply x/q, and zero the scratch for
+#      the next iteration.
+# Math is byte-for-byte the serial kernel's except the constraint sum is
+# reduced in atomic (i.e. nondeterministic) order — a parallelization detail,
+# not a solver-math change; the reorder is far below the existing GPU-atomic
+# noise floor. The two kernels are plain launches (no tiles), so they
+# graph-capture exactly like the serial path.
+#
+# The reduction `join` has two flavours, selected by Solver6DOF._primal_shuffle:
+#   - atomic   (primal_accumulate_6dof):  wp.atomic_add into scratch. Portable,
+#     but G lanes contend on the same per-body addresses (hurts at high G).
+#   - shuffle  (primal_accumulate_shuffle_6dof): a wp.func_native __shfl_down_
+#     sync reduction folds the lane partials register-to-register (no atomics,
+#     no contention, deterministic within the warp). Lane 0 then STORES the
+#     complete sum (no pre-zero needed). Requires a 1-D launch padded to a
+#     multiple of 32 with NO early-return before the shuffle (see below).
+#
+# Warp-shuffle reduction of a vec3 across `width` consecutive lanes (width|32).
+# Lane 0 of each sub-group ends with the sum. The full 0xffffffff mask is valid
+# ONLY because the launch pads the grid to a multiple of 32 and every lane
+# reaches this call (no divergent early-return before it).
+# NOTE the `#ifdef __CUDA_ARCH__` guard: __shfl_down_sync is a CUDA-only
+# intrinsic, but Warp compiles every kernel in this module for the CPU backend
+# too (and tests run on device="cpu"). The CPU branch is a no-op — the
+# warp-per-body shuffle path is gated to CUDA in the solver, so it's never
+# actually launched on CPU; it only has to *compile*.
+_WARP_SUM_VEC3_SNIPPET = """
+#ifdef __CUDA_ARCH__
+    wp::vec3 r = value;
+    for (int offset = width / 2; offset > 0; offset >>= 1) {
+        r[0] += __shfl_down_sync(0xffffffffu, r[0], offset, width);
+        r[1] += __shfl_down_sync(0xffffffffu, r[1], offset, width);
+        r[2] += __shfl_down_sync(0xffffffffu, r[2], offset, width);
+    }
+    return r;
+#else
+    return value;  // CPU: warp-per-body is gated off (G=1); never reached
+#endif
+"""
+
+
+@wp.func_native(_WARP_SUM_VEC3_SNIPPET)
+def warp_sum_vec3(value: wp.vec3, width: int) -> wp.vec3:
+    ...
+
+
+@wp.kernel
+def primal_accumulate_6dof(
+    # state (read-only here; the solve kernel applies the update)
+    x: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.quat),
+    mass: wp.array(dtype=float),
+    # constraints
+    c_type: wp.array(dtype=int),
+    c_body_a: wp.array(dtype=int),
+    c_body_b: wp.array(dtype=int),
+    c_world_anchor: wp.array(dtype=wp.vec3),
+    c_off_a: wp.array(dtype=wp.vec3),
+    c_off_b: wp.array(dtype=wp.vec3),
+    c_stiffness: wp.array(dtype=float),
+    c_lambda: wp.array(dtype=float),
+    c_penalty: wp.array(dtype=float),
+    c_fmin: wp.array(dtype=float),
+    c_fmax: wp.array(dtype=float),
+    c_alpha_C0: wp.array(dtype=float),
+    c_active: wp.array(dtype=int),
+    c_sibling: wp.array(dtype=int),
+    c_friction: wp.array(dtype=float),
+    c_friction_static: wp.array(dtype=float),
+    c_was_static: wp.array(dtype=int),
+    # adjacency + color partition
+    body_con_starts: wp.array(dtype=int),
+    body_con_indices: wp.array(dtype=int),
+    color_starts: wp.array(dtype=int),
+    color_bodies: wp.array(dtype=int),
+    color_id: int,
+    group_size: int,
+    # per-body reduction scratch (atomically accumulated; zeroed by the solve)
+    scratch_A: wp.array(dtype=wp.mat33),
+    scratch_B: wp.array(dtype=wp.mat33),
+    scratch_D: wp.array(dtype=wp.mat33),
+    scratch_rlin: wp.array(dtype=wp.vec3),
+    scratch_rang: wp.array(dtype=wp.vec3),
+):
+    slot, lane = wp.tid()
+    base = color_starts[color_id]
+    end_c = color_starts[color_id + 1]
+    if slot >= end_c - base:
+        return
+    i = color_bodies[base + slot]
+    m = mass[i]
+    if m <= 0.0:
+        return
+
+    qi = q[i]
+    xi = x[i]
+    start = body_con_starts[i]
+    end = body_con_starts[i + 1]
+
+    # Local lane partials — constraint contributions only (no inertial term).
+    A = wp.mat33()
+    B = wp.mat33()
+    D = wp.mat33()
+    r_lin = wp.vec3(0.0, 0.0, 0.0)
+    r_ang = wp.vec3(0.0, 0.0, 0.0)
+
+    for k in range(start + lane, end, group_size):
+        cj = body_con_indices[k]
+        if c_active[cj] == 0:
+            continue
+        t = c_type[cj]
+        s = c_stiffness[cj]
+        k_p = c_penalty[cj]
+        off_a = c_off_a[cj]
+        anchor = c_world_anchor[cj]   # n̂ for BOX_BOX / TANGENT; floor / pin pos otherwise
+
+        j_lin = wp.vec3(0.0, 0.0, 0.0)
+        j_ang = wp.vec3(0.0, 0.0, 0.0)
+        C = float(0.0)
+        r_self_w = wp.vec3(0.0, 0.0, 0.0)
+        n_for_G = wp.vec3(0.0, 0.0, 0.0)
+        have_G = False
+
+        if t == FLOOR_CONTACT_6DOF:
+            r_self_w = wp.quat_rotate(qi, off_a)
+            n_hat = wp.vec3(0.0, 1.0, 0.0)
+            j_lin = n_hat
+            j_ang = wp.cross(r_self_w, n_hat)
+            C = (xi[1] + r_self_w[1]) - anchor[1]
+            n_for_G = n_hat
+            have_G = True
+        elif t == CONTACT_TANGENT_6DOF:
+            tangent = anchor
+            bb = c_body_b[cj]
+            if bb < 0:
+                r_self_w = wp.quat_rotate(qi, off_a)
+                j_lin = tangent
+                j_ang = wp.cross(r_self_w, tangent)
+                C = wp.dot(tangent, xi + r_self_w)
+            else:
+                ba = c_body_a[cj]
+                off_b = c_off_b[cj]
+                if ba == i:
+                    r_self_w = wp.quat_rotate(qi, off_a)
+                    r_other_w = wp.quat_rotate(q[bb], off_b)
+                    C = wp.dot(tangent,
+                               (xi + r_self_w) - (x[bb] + r_other_w))
+                    j_lin = tangent
+                    j_ang = wp.cross(r_self_w, tangent)
+                else:
+                    r_other_w = wp.quat_rotate(q[ba], off_a)
+                    r_self_w = wp.quat_rotate(qi, off_b)
+                    C = wp.dot(tangent,
+                               (x[ba] + r_other_w) - (xi + r_self_w))
+                    j_lin = -tangent
+                    j_ang = -wp.cross(r_self_w, tangent)
+            n_for_G = tangent
+            have_G = True
+        elif t == PIN_6DOF:
+            axis = c_body_b[cj]
+            r_self_w = wp.quat_rotate(qi, off_a)
+            world_anchor_pt = xi + r_self_w
+            if axis == 0:
+                n_hat = wp.vec3(1.0, 0.0, 0.0)
+                C = world_anchor_pt[0] - anchor[0]
+            elif axis == 1:
+                n_hat = wp.vec3(0.0, 1.0, 0.0)
+                C = world_anchor_pt[1] - anchor[1]
+            else:
+                n_hat = wp.vec3(0.0, 0.0, 1.0)
+                C = world_anchor_pt[2] - anchor[2]
+            j_lin = n_hat
+            j_ang = wp.cross(r_self_w, n_hat)
+            n_for_G = n_hat
+            have_G = True
+        elif t == BOX_BOX_CONTACT_6DOF:
+            ba = c_body_a[cj]
+            bb = c_body_b[cj]
+            n_hat = anchor   # stored constant during step
+            off_b = c_off_b[cj]
+            if ba == i:
+                r_self_w = wp.quat_rotate(qi, off_a)
+                r_other_w = wp.quat_rotate(q[bb], off_b)
+                C = wp.dot(n_hat,
+                           (xi + r_self_w) - (x[bb] + r_other_w))
+                j_lin = n_hat
+                j_ang = wp.cross(r_self_w, n_hat)
+            else:
+                r_other_w = wp.quat_rotate(q[ba], off_a)
+                r_self_w = wp.quat_rotate(qi, off_b)
+                C = wp.dot(n_hat,
+                           (x[ba] + r_other_w) - (xi + r_self_w))
+                j_lin = -n_hat
+                j_ang = -wp.cross(r_self_w, n_hat)
+            n_for_G = n_hat
+            have_G = True
+
+        hard = s >= wp.inf
+        if hard:
+            C = C - c_alpha_C0[cj]
+
+        lam_eff = c_lambda[cj]
+        if not hard:
+            lam_eff = 0.0
+
+        lam_plus = k_p * C + lam_eff
+        if t == CONTACT_TANGENT_6DOF:
+            sib = c_sibling[cj]
+            mu = c_friction[cj]
+            if c_was_static[sib] != 0:
+                mu = c_friction_static[cj]
+            bound = mu * wp.abs(c_lambda[sib])
+            f_lo = -bound
+            f_hi = bound
+        else:
+            f_lo = c_fmin[cj]
+            f_hi = c_fmax[cj]
+        f = wp.clamp(lam_plus, f_lo, f_hi)
+
+        k_for_lhs = k_p
+        abs_C = wp.abs(C)
+        if abs_C > 1.0e-12:
+            if lam_plus < f_lo:
+                k_for_lhs = wp.abs(f_lo - lam_plus) / abs_C
+            elif lam_plus > f_hi:
+                k_for_lhs = wp.abs(f_hi - lam_plus) / abs_C
+
+        A = A + outer3(j_lin, j_lin) * k_for_lhs
+        B = B + outer3(j_ang, j_lin) * k_for_lhs
+        D = D + outer3(j_ang, j_ang) * k_for_lhs
+
+        f_mag = wp.abs(f)
+        if f_mag > 0.0 and have_G:
+            g_diag = geom_stiffness_diag(n_for_G, r_self_w) * f_mag
+            D = D + wp.mat33(g_diag[0], 0.0, 0.0,
+                             0.0, g_diag[1], 0.0,
+                             0.0, 0.0, g_diag[2])
+        r_lin = r_lin + j_lin * f
+        r_ang = r_ang + j_ang * f
+
+    # Fold this lane's partial into the body's reduction scratch. One atomic
+    # set per lane (G-way contention per body) — the per-constraint serial
+    # work above is what we parallelized; this is the join.
+    wp.atomic_add(scratch_A, i, A)
+    wp.atomic_add(scratch_B, i, B)
+    wp.atomic_add(scratch_D, i, D)
+    wp.atomic_add(scratch_rlin, i, r_lin)
+    wp.atomic_add(scratch_rang, i, r_ang)
+
+
+@wp.kernel
+def primal_accumulate_shuffle_6dof(
+    # state (read-only here; the solve kernel applies the update)
+    x: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.quat),
+    mass: wp.array(dtype=float),
+    # constraints
+    c_type: wp.array(dtype=int),
+    c_body_a: wp.array(dtype=int),
+    c_body_b: wp.array(dtype=int),
+    c_world_anchor: wp.array(dtype=wp.vec3),
+    c_off_a: wp.array(dtype=wp.vec3),
+    c_off_b: wp.array(dtype=wp.vec3),
+    c_stiffness: wp.array(dtype=float),
+    c_lambda: wp.array(dtype=float),
+    c_penalty: wp.array(dtype=float),
+    c_fmin: wp.array(dtype=float),
+    c_fmax: wp.array(dtype=float),
+    c_alpha_C0: wp.array(dtype=float),
+    c_active: wp.array(dtype=int),
+    c_sibling: wp.array(dtype=int),
+    c_friction: wp.array(dtype=float),
+    c_friction_static: wp.array(dtype=float),
+    c_was_static: wp.array(dtype=int),
+    # adjacency + color partition
+    body_con_starts: wp.array(dtype=int),
+    body_con_indices: wp.array(dtype=int),
+    color_starts: wp.array(dtype=int),
+    color_bodies: wp.array(dtype=int),
+    color_id: int,
+    group_size: int,
+    scratch_A: wp.array(dtype=wp.mat33),
+    scratch_B: wp.array(dtype=wp.mat33),
+    scratch_D: wp.array(dtype=wp.mat33),
+    scratch_rlin: wp.array(dtype=wp.vec3),
+    scratch_rang: wp.array(dtype=wp.vec3),
+):
+    # 1-D launch padded to a multiple of 32 (see solver). `slot` is the body's
+    # index in the color slice; the `group_size` lanes of a body are
+    # consecutive tids => one width-G warp sub-group. CRITICAL: do NOT return
+    # before warp_sum_vec3 — every lane in the warp must reach the shuffle or
+    # the full-mask __shfl_down_sync is undefined. Padding/static/empty lanes
+    # carry a zero partial and simply don't write.
+    tid = wp.tid()
+    slot = tid // group_size
+    lane = tid % group_size
+    base = color_starts[color_id]
+    end_c = color_starts[color_id + 1]
+    i = int(0)
+    active = int(0)
+    if slot < end_c - base:
+        i = color_bodies[base + slot]
+        if mass[i] > 0.0:
+            active = 1
+
+    A = wp.mat33()
+    B = wp.mat33()
+    D = wp.mat33()
+    r_lin = wp.vec3(0.0, 0.0, 0.0)
+    r_ang = wp.vec3(0.0, 0.0, 0.0)
+
+    if active == 1:
+        qi = q[i]
+        xi = x[i]
+        start = body_con_starts[i]
+        end = body_con_starts[i + 1]
+        for k in range(start + lane, end, group_size):
+            cj = body_con_indices[k]
+            if c_active[cj] == 0:
+                continue
+            t = c_type[cj]
+            s = c_stiffness[cj]
+            k_p = c_penalty[cj]
+            off_a = c_off_a[cj]
+            anchor = c_world_anchor[cj]
+
+            j_lin = wp.vec3(0.0, 0.0, 0.0)
+            j_ang = wp.vec3(0.0, 0.0, 0.0)
+            C = float(0.0)
+            r_self_w = wp.vec3(0.0, 0.0, 0.0)
+            n_for_G = wp.vec3(0.0, 0.0, 0.0)
+            have_G = False
+
+            if t == FLOOR_CONTACT_6DOF:
+                r_self_w = wp.quat_rotate(qi, off_a)
+                n_hat = wp.vec3(0.0, 1.0, 0.0)
+                j_lin = n_hat
+                j_ang = wp.cross(r_self_w, n_hat)
+                C = (xi[1] + r_self_w[1]) - anchor[1]
+                n_for_G = n_hat
+                have_G = True
+            elif t == CONTACT_TANGENT_6DOF:
+                tangent = anchor
+                bb = c_body_b[cj]
+                if bb < 0:
+                    r_self_w = wp.quat_rotate(qi, off_a)
+                    j_lin = tangent
+                    j_ang = wp.cross(r_self_w, tangent)
+                    C = wp.dot(tangent, xi + r_self_w)
+                else:
+                    ba = c_body_a[cj]
+                    off_b = c_off_b[cj]
+                    if ba == i:
+                        r_self_w = wp.quat_rotate(qi, off_a)
+                        r_other_w = wp.quat_rotate(q[bb], off_b)
+                        C = wp.dot(tangent,
+                                   (xi + r_self_w) - (x[bb] + r_other_w))
+                        j_lin = tangent
+                        j_ang = wp.cross(r_self_w, tangent)
+                    else:
+                        r_other_w = wp.quat_rotate(q[ba], off_a)
+                        r_self_w = wp.quat_rotate(qi, off_b)
+                        C = wp.dot(tangent,
+                                   (x[ba] + r_other_w) - (xi + r_self_w))
+                        j_lin = -tangent
+                        j_ang = -wp.cross(r_self_w, tangent)
+                n_for_G = tangent
+                have_G = True
+            elif t == PIN_6DOF:
+                axis = c_body_b[cj]
+                r_self_w = wp.quat_rotate(qi, off_a)
+                world_anchor_pt = xi + r_self_w
+                if axis == 0:
+                    n_hat = wp.vec3(1.0, 0.0, 0.0)
+                    C = world_anchor_pt[0] - anchor[0]
+                elif axis == 1:
+                    n_hat = wp.vec3(0.0, 1.0, 0.0)
+                    C = world_anchor_pt[1] - anchor[1]
+                else:
+                    n_hat = wp.vec3(0.0, 0.0, 1.0)
+                    C = world_anchor_pt[2] - anchor[2]
+                j_lin = n_hat
+                j_ang = wp.cross(r_self_w, n_hat)
+                n_for_G = n_hat
+                have_G = True
+            elif t == BOX_BOX_CONTACT_6DOF:
+                ba = c_body_a[cj]
+                bb = c_body_b[cj]
+                n_hat = anchor
+                off_b = c_off_b[cj]
+                if ba == i:
+                    r_self_w = wp.quat_rotate(qi, off_a)
+                    r_other_w = wp.quat_rotate(q[bb], off_b)
+                    C = wp.dot(n_hat,
+                               (xi + r_self_w) - (x[bb] + r_other_w))
+                    j_lin = n_hat
+                    j_ang = wp.cross(r_self_w, n_hat)
+                else:
+                    r_other_w = wp.quat_rotate(q[ba], off_a)
+                    r_self_w = wp.quat_rotate(qi, off_b)
+                    C = wp.dot(n_hat,
+                               (x[ba] + r_other_w) - (xi + r_self_w))
+                    j_lin = -n_hat
+                    j_ang = -wp.cross(r_self_w, n_hat)
+                n_for_G = n_hat
+                have_G = True
+
+            hard = s >= wp.inf
+            if hard:
+                C = C - c_alpha_C0[cj]
+
+            lam_eff = c_lambda[cj]
+            if not hard:
+                lam_eff = 0.0
+
+            lam_plus = k_p * C + lam_eff
+            if t == CONTACT_TANGENT_6DOF:
+                sib = c_sibling[cj]
+                mu = c_friction[cj]
+                if c_was_static[sib] != 0:
+                    mu = c_friction_static[cj]
+                bound = mu * wp.abs(c_lambda[sib])
+                f_lo = -bound
+                f_hi = bound
+            else:
+                f_lo = c_fmin[cj]
+                f_hi = c_fmax[cj]
+            f = wp.clamp(lam_plus, f_lo, f_hi)
+
+            k_for_lhs = k_p
+            abs_C = wp.abs(C)
+            if abs_C > 1.0e-12:
+                if lam_plus < f_lo:
+                    k_for_lhs = wp.abs(f_lo - lam_plus) / abs_C
+                elif lam_plus > f_hi:
+                    k_for_lhs = wp.abs(f_hi - lam_plus) / abs_C
+
+            A = A + outer3(j_lin, j_lin) * k_for_lhs
+            B = B + outer3(j_ang, j_lin) * k_for_lhs
+            D = D + outer3(j_ang, j_ang) * k_for_lhs
+
+            f_mag = wp.abs(f)
+            if f_mag > 0.0 and have_G:
+                g_diag = geom_stiffness_diag(n_for_G, r_self_w) * f_mag
+                D = D + wp.mat33(g_diag[0], 0.0, 0.0,
+                                 0.0, g_diag[1], 0.0,
+                                 0.0, 0.0, g_diag[2])
+            r_lin = r_lin + j_lin * f
+            r_ang = r_ang + j_ang * f
+
+    # Cooperative join via warp shuffle — UNCONDITIONAL so every warp lane
+    # participates (the full-mask shuffle requires it). Reduce each 3×3 block
+    # row-by-row as a vec3, plus the two gradient vec3s. Inactive lanes feed
+    # zeros, so a sub-group's leader gets the body's full constraint sum.
+    a0 = warp_sum_vec3(wp.vec3(A[0, 0], A[0, 1], A[0, 2]), group_size)
+    a1 = warp_sum_vec3(wp.vec3(A[1, 0], A[1, 1], A[1, 2]), group_size)
+    a2 = warp_sum_vec3(wp.vec3(A[2, 0], A[2, 1], A[2, 2]), group_size)
+    b0 = warp_sum_vec3(wp.vec3(B[0, 0], B[0, 1], B[0, 2]), group_size)
+    b1 = warp_sum_vec3(wp.vec3(B[1, 0], B[1, 1], B[1, 2]), group_size)
+    b2 = warp_sum_vec3(wp.vec3(B[2, 0], B[2, 1], B[2, 2]), group_size)
+    d0 = warp_sum_vec3(wp.vec3(D[0, 0], D[0, 1], D[0, 2]), group_size)
+    d1 = warp_sum_vec3(wp.vec3(D[1, 0], D[1, 1], D[1, 2]), group_size)
+    d2 = warp_sum_vec3(wp.vec3(D[2, 0], D[2, 1], D[2, 2]), group_size)
+    rl = warp_sum_vec3(r_lin, group_size)
+    ra = warp_sum_vec3(r_ang, group_size)
+
+    # Sub-group leader stores the complete sum (overwrite — primal_solve_6dof
+    # still zeros scratch afterward, harmless here).
+    if active == 1 and lane == 0:
+        scratch_A[i] = wp.mat33(a0[0], a0[1], a0[2],
+                                a1[0], a1[1], a1[2],
+                                a2[0], a2[1], a2[2])
+        scratch_B[i] = wp.mat33(b0[0], b0[1], b0[2],
+                                b1[0], b1[1], b1[2],
+                                b2[0], b2[1], b2[2])
+        scratch_D[i] = wp.mat33(d0[0], d0[1], d0[2],
+                                d1[0], d1[1], d1[2],
+                                d2[0], d2[1], d2[2])
+        scratch_rlin[i] = rl
+        scratch_rang[i] = ra
+
+
+@wp.kernel
+def primal_solve_6dof(
+    x: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.quat),
+    mass: wp.array(dtype=float),
+    inertia_world: wp.array(dtype=wp.mat33),
+    x_inertial: wp.array(dtype=wp.vec3),
+    q_inertial: wp.array(dtype=wp.quat),
+    color_starts: wp.array(dtype=int),
+    color_bodies: wp.array(dtype=int),
+    color_id: int,
+    dt: float,
+    scratch_A: wp.array(dtype=wp.mat33),
+    scratch_B: wp.array(dtype=wp.mat33),
+    scratch_D: wp.array(dtype=wp.mat33),
+    scratch_rlin: wp.array(dtype=wp.vec3),
+    scratch_rang: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    base = color_starts[color_id]
+    end_c = color_starts[color_id + 1]
+    if tid >= end_c - base:
+        return
+    i = color_bodies[base + tid]
+    m = mass[i]
+    if m <= 0.0:
+        return
+
+    inv_dt2 = 1.0 / (dt * dt)
+    I_world = inertia_world[i]
+
+    # Inertial init (identical to the serial kernel) + the constraint sum that
+    # primal_accumulate_6dof folded into scratch.
+    A = wp.mat33(m * inv_dt2, 0.0, 0.0,
+                 0.0, m * inv_dt2, 0.0,
+                 0.0, 0.0, m * inv_dt2) + scratch_A[i]
+    D = I_world * inv_dt2 + scratch_D[i]
+    B = scratch_B[i]
+
+    r_lin = (x[i] - x_inertial[i]) * (m * inv_dt2) + scratch_rlin[i]
+    dq_iner = wp.mul(q[i], wp.quat_inverse(q_inertial[i]))
+    dtheta_iner = quat_to_rotvec(dq_iner)
+    r_ang = I_world * (dtheta_iner * inv_dt2) + scratch_rang[i]
+
+    # Schur-complement solve (verbatim from primal_update_6dof).
+    A_inv = wp.inverse(A)
+    BAinv = B * A_inv
+    rhs_theta = r_ang - BAinv * r_lin
+    S = D - BAinv * wp.transpose(B)
+    S_inv = wp.inverse(S)
+    d_theta = S_inv * rhs_theta
+    d_x = A_inv * (r_lin - wp.transpose(B) * d_theta)
+
+    x[i] = x[i] - d_x
+    dq = quat_from_rotvec(-d_theta)
+    q[i] = wp.normalize(dq * q[i])
+
+    # Reset scratch for the next iteration's accumulate (initial state is zero;
+    # this restores it without a separate clear launch).
+    scratch_A[i] = wp.mat33()
+    scratch_B[i] = wp.mat33()
+    scratch_D[i] = wp.mat33()
+    scratch_rlin[i] = wp.vec3(0.0, 0.0, 0.0)
+    scratch_rang[i] = wp.vec3(0.0, 0.0, 0.0)
 
 
 # -----------------------------------------------------------------------------

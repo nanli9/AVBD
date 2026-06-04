@@ -180,9 +180,38 @@ class Solver6DOF:
         substeps: int = 1,
         friction_static_mult: float = 1.5,
         coloring_mode: str = "jacobi",
+        unsafe_fixed_capacity: bool = False,
+        primal_group_size: int = 16,
+        primal_shuffle: bool = True,
     ):
         wp.init()
         self.device = device
+        # Perf (warp-per-body primal): how many GPU lanes cooperate on one
+        # body's primal update. 1 = the original one-thread-per-body kernel
+        # (`primal_update_6dof`). >1 splits each body's constraint sum across
+        # G lanes (`primal_accumulate*_6dof` → reduce → `primal_solve_6dof`),
+        # raising occupancy where colored Gauss-Seidel otherwise launches only
+        # ~n_bodies/n_colors threads per color. Same AVBD math; the reduction
+        # order differs (below the atomic noise floor). CUDA only — the CPU
+        # path always uses the serial kernel. DEFAULT 16: the robust
+        # all-rounder, within ~7% of the per-scene optimum from tiny to
+        # ~2000-body scenes (G=32 wins small/medium, G=8 wins very large).
+        # See avbd-stress-profile. Clamp ≥1; G is also the constraint stride.
+        self._primal_group_size = max(1, int(primal_group_size))
+        # Warp-per-body reduction `join` flavour (only when group_size>1):
+        # False = global atomic_add (portable, contends at high G); True
+        # (DEFAULT) = wp.func_native __shfl_down_sync register reduction
+        # (contention-free, faster everywhere — 1-D launch padded to a
+        # multiple of 32). Same AVBD math either way.
+        self._primal_shuffle = bool(primal_shuffle)
+        # Perf: when True, trust the pre-sized contact/pair pools and DROP the
+        # two per-substep host syncs (`n_active_rows` and `_bp_pair_count`
+        # `.numpy()` reads) that only existed to detect overflow and regrow.
+        # The kernels already bound their writes device-side, so this changes
+        # no physics — but if the pools are actually exceeded, contacts are
+        # silently dropped instead of triggering a regrow. Only safe for a
+        # bounded object count; a once-per-frame check still warns on overflow.
+        self._unsafe_fixed_capacity = bool(unsafe_fixed_capacity)
         # Graph-coloring algorithm used to parallelize the per-color primal
         # updates: "jacobi" (default — the parallel-Jacobi greedy coloring the
         # AVBD paper specifies, §4 / Alg. 1 line 2: assign each body the
@@ -332,6 +361,9 @@ class Solver6DOF:
         self._spatial_cell_size = 0.0
         # One-shot warning gate for row-pool overflow on dense clusters.
         self._row_overflow_warned = False
+        # One-shot warning gate for the once-per-frame overflow check used in
+        # unsafe_fixed_capacity mode (no per-substep regrow there).
+        self._fixed_cap_overflow_warned = False
         # Vestigial fingerprint from round-2 host-side coloring; round-3
         # moved coloring fully to GPU and no longer reads it. Retained
         # only because read_state_batched / external diagnostics may
@@ -530,6 +562,18 @@ class Solver6DOF:
             # take effect until a contact change happened to force a recolor.
             # A live switch must visibly re-partition, so we mark dirty.
             self._color_dirty = True
+
+    @property
+    def primal_group_size(self) -> int:
+        """GPU lanes cooperating on each body's primal update (warp-per-body).
+        1 = serial one-thread-per-body kernel; >1 = parallel accumulate+solve.
+        Settable at runtime; the next step() recaptures the graph (the value
+        is part of `_current_graph_signature`). CUDA only — ignored on CPU."""
+        return self._primal_group_size
+
+    @primal_group_size.setter
+    def primal_group_size(self, g: int) -> None:
+        self._primal_group_size = max(1, int(g))
 
     def _gpu_recolor(self, n_b: int, dev) -> None:
         """Device-side body coloring (round 3 §A). Builds the body-body
@@ -875,6 +919,18 @@ class Solver6DOF:
         # here each recolor; _step_one reads it back as the host-side
         # n_active_colors that bounds the primal loop (A1).
         self.n_active_colors_dev = wp.zeros(1, dtype=int, device=dev)
+        # Warp-per-body primal reduction scratch (perf path; group_size>1).
+        # Per-body Hessian blocks A/B/D + gradient r_lin/r_ang that
+        # primal_accumulate_6dof atomically folds the lane partials into and
+        # primal_solve_6dof consumes + re-zeros each iteration. Tiny (n_b ×
+        # 33 floats); allocated unconditionally so the group size can be
+        # toggled at runtime without a realloc. Starts zeroed (the solve
+        # kernel's invariant).
+        self.scratch_A = wp.zeros(max(n_b, 1), dtype=wp.mat33, device=dev)
+        self.scratch_B = wp.zeros(max(n_b, 1), dtype=wp.mat33, device=dev)
+        self.scratch_D = wp.zeros(max(n_b, 1), dtype=wp.mat33, device=dev)
+        self.scratch_rlin = wp.zeros(max(n_b, 1), dtype=wp.vec3, device=dev)
+        self.scratch_rang = wp.zeros(max(n_b, 1), dtype=wp.vec3, device=dev)
         # Host-side metadata (no readbacks — kept only for the existing
         # diagnostic API surface; .num_colors is the upper bound, not the
         # actual achieved count, which is .num_active_colors).
@@ -998,6 +1054,8 @@ class Solver6DOF:
     def step(self) -> None:
         if self.substeps <= 1:
             self._step_one()
+            if self._unsafe_fixed_capacity:
+                self._check_fixed_cap_overflow()
             return
         full_dt = self.dt
         sub_dt = full_dt / self.substeps
@@ -1007,6 +1065,26 @@ class Solver6DOF:
                 self._step_one()
         finally:
             self.dt = full_dt
+        if self._unsafe_fixed_capacity:
+            self._check_fixed_cap_overflow()
+
+    def _check_fixed_cap_overflow(self) -> None:
+        """Once-per-frame insurance for unsafe_fixed_capacity mode. The
+        per-substep regrow is gone, so read the row reservation counter ONE
+        time (the last substep's value) and warn once if the pool was
+        exceeded — meaning contacts were silently dropped this frame."""
+        if self.n_active_rows is None:
+            return
+        n = int(self.n_active_rows.numpy()[0])
+        if n > self._gpu_pool_n_capacity and not self._fixed_cap_overflow_warned:
+            import warnings
+            warnings.warn(
+                f"avbd3d unsafe_fixed_capacity: row pool overflow "
+                f"({n} reserved > {self._gpu_pool_n_capacity} capacity) — "
+                "contacts were dropped. Increase "
+                "solver._gpu_pool_n_dyn_capacity or disable "
+                "unsafe_fixed_capacity.", RuntimeWarning, stacklevel=2)
+            self._fixed_cap_overflow_warned = True
 
     def _step_one(self) -> None:
         """One AVBD substep. After the initial _flush() upload from the CPU
@@ -1054,26 +1132,36 @@ class Solver6DOF:
         n_active = n_static
         if self._self_collide and n_b >= 2:
             self._gpu_emit_dynamic_contacts(n_b)
-            # Single int readback — sizes the row-kernel launches below.
-            # n_active_rows is the *reservation* counter; the kernel-side
-            # guard rejects contacts that would write past _gpu_pool_n_capacity
-            # but still bumps the counter. Clamp before using as a launch dim,
-            # and grow the c_* arrays next substep on overflow so the rejected
-            # contacts get a slot.
-            n_active_raw = int(self.n_active_rows.numpy()[0])
-            cap = self._gpu_pool_n_capacity
-            if n_active_raw > cap:
-                if not self._row_overflow_warned:
-                    import warnings
-                    warnings.warn(
-                        f"avbd3d row pool overflow: reserved {n_active_raw} "
-                        f"rows > capacity {cap}; growing for next substep. "
-                        "Tune solver._gpu_pool_n_dyn_capacity if frequent.",
-                        RuntimeWarning, stacklevel=2)
-                    self._row_overflow_warned = True
-                self._grow_row_pool(max(2 * self._gpu_pool_n_dyn_capacity,
-                                          (n_active_raw - n_static) * 2))
-            n_active = min(n_active_raw, cap)
+            if self._unsafe_fixed_capacity:
+                # A3 fixed-capacity mode: skip the per-substep host sync +
+                # regrow. The row launches below already run at fixed
+                # `row_dim` and bound device-side against n_active_rows[0],
+                # so they don't need the host value; we just assume rows are
+                # present (capacity > 0) so the `n_active > 0` guards fire.
+                # Overflow (if the pool is under-sized) is caught once per
+                # frame in step(), not here. No `.numpy()` → no stall.
+                n_active = self._gpu_pool_n_capacity
+            else:
+                # Single int readback — sizes the row-kernel launches below.
+                # n_active_rows is the *reservation* counter; the kernel-side
+                # guard rejects contacts that would write past
+                # _gpu_pool_n_capacity but still bumps the counter. Clamp
+                # before using as a launch dim, and grow the c_* arrays next
+                # substep on overflow so the rejected contacts get a slot.
+                n_active_raw = int(self.n_active_rows.numpy()[0])
+                cap = self._gpu_pool_n_capacity
+                if n_active_raw > cap:
+                    if not self._row_overflow_warned:
+                        import warnings
+                        warnings.warn(
+                            f"avbd3d row pool overflow: reserved {n_active_raw} "
+                            f"rows > capacity {cap}; growing for next substep. "
+                            "Tune solver._gpu_pool_n_dyn_capacity if frequent.",
+                            RuntimeWarning, stacklevel=2)
+                        self._row_overflow_warned = True
+                    self._grow_row_pool(max(2 * self._gpu_pool_n_dyn_capacity,
+                                              (n_active_raw - n_static) * 2))
+                n_active = min(n_active_raw, cap)
 
         # Device-side body recolor (round 3 §A). Runs unconditionally so
         # bodies without contacts (static scenes, single-body free fall)
@@ -1224,6 +1312,8 @@ class Solver6DOF:
             int(self.post_stabilize),
             int(self._max_colors),
             int(self._n_active_colors),
+            int(self._primal_group_size),
+            int(self._primal_shuffle),
             float(self.dt),
             float(self.alpha),
             float(self.beta),
@@ -1281,25 +1371,68 @@ class Solver6DOF:
             # launched. The count is baked into the graph signature, so a
             # change recaptures. Within the captured graph the launch count
             # is fixed. `color_starts` is device-resident.
+            G = self._primal_group_size if str(dev).startswith("cuda") else 1
             for color_id in range(self._n_active_colors):
-                wp.launch(
-                    K.primal_update_6dof, dim=n_b,
-                    inputs=[self.x, self.q, self.mass,
-                            self.inv_inertia_world, self.inertia_world,
-                            self.x_inertial, self.q_inertial,
-                            self.c_type, self.c_body_a, self.c_body_b,
-                            self.c_world_anchor, self.c_off_a, self.c_off_b,
-                            self.c_rest, self.c_stiffness,
-                            self.c_lambda, self.c_penalty,
-                            self.c_fmin, self.c_fmax,
-                            self.c_alpha_C0, self.c_active,
-                            self.c_sibling, self.c_friction,
-                            self.c_friction_static, self.c_was_static,
-                            self.body_con_starts, self.body_con_indices,
-                            self.color_starts, self.color_bodies,
-                            color_id, self.dt],
-                    device=dev,
-                )
+                if G > 1:
+                    # Warp-per-body: G lanes cooperate per body. accumulate
+                    # folds the lane partials into scratch (atomic_add, or a
+                    # warp-shuffle register reduction when _primal_shuffle);
+                    # solve (dim=n_b) adds the inertial term, runs the Schur
+                    # solve, applies x/q, and re-zeros scratch.
+                    accum_inputs = [
+                        self.x, self.q, self.mass,
+                        self.c_type, self.c_body_a, self.c_body_b,
+                        self.c_world_anchor, self.c_off_a, self.c_off_b,
+                        self.c_stiffness,
+                        self.c_lambda, self.c_penalty,
+                        self.c_fmin, self.c_fmax,
+                        self.c_alpha_C0, self.c_active,
+                        self.c_sibling, self.c_friction,
+                        self.c_friction_static, self.c_was_static,
+                        self.body_con_starts, self.body_con_indices,
+                        self.color_starts, self.color_bodies,
+                        color_id, G,
+                        self.scratch_A, self.scratch_B, self.scratch_D,
+                        self.scratch_rlin, self.scratch_rang]
+                    if self._primal_shuffle:
+                        # 1-D launch padded to a multiple of 32 so every warp
+                        # lane reaches the full-mask shuffle (see kernel).
+                        shuf_dim = ((n_b * G + 31) // 32) * 32
+                        wp.launch(K.primal_accumulate_shuffle_6dof,
+                                  dim=shuf_dim, inputs=accum_inputs, device=dev)
+                    else:
+                        wp.launch(K.primal_accumulate_6dof, dim=(n_b, G),
+                                  inputs=accum_inputs, device=dev)
+                    wp.launch(
+                        K.primal_solve_6dof, dim=n_b,
+                        inputs=[self.x, self.q, self.mass,
+                                self.inertia_world,
+                                self.x_inertial, self.q_inertial,
+                                self.color_starts, self.color_bodies,
+                                color_id, self.dt,
+                                self.scratch_A, self.scratch_B, self.scratch_D,
+                                self.scratch_rlin, self.scratch_rang],
+                        device=dev,
+                    )
+                else:
+                    wp.launch(
+                        K.primal_update_6dof, dim=n_b,
+                        inputs=[self.x, self.q, self.mass,
+                                self.inv_inertia_world, self.inertia_world,
+                                self.x_inertial, self.q_inertial,
+                                self.c_type, self.c_body_a, self.c_body_b,
+                                self.c_world_anchor, self.c_off_a, self.c_off_b,
+                                self.c_rest, self.c_stiffness,
+                                self.c_lambda, self.c_penalty,
+                                self.c_fmin, self.c_fmax,
+                                self.c_alpha_C0, self.c_active,
+                                self.c_sibling, self.c_friction,
+                                self.c_friction_static, self.c_was_static,
+                                self.body_con_starts, self.body_con_indices,
+                                self.color_starts, self.color_bodies,
+                                color_id, self.dt],
+                        device=dev,
+                    )
 
             if it < self.iterations:
                 wp.launch(
@@ -1466,8 +1599,13 @@ class Solver6DOF:
         self._bp_bvh = wp.Bvh(self._bp_aabb_lo, self._bp_aabb_hi,
                               constructor=constructor)
 
-        n_pairs = 0
-        for attempt in range(MAX_PAIR_RETRIES + 1):
+        if self._unsafe_fixed_capacity:
+            # A3 fixed-capacity mode: a single broadphase pass, no host sync,
+            # no retry, no zero early-out. The kernel caps its writes at
+            # _bp_max_pairs; SAT/manifold/emit run at that fixed dim and
+            # no-op past pair_count[0] (including when it is 0). If the
+            # pre-sized pair pool is exceeded, surplus pairs are silently
+            # dropped — bounded scenes only. No `.numpy()` → no stall.
             self._bp_pair_count.zero_()
             wp.launch(
                 K.bvh_broadphase_pairs, dim=n_b,
@@ -1476,18 +1614,29 @@ class Solver6DOF:
                         self._bp_pair_a, self._bp_pair_b, self._bp_max_pairs],
                 device=dev,
             )
-            n_pairs = int(self._bp_pair_count.numpy()[0])
-            if n_pairs <= self._bp_max_pairs or attempt == MAX_PAIR_RETRIES:
-                break
-            # Grow and retry — the BVH itself is unaffected by the cap.
-            self._ensure_pair_buffers(max(2 * self._bp_max_pairs,
-                                           n_pairs * 2))
-            # Pair cap changed → emit-side row pool may need a re-capture.
-            self._graph = None
+        else:
+            n_pairs = 0
+            for attempt in range(MAX_PAIR_RETRIES + 1):
+                self._bp_pair_count.zero_()
+                wp.launch(
+                    K.bvh_broadphase_pairs, dim=n_b,
+                    inputs=[self._bp_bvh.id, self._bp_aabb_lo, self._bp_aabb_hi,
+                            self.mass, self._bp_pair_count,
+                            self._bp_pair_a, self._bp_pair_b, self._bp_max_pairs],
+                    device=dev,
+                )
+                n_pairs = int(self._bp_pair_count.numpy()[0])
+                if n_pairs <= self._bp_max_pairs or attempt == MAX_PAIR_RETRIES:
+                    break
+                # Grow and retry — the BVH itself is unaffected by the cap.
+                self._ensure_pair_buffers(max(2 * self._bp_max_pairs,
+                                               n_pairs * 2))
+                # Pair cap changed → emit-side row pool may need a re-capture.
+                self._graph = None
 
-        if n_pairs == 0:
-            self.broadphase_ms = (_t.perf_counter() - t_bp0) * 1000.0
-            return
+            if n_pairs == 0:
+                self.broadphase_ms = (_t.perf_counter() - t_bp0) * 1000.0
+                return
         # Post-Phase-A: bounds for SAT / manifold / emit come from the
         # device-side `_bp_pair_count` array, not a Python scalar. We launch
         # at the *upper bound* `_bp_max_pairs` so the launch dim is fixed at

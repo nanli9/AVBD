@@ -31,7 +31,7 @@ The repo ships **two solvers**, mirroring the structure of the 2D reference at
 | `TET_VOLUME` soft volume preservation for deformables | ✅ new tet pool + adjacency | n/a |
 | Post-stabilization extra pass (α → 0) | ✅ | ✅ |
 | BDF1 velocity finalize | ✅ | ✅ (world-frame ω via `quat_to_rotvec`) |
-| Greedy graph coloring (Sec. 4) | ✅ Welsh-Powell | ✅ same |
+| Greedy graph coloring (Sec. 4) | ✅ Welsh-Powell (CPU) | ✅ GPU parallel-Jacobi greedy (`jacobi`, the paper §4 default) or Jones-Plassmann (`jones_plassmann`), switchable at runtime |
 | LBVH broad phase (Sec. 4) | ❌ brute O(N²) on CPU | ✅ `wp.Bvh` + GPU SAT kernel |
 | Eq. 15 contact form `[t̂ b̂ n̂]ᵀ(r_a − r_b)` | ✅ | ✅ |
 | Square-cone friction `|λ_t| ≤ μ\|λ_n\|` (Sec. 3.3) | ✅ per-row | ✅ + **isotropic disk static-stick + μ_s/μ_d switch** (beyond paper) |
@@ -132,6 +132,43 @@ uv run python examples/viewer.py                       # 6-DOF rigid stacks + do
 uv run python examples/viewer.py --deformable-bunny    # deformable Stanford bunny (tet mass-spring)
 uv run python examples/viewer_particles.py             # 3-DOF particle viewer
 # open the printed URL (default http://localhost:8080) in a browser
+
+# Large paper-style block pile on the GPU (414 bodies). The warp-per-body
+# primal solve (warp-shuffle reduction) is ON by default on CUDA — ~5x faster
+# than the serial kernel on this scene (see "Warp-per-body primal" below):
+uv run python examples/viewer.py --device cuda:0 --stress --iterations 25
+```
+
+### Performance: warp-per-body primal (CUDA)
+
+Colored Gauss-Seidel launches only ~`n_bodies / n_colors` threads per color, so
+the one-thread-per-body primal kernel leaves the GPU mostly idle on big scenes
+(e.g. a 414-body pile fills ~0.5% of an RTX 3060's threads) while each thread
+serially walks ~32 incident constraints. The solver instead gives each body a
+**group of `G` lanes** that cooperatively accumulate its constraint Hessian /
+gradient, then join the partials — by default with a `wp.func_native`
+**warp-shuffle** (`__shfl_down_sync`) register reduction (contention-free; an
+`atomic_add` join is also available). Lane 0 runs the 6×6 Schur solve.
+
+This is **implementation only — the AVBD math is unchanged**; the reduction
+just reorders a sum (divergence vs the serial kernel = the GPU-atomic noise
+floor, ~0.02 mm). It is **on by default on CUDA** (`G=16`, shuffle) and a no-op
+on `--device cpu` (the serial kernel is used). Measured RTX 3060, 25 iters ×
+8 substeps:
+
+| scene | bodies | serial | warp-per-body (best) | speedup |
+|-------|-------:|-------:|---------------------:|--------:|
+| small (3×3×3) | 33 | 46 ms | 12 ms | 4.0× |
+| `--stress` (8×8×6) | 414 | 116 ms | 22 ms | 5.1× |
+| 12×12×8 | 1212 | 133 ms | 36 ms | 3.6× |
+| 16×16×8 | 2128 | 149 ms | 52 ms | 2.8× |
+
+Flags (`viewer.py`, or `Solver6DOF(primal_group_size=…, primal_shuffle=…)`):
+
+```bash
+--primal-group N      # lanes per body; 1 = serial, default 16
+                      #   (32 best for small/medium, 8 for >1000-body scenes)
+--no-primal-shuffle   # use the atomic-add join instead of warp-shuffle
 ```
 
 ### Deformable bunny mode

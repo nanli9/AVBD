@@ -65,11 +65,21 @@ def random_orientation(rng: np.random.Generator) -> tuple[float, float, float, f
     return (float(s1), float(s2), float(s3 * s), float(s4 * s))
 
 
+# Above this many bodies (e.g. a --stress block pile) we skip the per-body
+# drag gizmos: one transform-control per body would create hundreds of viser
+# scene nodes and make the GUI sluggish. Rendering + sim are unaffected.
+_MAX_DRAG_GIZMOS = 120
+
+
 def build_scene(args) -> tuple[Solver6DOF, list[ViewerBox], list[int]]:
     """Build a 6-DOF scene: a grid of cube towers + a row of standing
     domino slabs (the pinned anchor box was removed — see git history).
     Stresses the OBB-OBB contact + persistent augmented-Lagrangian
     warm-start that AVBD relies on for stable stacks.
+
+    Pass ``--stress`` to scale up into a paper-style block pile (many more,
+    taller towers + a longer domino wall) for a solver stress test; tune
+    with ``--stress-grid`` / ``--stress-height`` / ``--stress-dominoes``.
     Returns solver, list of viewer boxes, list of pin-row indices."""
     s = Solver6DOF(
         dt=1.0 / 60.0,
@@ -80,6 +90,9 @@ def build_scene(args) -> tuple[Solver6DOF, list[ViewerBox], list[int]]:
         substeps=int(args.substeps),
         friction_static_mult=float(args.static_mult),
         coloring_mode=str(getattr(args, "coloring", "jacobi")),
+        unsafe_fixed_capacity=bool(getattr(args, "fixed_capacity", False)),
+        primal_group_size=int(getattr(args, "primal_group", 1)),
+        primal_shuffle=bool(getattr(args, "primal_shuffle", False)),
     )
     s.enable_self_collision(True, default_friction=args.friction)
     boxes: list[ViewerBox] = []
@@ -100,14 +113,18 @@ def build_scene(args) -> tuple[Solver6DOF, list[ViewerBox], list[int]]:
     # set its pin height, is now unused.)
 
     # --- 2. Grid of cube towers ---------------------------------------------
-    # 3×3 layout, each tower is `tower_height` cubes tall. Cube half-extent
-    # h=0.12 → full cube 24 cm. Tower spacing 0.55 m gives ~7 cm gap between
-    # towers, enough to keep them from crosstalking on the first substep but
-    # tight enough to look dense.
+    # grid_n × grid_n layout, each tower `tower_height` cubes tall. Cube
+    # half-extent h=0.12 → full cube 24 cm. Tower spacing 0.55 m gives ~31 cm
+    # gap between towers, enough to keep them from crosstalking on the first
+    # substep but tight enough to look dense.
+    #   --stress scales this up into a paper-style block pile (Fig. 1/6/10):
+    #   many more, taller towers. Default 3×3×3 = 27 cubes; --stress defaults
+    #   to 8×8×6 = 384, tunable via --stress-grid / --stress-height.
+    stress = bool(getattr(args, "stress", False))
     h_cube = 0.12
-    tower_height = 3
     tower_spacing = 0.55
-    grid_n = 3
+    tower_height = int(getattr(args, "stress_height", 6)) if stress else 3
+    grid_n = int(getattr(args, "stress_grid", 8)) if stress else 3
     grid_origin = -(grid_n - 1) * tower_spacing * 0.5  # centered on origin
     for ix in range(grid_n):
         for iz in range(grid_n):
@@ -134,8 +151,10 @@ def build_scene(args) -> tuple[Solver6DOF, list[ViewerBox], list[int]]:
     # over their height in x so toppling one cascades into the next.
     domino_he = (0.025, 0.12, 0.06)  # half-extents → 5 × 24 × 12 cm slab
     domino_spacing = 0.10            # x-gap between adjacent slabs
-    domino_count = 6
-    domino_z = 1.8                   # in front of the tower grid
+    domino_count = int(getattr(args, "stress_dominoes", 30)) if stress else 6
+    # Keep the wall just past the +z edge of the (now larger) tower grid in
+    # stress mode (the grid is symmetric, so its +z edge is -grid_origin).
+    domino_z = (-grid_origin + tower_spacing) if stress else 1.8
     domino_x0 = -(domino_count - 1) * domino_spacing * 0.5
     for i in range(domino_count):
         cx = domino_x0 + i * domino_spacing
@@ -191,19 +210,24 @@ class Viewer:
 
         # transform controls — hidden by default (toggle via "drag mode")
         # (Every box is draggable now that the pinned anchor is gone.)
-        for i, vb in enumerate(self.boxes):
-            tc = self.server.scene.add_transform_controls(
-                f"/drag/{i}",
-                position=tuple(self.solver.positions()[vb.body.index]),
-                scale=self._gizmo_scale_for(vb.body),
-                line_width=4.0,
-                disable_axes=False,
-                disable_sliders=False,   # plane handles for 2-axis drag
-                disable_rotations=True,  # translation-only
-                visible=False,
-            )
-            vb.tc = tc
-            self._wire_drag(vb)
+        # Skipped for very large scenes (--stress) — see _MAX_DRAG_GIZMOS.
+        if len(self.boxes) > _MAX_DRAG_GIZMOS:
+            print(f"[viewer] {len(self.boxes)} bodies > {_MAX_DRAG_GIZMOS}: "
+                  "per-body drag gizmos disabled for this stress scene.")
+        else:
+            for i, vb in enumerate(self.boxes):
+                tc = self.server.scene.add_transform_controls(
+                    f"/drag/{i}",
+                    position=tuple(self.solver.positions()[vb.body.index]),
+                    scale=self._gizmo_scale_for(vb.body),
+                    line_width=4.0,
+                    disable_axes=False,
+                    disable_sliders=False,   # plane handles for 2-axis drag
+                    disable_rotations=True,  # translation-only
+                    visible=False,
+                )
+                vb.tc = tc
+                self._wire_drag(vb)
 
         # GUI panel
         with self.server.gui.add_folder("Simulation"):
@@ -524,17 +548,21 @@ class Viewer:
             positions_after_build = self.solver.positions().copy()
         for i, vb in enumerate(self.boxes):
             self._add_box_primitive(vb, f"/bodies/{i}")
-        for i, vb in enumerate(self.boxes):
-            tc = self.server.scene.add_transform_controls(
-                f"/drag/{i}",
-                position=tuple(positions_after_build[vb.body.index]),
-                scale=self._gizmo_scale_for(vb.body),
-                line_width=4.0,
-                disable_sliders=False, disable_rotations=True,
-                visible=bool(self.gui_drag_mode.value),
-            )
-            vb.tc = tc
-            self._wire_drag(vb)
+        if len(self.boxes) > _MAX_DRAG_GIZMOS:
+            print(f"[viewer] {len(self.boxes)} bodies > {_MAX_DRAG_GIZMOS}: "
+                  "per-body drag gizmos disabled for this stress scene.")
+        else:
+            for i, vb in enumerate(self.boxes):
+                tc = self.server.scene.add_transform_controls(
+                    f"/drag/{i}",
+                    position=tuple(positions_after_build[vb.body.index]),
+                    scale=self._gizmo_scale_for(vb.body),
+                    line_width=4.0,
+                    disable_sliders=False, disable_rotations=True,
+                    visible=bool(self.gui_drag_mode.value),
+                )
+                vb.tc = tc
+                self._wire_drag(vb)
         self._iters_changed(None)
         self._substeps_changed(None)
         self._gravity_changed(None)
@@ -802,14 +830,14 @@ class DeformableViewer:
             pass
 
         # Bunny mode follows the AVBD paper budget: iterations=4 per
-        # substep + multiple substeps per visual frame. If the user
-        # passed --iterations explicitly (anything other than the global
-        # default of 25), we honour that; otherwise we switch to 4.
+        # substep + multiple substeps per visual frame. The shared
+        # --iterations arg now defaults to 4 (the paper budget), so the
+        # bunny just uses it directly; pass --iterations N to override.
         # The shared --substeps arg controls how many AVBD substeps run
         # per tick. At 4 iters × 8 substeps the effective work per frame
         # matches the old 25-iters single-step setup but resolves plate
         # contact penetration much better when squeezing hard.
-        bunny_iters = 4 if int(args.iterations) == 25 else int(args.iterations)
+        bunny_iters = int(args.iterations)
         self._bunny_substeps = max(1, int(args.substeps))
         # Gravity off by default in the bunny scene — the canonical demo is
         # the two-plate squash, which reads cleaner with the bunny at rest
@@ -1332,7 +1360,7 @@ def main():
     p.add_argument("--static-mult", type=float, default=1.5,
                    help="μ_s / μ_d ratio. 1.5 ≈ dry steel; 1.0 disables "
                         "static-vs-kinetic switching.")
-    p.add_argument("--iterations", type=int, default=25)
+    p.add_argument("--iterations", type=int, default=4)
     p.add_argument("--gizmo-scale", type=float, default=0.35,
                    help="minimum size (m) of the drag-handle axis arrows. "
                         "Per-body actual scale is max(this, 2.5·half_extent) "
@@ -1359,6 +1387,45 @@ def main():
                         "(§4); it packs colors tighter than Jones–Plassmann, "
                         "shrinking the serialization chain. Switchable live "
                         "in the GUI; the AVBD solve is identical either way.")
+    # ---- Stress-test scene (paper-style block pile) -------------------------
+    p.add_argument("--stress", action="store_true",
+                   help="Scale the rigid scene up into a paper-style block "
+                        "pile (Fig. 1/6/10): many more, taller cube towers + "
+                        "a longer domino wall, to stress the solver. Default "
+                        "3×3×3=27 cubes becomes 8×8×6=384. Use a GPU "
+                        "(--device cuda:0) for interactive rates.")
+    p.add_argument("--stress-grid", type=int, default=8,
+                   help="With --stress: towers per side (grid is N×N). "
+                        "8 → 64 towers.")
+    p.add_argument("--stress-height", type=int, default=6,
+                   help="With --stress: cubes stacked per tower.")
+    p.add_argument("--stress-dominoes", type=int, default=30,
+                   help="With --stress: number of standing domino slabs in "
+                        "the wall.")
+    p.add_argument("--primal-group", type=int, default=16,
+                   help="Perf (warp-per-body primal): GPU lanes cooperating on "
+                        "each body's primal update. 1 = serial one-thread-per-"
+                        "body. >1 splits each body's constraint sum across G "
+                        "lanes to raise occupancy — measured 2.8-5.1x on RTX "
+                        "3060. DEFAULT 16 (robust all-rounder; 32 is best for "
+                        "small/medium, 8 for >1000-body scenes). Same AVBD "
+                        "math (reduction reorder below the atomic noise "
+                        "floor). CUDA only (ignored on --device cpu).")
+    p.add_argument("--primal-shuffle", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="With --primal-group >1: join the per-body lane "
+                        "partials with a warp-shuffle (__shfl_down_sync) "
+                        "register reduction instead of atomic_add. "
+                        "Contention-free and faster everywhere — ON by "
+                        "default. Use --no-primal-shuffle for the atomic "
+                        "join. Same math.")
+    p.add_argument("--fixed-capacity", action="store_true",
+                   help="Perf (A3): drop the two per-substep host syncs that "
+                        "only detect contact-pool overflow, trusting the "
+                        "pre-sized pools. ~1.1–1.3 ms/frame faster, physics "
+                        "identical — but contacts are silently dropped if the "
+                        "pool is exceeded. Use only with a bounded object "
+                        "count; a once-per-frame check warns on overflow.")
     # ---- Deformable-bunny mode flags ----------------------------------------
     p.add_argument("--deformable-bunny", action="store_true",
                    help="Replace the rigid-body scene with a deformable "

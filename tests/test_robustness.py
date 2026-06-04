@@ -18,6 +18,7 @@ Targets the regressions found in the codex code review (plan file
 
 import numpy as np
 import pytest
+import warp as wp
 
 from avbd3d.solver_6dof import Solver6DOF
 
@@ -206,3 +207,54 @@ def test_graph_invalidates_on_iterations():
     assert sig_after[0] == 9, (
         f"signature did not pick up iterations change: {sig_after}")
     assert sig_before != sig_after
+
+
+def test_primal_group_size_invalidates_graph():
+    """primal_group_size (warp-per-body lane count) is part of the captured-
+    graph signature: changing it must force a recapture, because the inner
+    loop dispatches the serial vs accumulate+solve kernels based on it.
+    CPU-safe — the signature is computed regardless of capture."""
+    s = Solver6DOF(gravity=(0, -9.8, 0), iterations=4)
+    s.add_box(position=(0.0, 2.0, 0.0), half_extents=(0.5, 0.5, 0.5), mass=1.0)
+    s.add_box(position=(0.6, 2.0, 0.0), half_extents=(0.5, 0.5, 0.5), mass=1.0)
+    s.enable_self_collision(True)
+    s.step()
+    sig_before = s._graph_signature
+    s.primal_group_size = 8
+    assert s.primal_group_size == 8
+    s.step()
+    assert s._graph_signature != sig_before, (
+        "graph signature did not pick up the primal_group_size change")
+
+
+@pytest.mark.skipif(not wp.is_cuda_available(),
+                    reason="warp-per-body primal path is CUDA-only")
+@pytest.mark.parametrize("shuffle", [False, True], ids=["atomic", "shuffle"])
+def test_warp_per_body_matches_serial_cuda(shuffle):
+    """Both warp-per-body join flavours (group_size > 1) are math-preserving:
+    they parallelize only the per-body constraint reduction (atomic_add, or a
+    func_native __shfl_down_sync register reduction), so a small stable stack
+    must follow the serial one-thread-per-body kernel to within the GPU-atomic
+    noise floor (sub-mm). A systematic kernel error blows past the 1 mm bar."""
+    def build(group, shuf=False):
+        s = Solver6DOF(gravity=(0, -9.81, 0), iterations=20, substeps=4,
+                       dt=1 / 60, device="cuda:0", primal_group_size=group,
+                       primal_shuffle=shuf)
+        s.enable_self_collision(True, default_friction=0.5)
+        for k in range(4):
+            b = s.add_box(position=(0.0, 0.13 + 0.24 * k, 0.0),
+                          half_extents=(0.12, 0.12, 0.12), mass=1.0,
+                          friction=0.5)
+            s.add_floor_contact_box(b, friction=0.5)
+        return s
+
+    serial = build(1)
+    parallel = build(8, shuf=shuffle)
+    for _ in range(40):
+        serial.step()
+        parallel.step()
+    wp.synchronize_device("cuda:0")
+    diff = float(np.abs(serial.positions() - parallel.positions()).max())
+    assert diff < 1.0e-3, (
+        f"warp-per-body ({'shuffle' if shuffle else 'atomic'}) diverged from "
+        f"serial by {diff*1e3:.3f} mm — expected sub-mm (reduction reorder only)")
