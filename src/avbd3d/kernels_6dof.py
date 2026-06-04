@@ -1146,6 +1146,305 @@ def primal_solve_6dof(
     scratch_rang[i] = wp.vec3(0.0, 0.0, 0.0)
 
 
+@wp.kernel
+def primal_solve_fused_shuffle_6dof(
+    # state (lane 0 writes x/q for the body in place)
+    x: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.quat),
+    mass: wp.array(dtype=float),
+    inertia_world: wp.array(dtype=wp.mat33),
+    x_inertial: wp.array(dtype=wp.vec3),
+    q_inertial: wp.array(dtype=wp.quat),
+    # constraints
+    c_type: wp.array(dtype=int),
+    c_body_a: wp.array(dtype=int),
+    c_body_b: wp.array(dtype=int),
+    c_world_anchor: wp.array(dtype=wp.vec3),
+    c_off_a: wp.array(dtype=wp.vec3),
+    c_off_b: wp.array(dtype=wp.vec3),
+    c_stiffness: wp.array(dtype=float),
+    c_lambda: wp.array(dtype=float),
+    c_penalty: wp.array(dtype=float),
+    c_fmin: wp.array(dtype=float),
+    c_fmax: wp.array(dtype=float),
+    c_alpha_C0: wp.array(dtype=float),
+    c_active: wp.array(dtype=int),
+    c_sibling: wp.array(dtype=int),
+    c_friction: wp.array(dtype=float),
+    c_friction_static: wp.array(dtype=float),
+    c_was_static: wp.array(dtype=int),
+    # adjacency + color partition
+    body_con_starts: wp.array(dtype=int),
+    body_con_indices: wp.array(dtype=int),
+    color_starts: wp.array(dtype=int),
+    color_bodies: wp.array(dtype=int),
+    color_id: int,
+    group_size: int,
+    dt: float,
+    # write targets. For the GPU-resident path these are the double-buffer
+    # arrays (x_new/q_new) and primal_commit_6dof copies them back after the
+    # color finishes; for the in-place path the caller passes x/q themselves.
+    x_out: wp.array(dtype=wp.vec3),
+    q_out: wp.array(dtype=wp.quat),
+):
+    # Fused warp-per-body primal step (DEFAULT shuffle path). Identical to
+    # primal_accumulate_shuffle_6dof's cooperative reduction, but instead of
+    # storing the per-body sums to global scratch and launching a separate
+    # low-occupancy solve, the sub-group LEADER (lane 0) keeps the reduced
+    # A/B/D/r in registers, adds the inertial init, and runs the Schur solve in
+    # place. No scratch round-trip, no second launch. Math is bit-for-bit the
+    # two-kernel path (same reduction order, same verbatim solve).
+    #
+    # CRITICAL: do NOT return before warp_sum_vec3 — every warp lane must reach
+    # the full-mask shuffle. Padding/static/empty lanes carry a zero partial.
+    tid = wp.tid()
+    slot = tid // group_size
+    lane = tid % group_size
+    base = color_starts[color_id]
+    end_c = color_starts[color_id + 1]
+    # Entirely-empty color: ALL launch threads return together, so none reach
+    # the warp_sum_vec3 below — the full-mask shuffle stays well-defined. This
+    # keeps the fixed-MAX_COLORS loop (recolor_every_substep) cheap; with the
+    # achieved-count loop this never triggers.
+    if end_c <= base:
+        return
+    i = int(0)
+    active = int(0)
+    if slot < end_c - base:
+        i = color_bodies[base + slot]
+        if mass[i] > 0.0:
+            active = 1
+
+    A = wp.mat33()
+    B = wp.mat33()
+    D = wp.mat33()
+    r_lin = wp.vec3(0.0, 0.0, 0.0)
+    r_ang = wp.vec3(0.0, 0.0, 0.0)
+
+    if active == 1:
+        qi = q[i]
+        xi = x[i]
+        start = body_con_starts[i]
+        end = body_con_starts[i + 1]
+        for k in range(start + lane, end, group_size):
+            cj = body_con_indices[k]
+            if c_active[cj] == 0:
+                continue
+            t = c_type[cj]
+            s = c_stiffness[cj]
+            k_p = c_penalty[cj]
+            off_a = c_off_a[cj]
+            anchor = c_world_anchor[cj]
+
+            j_lin = wp.vec3(0.0, 0.0, 0.0)
+            j_ang = wp.vec3(0.0, 0.0, 0.0)
+            C = float(0.0)
+            r_self_w = wp.vec3(0.0, 0.0, 0.0)
+            n_for_G = wp.vec3(0.0, 0.0, 0.0)
+            have_G = False
+
+            if t == FLOOR_CONTACT_6DOF:
+                r_self_w = wp.quat_rotate(qi, off_a)
+                n_hat = wp.vec3(0.0, 1.0, 0.0)
+                j_lin = n_hat
+                j_ang = wp.cross(r_self_w, n_hat)
+                C = (xi[1] + r_self_w[1]) - anchor[1]
+                n_for_G = n_hat
+                have_G = True
+            elif t == CONTACT_TANGENT_6DOF:
+                tangent = anchor
+                bb = c_body_b[cj]
+                if bb < 0:
+                    r_self_w = wp.quat_rotate(qi, off_a)
+                    j_lin = tangent
+                    j_ang = wp.cross(r_self_w, tangent)
+                    C = wp.dot(tangent, xi + r_self_w)
+                else:
+                    ba = c_body_a[cj]
+                    off_b = c_off_b[cj]
+                    if ba == i:
+                        r_self_w = wp.quat_rotate(qi, off_a)
+                        r_other_w = wp.quat_rotate(q[bb], off_b)
+                        C = wp.dot(tangent,
+                                   (xi + r_self_w) - (x[bb] + r_other_w))
+                        j_lin = tangent
+                        j_ang = wp.cross(r_self_w, tangent)
+                    else:
+                        r_other_w = wp.quat_rotate(q[ba], off_a)
+                        r_self_w = wp.quat_rotate(qi, off_b)
+                        C = wp.dot(tangent,
+                                   (x[ba] + r_other_w) - (xi + r_self_w))
+                        j_lin = -tangent
+                        j_ang = -wp.cross(r_self_w, tangent)
+                n_for_G = tangent
+                have_G = True
+            elif t == PIN_6DOF:
+                axis = c_body_b[cj]
+                r_self_w = wp.quat_rotate(qi, off_a)
+                world_anchor_pt = xi + r_self_w
+                if axis == 0:
+                    n_hat = wp.vec3(1.0, 0.0, 0.0)
+                    C = world_anchor_pt[0] - anchor[0]
+                elif axis == 1:
+                    n_hat = wp.vec3(0.0, 1.0, 0.0)
+                    C = world_anchor_pt[1] - anchor[1]
+                else:
+                    n_hat = wp.vec3(0.0, 0.0, 1.0)
+                    C = world_anchor_pt[2] - anchor[2]
+                j_lin = n_hat
+                j_ang = wp.cross(r_self_w, n_hat)
+                n_for_G = n_hat
+                have_G = True
+            elif t == BOX_BOX_CONTACT_6DOF:
+                ba = c_body_a[cj]
+                bb = c_body_b[cj]
+                n_hat = anchor
+                off_b = c_off_b[cj]
+                if ba == i:
+                    r_self_w = wp.quat_rotate(qi, off_a)
+                    r_other_w = wp.quat_rotate(q[bb], off_b)
+                    C = wp.dot(n_hat,
+                               (xi + r_self_w) - (x[bb] + r_other_w))
+                    j_lin = n_hat
+                    j_ang = wp.cross(r_self_w, n_hat)
+                else:
+                    r_other_w = wp.quat_rotate(q[ba], off_a)
+                    r_self_w = wp.quat_rotate(qi, off_b)
+                    C = wp.dot(n_hat,
+                               (x[ba] + r_other_w) - (xi + r_self_w))
+                    j_lin = -n_hat
+                    j_ang = -wp.cross(r_self_w, n_hat)
+                n_for_G = n_hat
+                have_G = True
+
+            hard = s >= wp.inf
+            if hard:
+                C = C - c_alpha_C0[cj]
+
+            lam_eff = c_lambda[cj]
+            if not hard:
+                lam_eff = 0.0
+
+            lam_plus = k_p * C + lam_eff
+            if t == CONTACT_TANGENT_6DOF:
+                sib = c_sibling[cj]
+                mu = c_friction[cj]
+                if c_was_static[sib] != 0:
+                    mu = c_friction_static[cj]
+                bound = mu * wp.abs(c_lambda[sib])
+                f_lo = -bound
+                f_hi = bound
+            else:
+                f_lo = c_fmin[cj]
+                f_hi = c_fmax[cj]
+            f = wp.clamp(lam_plus, f_lo, f_hi)
+
+            k_for_lhs = k_p
+            abs_C = wp.abs(C)
+            if abs_C > 1.0e-12:
+                if lam_plus < f_lo:
+                    k_for_lhs = wp.abs(f_lo - lam_plus) / abs_C
+                elif lam_plus > f_hi:
+                    k_for_lhs = wp.abs(f_hi - lam_plus) / abs_C
+
+            A = A + outer3(j_lin, j_lin) * k_for_lhs
+            B = B + outer3(j_ang, j_lin) * k_for_lhs
+            D = D + outer3(j_ang, j_ang) * k_for_lhs
+
+            f_mag = wp.abs(f)
+            if f_mag > 0.0 and have_G:
+                g_diag = geom_stiffness_diag(n_for_G, r_self_w) * f_mag
+                D = D + wp.mat33(g_diag[0], 0.0, 0.0,
+                                 0.0, g_diag[1], 0.0,
+                                 0.0, 0.0, g_diag[2])
+            r_lin = r_lin + j_lin * f
+            r_ang = r_ang + j_ang * f
+
+    # Cooperative join via warp shuffle — UNCONDITIONAL (full-mask). After the
+    # reduction the sub-group LEADER (lane 0) holds the body's complete sum.
+    a0 = warp_sum_vec3(wp.vec3(A[0, 0], A[0, 1], A[0, 2]), group_size)
+    a1 = warp_sum_vec3(wp.vec3(A[1, 0], A[1, 1], A[1, 2]), group_size)
+    a2 = warp_sum_vec3(wp.vec3(A[2, 0], A[2, 1], A[2, 2]), group_size)
+    b0 = warp_sum_vec3(wp.vec3(B[0, 0], B[0, 1], B[0, 2]), group_size)
+    b1 = warp_sum_vec3(wp.vec3(B[1, 0], B[1, 1], B[1, 2]), group_size)
+    b2 = warp_sum_vec3(wp.vec3(B[2, 0], B[2, 1], B[2, 2]), group_size)
+    d0 = warp_sum_vec3(wp.vec3(D[0, 0], D[0, 1], D[0, 2]), group_size)
+    d1 = warp_sum_vec3(wp.vec3(D[1, 0], D[1, 1], D[1, 2]), group_size)
+    d2 = warp_sum_vec3(wp.vec3(D[2, 0], D[2, 1], D[2, 2]), group_size)
+    rl = warp_sum_vec3(r_lin, group_size)
+    ra = warp_sum_vec3(r_ang, group_size)
+
+    # Sub-group leader solves in place — inertial init + Schur solve verbatim
+    # from primal_solve_6dof, on the reduced constraint sum held in registers.
+    if active == 1 and lane == 0:
+        m = mass[i]
+        inv_dt2 = 1.0 / (dt * dt)
+        I_world = inertia_world[i]
+        xi0 = x[i]
+        qi0 = q[i]
+
+        A_s = wp.mat33(a0[0] + m * inv_dt2, a0[1], a0[2],
+                       a1[0], a1[1] + m * inv_dt2, a1[2],
+                       a2[0], a2[1], a2[2] + m * inv_dt2)
+        D_s = I_world * inv_dt2 + wp.mat33(d0[0], d0[1], d0[2],
+                                           d1[0], d1[1], d1[2],
+                                           d2[0], d2[1], d2[2])
+        B_s = wp.mat33(b0[0], b0[1], b0[2],
+                       b1[0], b1[1], b1[2],
+                       b2[0], b2[1], b2[2])
+
+        r_lin_s = (xi0 - x_inertial[i]) * (m * inv_dt2) + rl
+        dq_iner = wp.mul(qi0, wp.quat_inverse(q_inertial[i]))
+        dtheta_iner = quat_to_rotvec(dq_iner)
+        r_ang_s = I_world * (dtheta_iner * inv_dt2) + ra
+
+        A_inv = wp.inverse(A_s)
+        BAinv = B_s * A_inv
+        rhs_theta = r_ang_s - BAinv * r_lin_s
+        S = D_s - BAinv * wp.transpose(B_s)
+        S_inv = wp.inverse(S)
+        d_theta = S_inv * rhs_theta
+        d_x = A_inv * (r_lin_s - wp.transpose(B_s) * d_theta)
+
+        # Write to x_out/q_out (not x/q): under double-buffering the reads of
+        # x[i]/x[bb] above stay stable for every lane in this color, so a
+        # same-color neighbour pair degrades to Jacobi instead of racing.
+        x_out[i] = xi0 - d_x
+        dq = quat_from_rotvec(-d_theta)
+        q_out[i] = wp.normalize(dq * qi0)
+
+
+@wp.kernel
+def primal_commit_6dof(
+    x: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.quat),
+    mass: wp.array(dtype=float),
+    x_new: wp.array(dtype=wp.vec3),
+    q_new: wp.array(dtype=wp.quat),
+    color_starts: wp.array(dtype=int),
+    color_bodies: wp.array(dtype=int),
+    color_id: int,
+):
+    # Double-buffer commit (AVBD Alg 1 lines 22-24): after the fused primal has
+    # written every color-c body's new pose into x_new/q_new, copy it back into
+    # x/q so the NEXT color reads the updated positions (Gauss-Seidel across
+    # colors) while within a color everything read the pre-color pose (Jacobi
+    # for any same-color pair). One thread per color-c body. The mass>0 guard
+    # MUST match the fused kernel's write condition exactly — static bodies
+    # (mass<=0) are colored too but never get an x_new written, so copying
+    # their stale buffer back would corrupt them.
+    tid = wp.tid()
+    base = color_starts[color_id]
+    end_c = color_starts[color_id + 1]
+    if tid >= end_c - base:
+        return
+    i = color_bodies[base + tid]
+    if mass[i] <= 0.0:
+        return
+    x[i] = x_new[i]
+    q[i] = q_new[i]
+
+
 # -----------------------------------------------------------------------------
 # Dual update (AVBD Eq. 11 + Eq. 16) — same structure as 3-DOF
 # -----------------------------------------------------------------------------

@@ -258,3 +258,174 @@ def test_warp_per_body_matches_serial_cuda(shuffle):
     assert diff < 1.0e-3, (
         f"warp-per-body ({'shuffle' if shuffle else 'atomic'}) diverged from "
         f"serial by {diff*1e3:.3f} mm — expected sub-mm (reduction reorder only)")
+
+
+def _independent_boxes(**kw):
+    """Four boxes resting on the floor, spaced apart so there are NEVER any
+    body-body contacts. The body graph stays edge-free, so the flush-time
+    coloring (all color 0) never goes stale — this isolates the double-buffer
+    MATH from the recolor-at-flush convergence trade."""
+    s = Solver6DOF(gravity=(0, -9.81, 0), iterations=20, substeps=4,
+                   dt=1 / 60, device="cuda:0", **kw)
+    s.enable_self_collision(True, default_friction=0.5)
+    for k in range(4):
+        b = s.add_box(position=(2.0 * k, 0.13, 0.0),
+                      half_extents=(0.12, 0.12, 0.12), mass=1.0, friction=0.5)
+        s.add_floor_contact_box(b, friction=0.5)
+    return s
+
+
+def _stable_stack(**kw):
+    s = Solver6DOF(gravity=(0, -9.81, 0), iterations=20, substeps=4,
+                   dt=1 / 60, device="cuda:0", **kw)
+    s.enable_self_collision(True, default_friction=0.5)
+    for k in range(4):
+        b = s.add_box(position=(0.0, 0.13 + 0.24 * k, 0.0),
+                      half_extents=(0.12, 0.12, 0.12), mass=1.0, friction=0.5)
+        s.add_floor_contact_box(b, friction=0.5)
+    return s
+
+
+@pytest.mark.skipif(not wp.is_cuda_available(),
+                    reason="gpu_resident path is CUDA-only")
+@pytest.mark.parametrize("group", [8, 16, 32])
+def test_gpu_resident_matches_serial_cuda(group):
+    """The fully-GPU-resident path (double-buffered fused primal, paper §4)
+    only changes WHEN data crosses PCIe, not the AVBD math. On a scene whose
+    coloring never goes stale (independent boxes), the double buffer must
+    reproduce the serial reference essentially bit-for-bit — the per-color
+    Jacobi-vs-Gauss-Seidel choice is irrelevant when bodies share no
+    constraints. (Stale-coloring convergence on contacting scenes is covered
+    by test_gpu_resident_stack_stable.)"""
+    serial = _independent_boxes(primal_group_size=1, gpu_resident=False)
+    resident = _independent_boxes(primal_group_size=group, primal_shuffle=True,
+                                  primal_fused=True, gpu_resident=True)
+    for _ in range(40):
+        serial.step()
+        resident.step()
+    wp.synchronize_device("cuda:0")
+    diff = float(np.abs(serial.positions() - resident.positions()).max())
+    assert diff < 1.0e-4, (
+        f"gpu_resident (G={group}) diverged from serial by {diff*1e3:.4f} mm "
+        "on a stale-coloring-free scene — the double-buffer math must match")
+
+
+@pytest.mark.skipif(not wp.is_cuda_available(),
+                    reason="gpu_resident path is CUDA-only")
+def test_gpu_resident_stack_stable():
+    """On a contacting stack the resident coloring goes stale between flushes,
+    so same-color pairs fall back to Jacobi (paper's documented behaviour). We
+    don't require bit-parity with serial (the Jacobi fallback loosens
+    convergence), but the result MUST stay finite and physically bounded — the
+    4-box stack settles in place, it must not explode or tunnel through the
+    floor."""
+    resident = _stable_stack(primal_group_size=16, primal_shuffle=True,
+                             primal_fused=True, gpu_resident=True)
+    for _ in range(60):
+        resident.step()
+    wp.synchronize_device("cuda:0")
+    xr = resident.positions()
+    assert np.isfinite(xr).all(), "gpu_resident produced non-finite positions"
+    # 4 stacked 0.24 m boxes: bodies must stay above the floor and near the
+    # original ~1 m column, not blow up or sink through.
+    assert xr[:, 1].min() > -0.05, "a body tunnelled through the floor"
+    assert np.abs(xr).max() < 3.0, "the stack exploded (position out of bounds)"
+
+
+@pytest.mark.skipif(not wp.is_cuda_available(),
+                    reason="gpu_resident path is CUDA-only")
+def test_gpu_resident_no_per_substep_readback():
+    """gpu_resident's contract: ZERO host readbacks in the per-substep hot
+    loop. Count .numpy() calls across a steady-state frame — only the
+    once-per-frame overflow safety check may fire (row + pair pool = 2 reads),
+    versus the 3-per-substep (=> ~24/frame) the readback path issues."""
+    s = _stable_stack(primal_group_size=16, primal_shuffle=True,
+                      primal_fused=True, gpu_resident=True)
+    for _ in range(8):                      # flush, first recolor, capture
+        s.step()
+    wp.synchronize_device("cuda:0")
+
+    calls = {"n": 0}
+    orig = wp.array.numpy
+
+    def counting(self, *a, **k):
+        calls["n"] += 1
+        return orig(self, *a, **k)
+
+    wp.array.numpy = counting
+    try:
+        s.step()
+    finally:
+        wp.array.numpy = orig
+    wp.synchronize_device("cuda:0")
+    assert calls["n"] <= 2, (
+        f"gpu_resident issued {calls['n']} host readbacks in one frame; the "
+        "hot loop must be readback-free (only the once-per-frame row+pair "
+        "overflow check is allowed)")
+
+
+@pytest.mark.skipif(not wp.is_cuda_available(),
+                    reason="gpu_resident path is CUDA-only")
+def test_gpu_resident_recolor_every_substep_no_readback():
+    """recolor_every_substep recolours each substep but must STILL be
+    readback-free: fixed colouring rounds (no convergence sync) + a fixed
+    MAX_COLORS primal loop (achieved count never read). Same <=2/frame budget
+    as the flush-recolor path."""
+    s = _stable_stack(primal_group_size=16, primal_shuffle=True,
+                      primal_fused=True, gpu_resident=True,
+                      recolor_every_substep=True)
+    for _ in range(8):
+        s.step()
+    wp.synchronize_device("cuda:0")
+    calls = {"n": 0}
+    orig = wp.array.numpy
+
+    def counting(self, *a, **k):
+        calls["n"] += 1
+        return orig(self, *a, **k)
+
+    wp.array.numpy = counting
+    try:
+        s.step()
+    finally:
+        wp.array.numpy = orig
+    wp.synchronize_device("cuda:0")
+    assert calls["n"] <= 2, (
+        f"recolor_every_substep issued {calls['n']} readbacks/frame; it must "
+        "stay readback-free (fixed rounds + fixed color loop)")
+
+
+@pytest.mark.skipif(not wp.is_cuda_available(),
+                    reason="gpu_resident path is CUDA-only")
+@pytest.mark.parametrize("recolor_every", [False, True],
+                         ids=["recolor-flush", "recolor-substep"])
+def test_gpu_resident_stack_quality_vs_nonresident(recolor_every):
+    """Quality (not just non-explosion): a settled 4-box stack under the
+    resident path must match the non-resident path's settle — small contact
+    penetration and a near-identical rest column. The resident coloring may go
+    stale (more Jacobi), but a *settled* stack is an attractor, so both reach
+    the same ~0.24 m-spaced rest config. Guards against the Jacobi fallback
+    quietly degrading contact resolution (the thing recolor_every_substep is
+    meant to tighten)."""
+    def settle(**kw):
+        s = _stable_stack(**kw)
+        for _ in range(150):                # long enough to reach rest
+            s.step()
+        wp.synchronize_device("cuda:0")
+        return np.sort(s.positions()[:, 1])  # ascending stack heights
+
+    ref = settle(primal_group_size=1, gpu_resident=False)
+    res = settle(primal_group_size=16, primal_shuffle=True, primal_fused=True,
+                 gpu_resident=True, recolor_every_substep=recolor_every)
+
+    # Adjacent-box gaps: full box height is 0.24 m. A healthy stack keeps gaps
+    # near 0.24; deep penetration would collapse them. Allow a few mm of soft
+    # contact penetration, but not a collapse.
+    ref_gaps = np.diff(ref)
+    res_gaps = np.diff(res)
+    assert res_gaps.min() > 0.20, (
+        f"resident stack penetrated: min adjacent gap {res_gaps.min()*1e3:.1f} "
+        f"mm << 240 mm box height (nonresident min {ref_gaps.min()*1e3:.1f})")
+    # Rest column should match the reference settle within ~3 cm.
+    assert float(np.abs(res - ref).max()) < 0.03, (
+        "resident settled column drifted >30 mm from the non-resident settle")

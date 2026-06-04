@@ -162,6 +162,18 @@ def box_inertia_local_or_zero(mass: float, hx: float, hy: float, hz: float) -> n
     return box_inertia_local(mass, hx, hy, hz)
 
 
+def _snap_group_size(g: int) -> int:
+    """Snap a requested warp-per-body group size to a valid warp-shuffle width:
+    a power of two in [1, 32]. __shfl_down_sync's `width` must be a power of two
+    that divides the 32-lane warp, so an arbitrary value (e.g. 7) is undefined.
+    Snaps DOWN to the largest valid width ≤ the request (7→4, 20→16, 100→32)."""
+    g = max(1, min(32, int(g)))
+    p = 1
+    while p * 2 <= g:
+        p *= 2
+    return p
+
+
 class Solver6DOF:
     """6-DOF AVBD rigid body solver. Sibling of `Solver` for full SE(3) bodies."""
 
@@ -183,6 +195,9 @@ class Solver6DOF:
         unsafe_fixed_capacity: bool = False,
         primal_group_size: int = 16,
         primal_shuffle: bool = True,
+        primal_fused: bool = True,
+        gpu_resident: bool = True,
+        recolor_every_substep: bool = False,
     ):
         wp.init()
         self.device = device
@@ -196,14 +211,57 @@ class Solver6DOF:
         # path always uses the serial kernel. DEFAULT 16: the robust
         # all-rounder, within ~7% of the per-scene optimum from tiny to
         # ~2000-body scenes (G=32 wins small/medium, G=8 wins very large).
-        # See avbd-stress-profile. Clamp ≥1; G is also the constraint stride.
-        self._primal_group_size = max(1, int(primal_group_size))
+        # See avbd-stress-profile. Snapped to a power of two in [1,32]: G is
+        # the warp-shuffle `width`, and __shfl_down_sync is only defined for a
+        # power-of-two width that divides the 32-lane warp (an arbitrary G like
+        # 7 is undefined behaviour). G is also the constraint stride.
+        self._primal_group_size = _snap_group_size(primal_group_size)
         # Warp-per-body reduction `join` flavour (only when group_size>1):
         # False = global atomic_add (portable, contends at high G); True
         # (DEFAULT) = wp.func_native __shfl_down_sync register reduction
         # (contention-free, faster everywhere — 1-D launch padded to a
         # multiple of 32). Same AVBD math either way.
         self._primal_shuffle = bool(primal_shuffle)
+        # Perf: when True (DEFAULT, shuffle path only) the cooperative reduction
+        # and the per-body Schur solve run in ONE kernel
+        # (`primal_solve_fused_shuffle_6dof`): the warp-shuffle already lands the
+        # body's full A/B/D/r sum in lane 0's registers, so lane 0 adds the
+        # inertial init and solves in place — no global scratch write+read, no
+        # re-zero, and no separate low-occupancy `primal_solve` launch (which
+        # was a one-thread-per-body kernel at <1% occupancy). Bit-identical to
+        # the two-kernel path. Set False to A/B against the split kernels.
+        self._primal_fused = bool(primal_fused)
+        # Perf (paper §4 "We have implemented AVBD entirely on the GPU"): when
+        # True (DEFAULT, CUDA only) the per-substep hot loop has ZERO host
+        # readbacks. It (a) double-buffers the fused primal (x_new/q_new +
+        # primal_commit_6dof) so an imperfect/stale coloring is safe — same-
+        # color pairs go Jacobi, exactly as the paper's "double buffer the
+        # position updates" — which lets us (b) recolor only on a body-set
+        # change (_color_dirty) instead of gating on the per-substep
+        # count_color_conflicts() readback, and (c) trust the pre-sized pools
+        # (the unsafe_fixed_capacity launch path: no n_active_rows /
+        # _bp_pair_count syncs). Requires the fused shuffle primal; falls back
+        # to the readback path on CPU or when primal_group_size==1. Capacity
+        # safety is the caller's job (bound the body count — the viewer caps
+        # droppable boxes); a once-per-FRAME overflow check still warns if the
+        # pools are exceeded.
+        self._gpu_resident = bool(gpu_resident)
+        # gpu_resident colouring policy. False (DEFAULT) = recolour only on a
+        # body-set change (cheapest; the double-buffer keeps the now-stale
+        # colouring correct via Jacobi fallback). True = recolour EVERY substep
+        # like the paper (Alg 1 step 2), staying readback-free by (a) a fixed
+        # number of colouring rounds — no convergence sync, imperfect colourings
+        # are safe — and (b) looping a fixed MAX_COLORS in the primal (the
+        # paper's fixed/indirect-dispatch analog; empty colours early-out) so
+        # the achieved count is never read back. Fresher colouring → tighter
+        # tracking of the serial reference, at the cost of per-substep recolour
+        # compute + the empty-colour launches A1 removed. CUDA-resident only.
+        self._recolor_every_substep = bool(recolor_every_substep)
+        # Fixed colouring-round count for recolor_every_substep (no per-round
+        # readback). Our contact graphs colour in ~2-4 rounds; 6 is generous and
+        # gpu_color_finalize catches any straggler (which double-buffering then
+        # makes safe). Only used on the every-substep path.
+        self._resident_recolor_rounds = 6
         # Perf: when True, trust the pre-sized contact/pair pools and DROP the
         # two per-substep host syncs (`n_active_rows` and `_bp_pair_count`
         # `.numpy()` reads) that only existed to detect overflow and regrow.
@@ -361,9 +419,11 @@ class Solver6DOF:
         self._spatial_cell_size = 0.0
         # One-shot warning gate for row-pool overflow on dense clusters.
         self._row_overflow_warned = False
-        # One-shot warning gate for the once-per-frame overflow check used in
-        # unsafe_fixed_capacity mode (no per-substep regrow there).
+        # One-shot warning gates for the once-per-frame overflow check used in
+        # fixed-capacity / gpu_resident mode (no per-substep regrow there) —
+        # one for the row pool, one for the broadphase pair pool.
         self._fixed_cap_overflow_warned = False
+        self._pair_overflow_warned = False
         # Vestigial fingerprint from round-2 host-side coloring; round-3
         # moved coloring fully to GPU and no longer reads it. Retained
         # only because read_state_batched / external diagnostics may
@@ -573,9 +633,51 @@ class Solver6DOF:
 
     @primal_group_size.setter
     def primal_group_size(self, g: int) -> None:
-        self._primal_group_size = max(1, int(g))
+        self._primal_group_size = _snap_group_size(g)
 
-    def _gpu_recolor(self, n_b: int, dev) -> None:
+    @property
+    def gpu_resident(self) -> bool:
+        """Fully-GPU-resident hot loop (paper §4): zero per-substep host
+        readbacks via the double-buffered fused primal + recolor-at-flush +
+        fixed-capacity pools. Settable at runtime (in the graph signature, so
+        the next step() recaptures). Effective only on CUDA with the fused
+        shuffle primal (group_size > 1); see `_resident_on`."""
+        return self._gpu_resident
+
+    @gpu_resident.setter
+    def gpu_resident(self, on: bool) -> None:
+        self._gpu_resident = bool(on)
+
+    @property
+    def recolor_every_substep(self) -> bool:
+        """gpu_resident colouring policy: False (default) recolours only on a
+        body-set change (fastest; double-buffer keeps the stale colouring
+        safe); True recolours every substep like the paper (still readback-free
+        but ~3x slower on Warp — no indirect dispatch). Settable at runtime."""
+        return self._recolor_every_substep
+
+    @recolor_every_substep.setter
+    def recolor_every_substep(self, on: bool) -> None:
+        self._recolor_every_substep = bool(on)
+
+    def _resident_on(self, dev) -> bool:
+        """True when the zero-readback GPU-resident hot loop is active: needs
+        CUDA, the gpu_resident flag, and the double-buffered fused-shuffle
+        primal (which is what makes a stale coloring safe). Otherwise we fall
+        back to the readback path (CPU, serial primal, or split/atomic join)."""
+        return (self._gpu_resident
+                and str(dev).startswith("cuda")
+                and self._primal_shuffle
+                and self._primal_fused
+                and self._primal_group_size > 1)
+
+    def _fixed_capacity_mode(self, dev) -> bool:
+        """Whether to take the no-host-sync fixed-capacity launch path for the
+        contact/pair pools — explicitly requested via unsafe_fixed_capacity, or
+        implied by gpu_resident (which guarantees a zero-readback hot loop)."""
+        return self._unsafe_fixed_capacity or self._resident_on(dev)
+
+    def _gpu_recolor(self, n_b: int, dev, fixed_rounds: int | None = None) -> None:
         """Device-side body coloring (round 3 §A). Builds the body-body
         adjacency CSR from the live `c_body_a` / `c_body_b` set written
         by `_gpu_emit_dynamic_contacts`, runs the coloring rounds for the
@@ -627,8 +729,11 @@ class Solver6DOF:
             device=dev,
         )
         # 5-6. Coloring rounds (mode-dependent) + uncolored fallback.
+        # `fixed_rounds` (recolor_every_substep) runs a constant number of
+        # rounds with NO per-round convergence readback — keeps the every-
+        # substep recolor fully GPU-resident.
         if self._coloring_mode == "jacobi":
-            self._color_rounds_jacobi(n_b, dev)
+            self._color_rounds_jacobi(n_b, dev, fixed_rounds=fixed_rounds)
         else:
             self._color_rounds_jp(n_b, dev)
         # Catch leftover uncolored bodies (very dense / tied graphs).
@@ -687,7 +792,8 @@ class Solver6DOF:
                 device=dev,
             )
 
-    def _color_rounds_jacobi(self, n_b: int, dev) -> None:
+    def _color_rounds_jacobi(self, n_b: int, dev,
+                             fixed_rounds: int | None = None) -> None:
         """Speculative ('Jacobi') greedy coloring (A2). Each round colors
         every uncolored body by first-fit (assign), then un-colors the
         loser of any same-color adjacency (resolve, double-buffered). Loops
@@ -695,8 +801,14 @@ class Solver6DOF:
         few rounds (vs JP's fixed JP_ROUNDS). The recolor runs outside the
         captured graph, so the per-round host readback of the uncolored
         count is safe. Capped at MAX_COLORS rounds; any residual is handled
-        by the shared gpu_color_finalize fallback."""
-        for _ in range(self._max_colors):
+        by the shared gpu_color_finalize fallback.
+
+        `fixed_rounds` (recolor_every_substep): run exactly that many rounds
+        with NO per-round readback — imperfect colourings are fine because the
+        resident primal double-buffers (paper §4), so leftover same-colour
+        pairs just go Jacobi. Keeps the every-substep recolor readback-free."""
+        rounds = fixed_rounds if fixed_rounds is not None else self._max_colors
+        for _ in range(rounds):
             wp.launch(
                 K.gpu_color_spec_assign, dim=n_b,
                 inputs=[self.body_neighbor_starts,
@@ -718,6 +830,8 @@ class Solver6DOF:
             # Swap so body_color holds the survivor coloring for next round.
             self.body_color, self.body_color_next = (
                 self.body_color_next, self.body_color)
+            if fixed_rounds is not None:
+                continue  # no convergence readback on the resident path
             # Converged once no body is uncolored. One int readback/round;
             # ~2-4 rounds for our sparse contact graphs.
             self.uncolored_dev.zero_()
@@ -931,6 +1045,16 @@ class Solver6DOF:
         self.scratch_D = wp.zeros(max(n_b, 1), dtype=wp.mat33, device=dev)
         self.scratch_rlin = wp.zeros(max(n_b, 1), dtype=wp.vec3, device=dev)
         self.scratch_rang = wp.zeros(max(n_b, 1), dtype=wp.vec3, device=dev)
+        # Double-buffer for the GPU-resident primal (AVBD §4 "Parallelization":
+        # "We double buffer the position updates … such that in the rare case
+        # where two masses have the same color, the solver effectively becomes
+        # equivalent to Jacobi for those masses that time step"). The fused
+        # primal writes lane-0's result here; primal_commit_6dof copies it back
+        # per color. This makes a stale/imperfect coloring SAFE (the same-color
+        # pair just goes Jacobi), so we no longer need the per-substep
+        # color-conflict readback — see _step_one's gpu_resident path.
+        self.x_new = wp.zeros(max(n_b, 1), dtype=wp.vec3, device=dev)
+        self.q_new = wp.zeros(max(n_b, 1), dtype=wp.quat, device=dev)
         # Host-side metadata (no readbacks — kept only for the existing
         # diagnostic API surface; .num_colors is the upper bound, not the
         # actual achieved count, which is .num_active_colors).
@@ -1052,9 +1176,13 @@ class Solver6DOF:
     # ---- The step -----------------------------------------------------------
 
     def step(self) -> None:
+        # Both fixed-capacity and gpu_resident drop the per-substep overflow
+        # readbacks; keep a single once-per-FRAME check as insurance (warns if
+        # the pre-sized pools were exceeded and contacts were dropped).
+        fixed_cap = self._unsafe_fixed_capacity or self._resident_on(self.device)
         if self.substeps <= 1:
             self._step_one()
-            if self._unsafe_fixed_capacity:
+            if fixed_cap:
                 self._check_fixed_cap_overflow()
             return
         full_dt = self.dt
@@ -1065,26 +1193,41 @@ class Solver6DOF:
                 self._step_one()
         finally:
             self.dt = full_dt
-        if self._unsafe_fixed_capacity:
+        if fixed_cap:
             self._check_fixed_cap_overflow()
 
     def _check_fixed_cap_overflow(self) -> None:
-        """Once-per-frame insurance for unsafe_fixed_capacity mode. The
-        per-substep regrow is gone, so read the row reservation counter ONE
-        time (the last substep's value) and warn once if the pool was
-        exceeded — meaning contacts were silently dropped this frame."""
-        if self.n_active_rows is None:
-            return
-        n = int(self.n_active_rows.numpy()[0])
-        if n > self._gpu_pool_n_capacity and not self._fixed_cap_overflow_warned:
-            import warnings
-            warnings.warn(
-                f"avbd3d unsafe_fixed_capacity: row pool overflow "
-                f"({n} reserved > {self._gpu_pool_n_capacity} capacity) — "
-                "contacts were dropped. Increase "
-                "solver._gpu_pool_n_dyn_capacity or disable "
-                "unsafe_fixed_capacity.", RuntimeWarning, stacklevel=2)
-            self._fixed_cap_overflow_warned = True
+        """Once-per-frame insurance for the fixed-capacity / gpu_resident path.
+        The per-substep regrow + sync is gone, so we read the last substep's
+        reservation counters ONE time each and warn once if either pool was
+        exceeded — meaning contacts were silently dropped this frame. Both the
+        ROW pool (n_active_rows) and the broadphase PAIR pool (_bp_pair_count)
+        are checked: a pair-pool overflow drops contacts *before* row emission,
+        so the row counter alone can miss it."""
+        import warnings
+        if self.n_active_rows is not None:
+            n = int(self.n_active_rows.numpy()[0])
+            if (n > self._gpu_pool_n_capacity
+                    and not self._fixed_cap_overflow_warned):
+                warnings.warn(
+                    f"avbd3d fixed-capacity: row pool overflow "
+                    f"({n} reserved > {self._gpu_pool_n_capacity} capacity) — "
+                    "contacts were dropped. Increase "
+                    "solver._gpu_pool_n_dyn_capacity, lower --max-bodies, or "
+                    "disable gpu_resident/unsafe_fixed_capacity.",
+                    RuntimeWarning, stacklevel=2)
+                self._fixed_cap_overflow_warned = True
+        if self._bp_pair_count is not None and self._bp_max_pairs > 0:
+            p = int(self._bp_pair_count.numpy()[0])
+            if p > self._bp_max_pairs and not self._pair_overflow_warned:
+                warnings.warn(
+                    f"avbd3d fixed-capacity: broadphase pair pool overflow "
+                    f"({p} pairs > {self._bp_max_pairs} capacity) — contacts "
+                    "were dropped before row emission. Increase the pair "
+                    "budget (lower --max-bodies / raise solver._bp_max_pairs) "
+                    "or disable gpu_resident/unsafe_fixed_capacity.",
+                    RuntimeWarning, stacklevel=2)
+                self._pair_overflow_warned = True
 
     def _step_one(self) -> None:
         """One AVBD substep. After the initial _flush() upload from the CPU
@@ -1115,6 +1258,8 @@ class Solver6DOF:
             return
         dev = self.device
         n_static = self._gpu_pool_n_static
+        resident = self._resident_on(dev)
+        fixed_cap = self._unsafe_fixed_capacity or resident
 
         # ---- 1. Reset substep counters + zero CSR counts (fused) ----
         # One launch at dim=n_b: thread 0 resets the atomic counters
@@ -1131,8 +1276,8 @@ class Solver6DOF:
         # ---- 2-4. Broadphase + SAT + manifold + kernel row emission ----
         n_active = n_static
         if self._self_collide and n_b >= 2:
-            self._gpu_emit_dynamic_contacts(n_b)
-            if self._unsafe_fixed_capacity:
+            self._gpu_emit_dynamic_contacts(n_b, fixed_cap)
+            if fixed_cap:
                 # A3 fixed-capacity mode: skip the per-substep host sync +
                 # regrow. The row launches below already run at fixed
                 # `row_dim` and bound device-side against n_active_rows[0],
@@ -1178,17 +1323,37 @@ class Solver6DOF:
         # after any flush (body_color is all -1 then) and skips the check on
         # that path. Removing contacts never invalidates a coloring, so a
         # resting/stable stack recolors once and then reuses every substep.
-        if self._color_dirty or self.count_color_conflicts() > 0:
-            self._gpu_recolor(n_b, dev)
+        #
+        # GPU-resident mode (paper §4): the fused primal is double-buffered, so
+        # a newly-formed same-color edge degrades to Jacobi instead of racing.
+        # That removes the *correctness* need for the per-substep conflict
+        # check — we recolor only when the body set changes (_color_dirty,
+        # i.e. at a flush), which is exactly when we recapture the graph. This
+        # drops the per-substep count_color_conflicts() readback entirely.
+        if resident and self._recolor_every_substep:
+            # Paper-faithful (Alg 1 step 2): recolor EVERY substep, readback-
+            # free. Fixed rounds (no convergence sync); the primal then loops a
+            # fixed MAX_COLORS (set below) instead of the achieved count, so the
+            # count is never read back. Empty colors early-out in the kernel.
+            self._gpu_recolor(n_b, dev,
+                              fixed_rounds=self._resident_recolor_rounds)
             self._color_dirty = False
-            # A0/A1: read back the achieved color count (highest used color
-            # + 1), clamped to [1, MAX_COLORS]. Bounds the per-color primal
-            # loop so the empty tail is never launched, and feeds the graph
-            # signature so a changed count recaptures.
-            n_active_colors = int(self.n_active_colors_dev.numpy()[0]) + 1
-            self._n_active_colors = max(1, min(n_active_colors,
-                                               self._max_colors))
-            self.num_active_colors = self._n_active_colors
+            self._n_active_colors = self._max_colors
+            self.num_active_colors = self._max_colors
+        else:
+            need_recolor = self._color_dirty or (
+                not resident and self.count_color_conflicts() > 0)
+            if need_recolor:
+                self._gpu_recolor(n_b, dev)
+                self._color_dirty = False
+                # A0/A1: read back the achieved color count (highest used color
+                # + 1), clamped to [1, MAX_COLORS]. Bounds the per-color primal
+                # loop so the empty tail is never launched, and feeds the graph
+                # signature so a changed count recaptures.
+                n_active_colors = int(self.n_active_colors_dev.numpy()[0]) + 1
+                self._n_active_colors = max(1, min(n_active_colors,
+                                                   self._max_colors))
+                self.num_active_colors = self._n_active_colors
 
         # Post-Phase-A: row-side launches all use fixed dim=row_dim with
         # device-side bounds via `self.n_active_rows[0]`. Lets the inner
@@ -1314,6 +1479,9 @@ class Solver6DOF:
             int(self._n_active_colors),
             int(self._primal_group_size),
             int(self._primal_shuffle),
+            int(self._primal_fused),
+            int(self._gpu_resident),
+            int(self._recolor_every_substep),
             float(self.dt),
             float(self.alpha),
             float(self.beta),
@@ -1372,6 +1540,7 @@ class Solver6DOF:
             # change recaptures. Within the captured graph the launch count
             # is fixed. `color_starts` is device-resident.
             G = self._primal_group_size if str(dev).startswith("cuda") else 1
+            resident = self._resident_on(dev)
             for color_id in range(self._n_active_colors):
                 if G > 1:
                     # Warp-per-body: G lanes cooperate per body. accumulate
@@ -1394,26 +1563,75 @@ class Solver6DOF:
                         color_id, G,
                         self.scratch_A, self.scratch_B, self.scratch_D,
                         self.scratch_rlin, self.scratch_rang]
-                    if self._primal_shuffle:
-                        # 1-D launch padded to a multiple of 32 so every warp
-                        # lane reaches the full-mask shuffle (see kernel).
+                    if self._primal_shuffle and self._primal_fused:
+                        # DEFAULT: one fused kernel — cooperative shuffle reduce
+                        # + lane-0 Schur solve in registers, no scratch round-
+                        # trip and no second launch. 1-D launch padded to a
+                        # multiple of 32 so every warp lane reaches the
+                        # full-mask shuffle (see kernel).
+                        #
+                        # GPU-resident (paper §4): write the new pose into the
+                        # double-buffer (x_new/q_new) and commit it after the
+                        # color, so same-color reads stay stable (Jacobi for any
+                        # stale-coloring collision). Non-resident: write x/q in
+                        # place (needs a conflict-free coloring, which the
+                        # per-substep check guarantees).
+                        if resident:
+                            x_out, q_out = self.x_new, self.q_new
+                        else:
+                            x_out, q_out = self.x, self.q
                         shuf_dim = ((n_b * G + 31) // 32) * 32
-                        wp.launch(K.primal_accumulate_shuffle_6dof,
-                                  dim=shuf_dim, inputs=accum_inputs, device=dev)
-                    else:
-                        wp.launch(K.primal_accumulate_6dof, dim=(n_b, G),
-                                  inputs=accum_inputs, device=dev)
-                    wp.launch(
-                        K.primal_solve_6dof, dim=n_b,
-                        inputs=[self.x, self.q, self.mass,
+                        wp.launch(
+                            K.primal_solve_fused_shuffle_6dof, dim=shuf_dim,
+                            inputs=[
+                                self.x, self.q, self.mass,
                                 self.inertia_world,
                                 self.x_inertial, self.q_inertial,
+                                self.c_type, self.c_body_a, self.c_body_b,
+                                self.c_world_anchor, self.c_off_a, self.c_off_b,
+                                self.c_stiffness,
+                                self.c_lambda, self.c_penalty,
+                                self.c_fmin, self.c_fmax,
+                                self.c_alpha_C0, self.c_active,
+                                self.c_sibling, self.c_friction,
+                                self.c_friction_static, self.c_was_static,
+                                self.body_con_starts, self.body_con_indices,
                                 self.color_starts, self.color_bodies,
-                                color_id, self.dt,
-                                self.scratch_A, self.scratch_B, self.scratch_D,
-                                self.scratch_rlin, self.scratch_rang],
-                        device=dev,
-                    )
+                                color_id, G, self.dt, x_out, q_out],
+                            device=dev,
+                        )
+                        if resident:
+                            wp.launch(
+                                K.primal_commit_6dof, dim=n_b,
+                                inputs=[self.x, self.q, self.mass,
+                                        self.x_new, self.q_new,
+                                        self.color_starts, self.color_bodies,
+                                        color_id],
+                                device=dev,
+                            )
+                    else:
+                        if self._primal_shuffle:
+                            # 1-D launch padded to a multiple of 32 so every warp
+                            # lane reaches the full-mask shuffle (see kernel).
+                            shuf_dim = ((n_b * G + 31) // 32) * 32
+                            wp.launch(K.primal_accumulate_shuffle_6dof,
+                                      dim=shuf_dim, inputs=accum_inputs,
+                                      device=dev)
+                        else:
+                            wp.launch(K.primal_accumulate_6dof, dim=(n_b, G),
+                                      inputs=accum_inputs, device=dev)
+                        wp.launch(
+                            K.primal_solve_6dof, dim=n_b,
+                            inputs=[self.x, self.q, self.mass,
+                                    self.inertia_world,
+                                    self.x_inertial, self.q_inertial,
+                                    self.color_starts, self.color_bodies,
+                                    color_id, self.dt,
+                                    self.scratch_A, self.scratch_B,
+                                    self.scratch_D,
+                                    self.scratch_rlin, self.scratch_rang],
+                            device=dev,
+                        )
                 else:
                     wp.launch(
                         K.primal_update_6dof, dim=n_b,
@@ -1553,7 +1771,8 @@ class Solver6DOF:
         # Force re-capture next step if graph caching is wired up.
         self._graph = None
 
-    def _gpu_emit_dynamic_contacts(self, n_b: int) -> None:
+    def _gpu_emit_dynamic_contacts(self, n_b: int,
+                                   fixed_cap: bool | None = None) -> None:
         """One-substep GPU pipeline: broadphase → SAT → manifold → emit rows.
         Atomically appends BOX_BOX + tangent rows into the dynamic region of
         c_* and records pool entries for the post-solve hash collect.
@@ -1569,6 +1788,8 @@ class Solver6DOF:
         dev = self.device
         margin = 0.005
         MAX_PAIR_RETRIES = 2
+        if fixed_cap is None:
+            fixed_cap = self._fixed_capacity_mode(dev)
 
         # AABB inputs are body state; they don't depend on the pair cap. The
         # half-extents themselves are static between substeps — only add_box
@@ -1599,7 +1820,7 @@ class Solver6DOF:
         self._bp_bvh = wp.Bvh(self._bp_aabb_lo, self._bp_aabb_hi,
                               constructor=constructor)
 
-        if self._unsafe_fixed_capacity:
+        if fixed_cap:
             # A3 fixed-capacity mode: a single broadphase pass, no host sync,
             # no retry, no zero early-out. The kernel caps its writes at
             # _bp_max_pairs; SAT/manifold/emit run at that fixed dim and

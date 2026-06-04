@@ -139,6 +139,14 @@ uv run python examples/viewer_particles.py             # 3-DOF particle viewer
 uv run python examples/viewer.py --device cuda:0 --stress --iterations 25
 ```
 
+The viser viewer renders all bodies as a single **instanced mesh** (one
+`add_batched_meshes_simple` node, per-frame transforms pushed as arrays) rather
+than one scene node per body — on a 414-body pile that cut the per-frame render
+push from ~27 ms to ~0.3 ms (the previous viewer bottleneck), so the frame is
+now solver-bound. The "GPU solver" GUI folder toggles `GPU resident`, `primal
+lanes (G)`, and `recolor every substep` live; watch `step time` / `render push`
+in the Performance panel.
+
 ### Performance: warp-per-body primal (CUDA)
 
 Colored Gauss-Seidel launches only ~`n_bodies / n_colors` threads per color, so
@@ -163,12 +171,62 @@ on `--device cpu` (the serial kernel is used). Measured RTX 3060, 25 iters ×
 | 12×12×8 | 1212 | 133 ms | 36 ms | 3.6× |
 | 16×16×8 | 2128 | 149 ms | 52 ms | 2.8× |
 
-Flags (`viewer.py`, or `Solver6DOF(primal_group_size=…, primal_shuffle=…)`):
+The two lanes' partials can be fused even further: lane 0 already holds the
+body's full Hessian/gradient in registers after the shuffle, so it runs the
+Schur solve **in the same kernel** — no global-scratch round-trip and no second
+launch (`--no-primal-fused` restores the two-kernel split). That alone is
+~1.3× over the split kernels.
+
+### Performance: fully GPU-resident hot loop (CUDA)
+
+The AVBD paper implements the solver *"entirely on the GPU"* (§4) with **no
+per-step CPU readbacks**. By default (`--gpu-resident`, CUDA + fused shuffle
+primal) this solver matches that: the per-substep hot loop issues **zero host
+`.numpy()` syncs** (down from 24/frame — three per substep for row-pool
+overflow, pair-pool overflow, and the colour-conflict check). The enabler is
+the paper's own trick — it **double-buffers the primal position update**
+(`x_new`/`q_new` + a per-colour commit, AVBD Alg. 1 lines 9–24), so a stale or
+imperfect colouring is *safe*: any same-colour pair simply degrades to Jacobi
+*"for those masses that time step"* (§4) instead of racing. That removes the
+correctness need for the per-substep conflict readback, so we recolour only
+when the body set changes and trust the pre-sized pools. Measured RTX 3060,
+25 iters × 8 substeps, vs the (already-fast) non-resident fused path:
+
+| scene | bodies | non-resident | **gpu-resident** | speedup | readbacks/frame |
+|-------|-------:|-------------:|-----------------:|--------:|----------------:|
+| `--stress` | 414 | 30.0 ms | **13.1 ms** | 2.3× | 24 → ~0 |
+| 12×12×8 | 894 | 39.4 ms | **18.8 ms** | 2.1× | 24 → ~0 |
+
+The double-buffer math is **bit-identical** to the serial kernel when the
+colouring stays valid (0.00000 mm on a no-contact scene). The one trade: the
+paper recolours every step (for convergence freshness via GPU-driven dispatch,
+which CUDA-graph capture can't replicate without a readback); recolouring at
+flush instead leaves more Jacobi pairs on evolving-contact scenes, so the
+result stays stable and settles correctly but is not bit-reproducible vs serial
+there. Use `--no-gpu-resident` to restore the per-substep readback path.
+
+`--recolor-every-substep` reproduces the paper's *every-step* recolour and is
+**also zero-readback** (fixed colouring rounds + a fixed `MAX_COLORS` primal
+loop, so the achieved count is never read back). But on Warp it's **~3.4×
+slower** than recolour-at-flush (stress 414: 39 ms vs 11.6 ms) — without
+`DispatchIndirect` you pay per-substep recolour compute *plus* the empty-colour
+launches A1 deletes — for negligible fidelity gain (both match serial to
+~0.02 mm at rest). It's kept as an opt-in for highly-dynamic scenes; on this GPU
+recolour-at-flush wins decisively.
+
+Flags (`viewer.py`, or `Solver6DOF(primal_group_size=…, primal_shuffle=…,
+primal_fused=…, gpu_resident=…)`):
 
 ```bash
 --primal-group N      # lanes per body; 1 = serial, default 16
                       #   (32 best for small/medium, 8 for >1000-body scenes)
 --no-primal-shuffle   # use the atomic-add join instead of warp-shuffle
+--no-primal-fused     # split the reduce + Schur solve into two kernels
+--no-gpu-resident      # restore per-substep overflow/conflict readbacks
+--recolor-every-substep # paper's every-step recolour (zero-readback but
+                       #   ~3.4x slower on Warp; see above)
+--max-bodies N         # cap total bodies so the pre-sized pools stay safe
+                       #   (viewer greys out "drop a fresh box" at the cap)
 ```
 
 ### Deformable bunny mode

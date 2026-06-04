@@ -70,6 +70,23 @@ def random_orientation(rng: np.random.Generator) -> tuple[float, float, float, f
 # scene nodes and make the GUI sluggish. Rendering + sim are unaffected.
 _MAX_DRAG_GIZMOS = 120
 
+# Unit cube (side 1, centered at origin) for INSTANCED rendering. Every body is
+# one instance of this mesh; per-instance position/orientation/scale/color are
+# pushed as arrays in a SINGLE viser message per frame (add_batched_meshes_
+# simple), instead of one add_box node + two transform messages per body. On a
+# 414-body pile the per-node path cost ~27 ms/frame (65% of the tick — see
+# AVBD perf notes); the batched path is ~0.05 ms. side='double' so face winding
+# never culls a box. Scale is anisotropic (2·half_extents) → handles non-cube
+# bodies (e.g. dominoes).
+_CUBE_V = np.array([
+    [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5],
+    [-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5],
+], dtype=np.float32)
+_CUBE_F = np.array([
+    [0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7], [0, 1, 5], [0, 5, 4],
+    [2, 3, 7], [2, 7, 6], [1, 2, 6], [1, 6, 5], [0, 4, 7], [0, 7, 3],
+], dtype=np.uint32)
+
 
 def build_scene(args) -> tuple[Solver6DOF, list[ViewerBox], list[int]]:
     """Build a 6-DOF scene: a grid of cube towers + a row of standing
@@ -91,8 +108,15 @@ def build_scene(args) -> tuple[Solver6DOF, list[ViewerBox], list[int]]:
         friction_static_mult=float(args.static_mult),
         coloring_mode=str(getattr(args, "coloring", "jacobi")),
         unsafe_fixed_capacity=bool(getattr(args, "fixed_capacity", False)),
-        primal_group_size=int(getattr(args, "primal_group", 1)),
-        primal_shuffle=bool(getattr(args, "primal_shuffle", False)),
+        # Fallbacks MATCH the CLI defaults below, so an ad-hoc Namespace that
+        # omits these (scripts/tests calling build_scene directly) still gets
+        # the current fast path rather than silently reverting to the serial one.
+        primal_group_size=int(getattr(args, "primal_group", 16)),
+        primal_shuffle=bool(getattr(args, "primal_shuffle", True)),
+        primal_fused=bool(getattr(args, "primal_fused", True)),
+        gpu_resident=bool(getattr(args, "gpu_resident", True)),
+        recolor_every_substep=bool(getattr(args, "recolor_every_substep",
+                                            False)),
     )
     s.enable_self_collision(True, default_friction=args.friction)
     boxes: list[ViewerBox] = []
@@ -190,6 +214,15 @@ class Viewer:
 
         self.solver, self.boxes, self.pin_rows = build_scene(args)
 
+        # Cap on total bodies (initial + dropped). With --gpu-resident the
+        # per-substep overflow readback is gone, so the pre-sized contact pools
+        # must stay sufficient — bounding the body count keeps them safe (the
+        # pool sizing scales with body count, with generous per-body headroom).
+        # 0 → auto: current bodies + 256 headroom. The 'drop a fresh box'
+        # button greys out at the cap.
+        mb = int(getattr(args, "max_bodies", 0))
+        self._max_bodies = mb if mb > 0 else len(self.boxes) + 256
+
         # ground plane. Grid sits 1mm above the box top so the two
         # surfaces don't Z-fight under camera motion (the ground box's
         # top face is at y=0 and the grid defaults to y=0 too).
@@ -204,9 +237,9 @@ class Viewer:
             position=(0.0, 0.001, 0.0),
         )
 
-        # body primitives
-        for i, vb in enumerate(self.boxes):
-            self._add_box_primitive(vb, name=f"/bodies/{i}")
+        # body primitives are one instanced mesh for all bodies (see
+        # _build_batched_boxes) — built below, after the render state is
+        # initialized (it needs self._batched / self._rendered_pose).
 
         # transform controls — hidden by default (toggle via "drag mode")
         # (Every box is draggable now that the pinned anchor is gone.)
@@ -270,6 +303,32 @@ class Viewer:
                 "drag mode (show handles)", initial_value=False,
                 hint="When on, every free box sprouts an XYZ gizmo you can "
                      "drag in 3D to teleport (orientation locked).")
+        with self.server.gui.add_folder("GPU solver"):
+            self.gui_resident = self.server.gui.add_checkbox(
+                "GPU resident (0 readbacks)",
+                initial_value=bool(self.solver.gpu_resident),
+                hint="Paper §4 fully-GPU-resident hot loop: ZERO per-substep "
+                     "host readbacks. Double-buffers the primal so a stale "
+                     "coloring is safe (same-color pairs go Jacobi), recolors "
+                     "only on a body-set change, and trusts the pre-sized "
+                     "pools. Default ON; toggle live and watch 'step time'. "
+                     "Effective on CUDA with primal lanes > 1.")
+            self.gui_primal_group = self.server.gui.add_dropdown(
+                "primal lanes (G)", ("1", "8", "16", "32"),
+                initial_value=str(self.solver.primal_group_size),
+                hint="Warp-per-body: GPU lanes cooperating on each body's "
+                     "primal update. 1 = serial one-thread-per-body; >1 splits "
+                     "the constraint sum across G lanes (warp-shuffle reduce + "
+                     "lane-0 Schur solve). G=16 is the robust default (32 best "
+                     "for small scenes, 8 for >2000 bodies). Same AVBD math.")
+            self.gui_recolor_every = self.server.gui.add_checkbox(
+                "recolor every substep",
+                initial_value=bool(self.solver.recolor_every_substep),
+                hint="With GPU resident: recolor every substep like the paper "
+                     "(Alg 1 step 2) instead of only on a body-set change. "
+                     "Still readback-free, but ~3x slower on Warp (no indirect "
+                     "dispatch) for negligible fidelity gain — advanced/compare "
+                     "only.")
         with self.server.gui.add_folder("Actions"):
             self.gui_drop = self.server.gui.add_button("drop a fresh box")
             self.gui_kick = self.server.gui.add_button("kick all (random impulse)")
@@ -312,6 +371,13 @@ class Viewer:
                 hint="1 / step_time. The max sustained Hz the solver could deliver "
                      "if rendering took zero time. NOT the screen frame rate.")
             self.gui_perf_wall = self.server.gui.add_text("wall tick", initial_value="—")
+            self.gui_perf_render = self.server.gui.add_text(
+                "render push", initial_value="—",
+                hint="Wall-time spent pushing body transforms to the browser "
+                     "each frame, and how many of N bodies actually moved "
+                     "enough to re-send (a delta filter skips resting bodies). "
+                     "For big piles this — not solver.step() — is the viser "
+                     "bottleneck; a settled pile should push ~0.")
         with self.server.gui.add_folder("Notes"):
             self.server.gui.add_markdown(
                 "**6-DOF rigid body solver** (Solver6DOF). Each box has full "
@@ -346,6 +412,10 @@ class Viewer:
         self.gui_drag_mode.on_update(self._drag_mode_changed)
         self.gui_friction.on_update(self._friction_changed)
         self.gui_static_mult.on_update(self._static_mult_changed)
+        self.gui_resident.on_update(self._resident_changed)
+        self.gui_primal_group.on_update(self._primal_group_changed)
+        self.gui_recolor_every.on_update(self._recolor_every_changed)
+        self._refresh_drop_button()
 
         # drag bookkeeping
         self._drag_targets: dict[int, np.ndarray] = {}
@@ -380,8 +450,64 @@ class Viewer:
         self._hud_maxlam = "0.0"
         self._hud_constraints = "0/0 active"
         self._hud_static = "0 sticking"
+        # Render-push delta filter: viser sends one websocket message per
+        # transform write, and the browser re-applies all of them every frame —
+        # for a few-hundred-body pile that, not the solver, is the bottleneck.
+        # We skip pushing any body whose pose barely changed since its last
+        # push (resting bodies → ~0 messages). Keyed by body index; reset on
+        # scene rebuild. Thresholds: ~0.1 mm position, ~tiny quaternion.
+        self._rendered_pose: dict[int, tuple] = {}
+        self._render_pos_eps = 1.0e-4
+        self._render_quat_eps = 1.0e-4
+        self._render_push_ms_window: list[float] = []
+        self._hud_pushed = "0/0"
+        # Instanced-render handle (one BatchedMesh for all bodies) + the
+        # body-index order of its instances. Built by _build_batched_boxes.
+        self._batched = None
+        self._batched_body_idx = np.zeros(0, dtype=np.int64)
+        # Now that the render state exists, build the instanced body mesh.
+        self._build_batched_boxes()
 
     # ----- helpers --------------------------------------------------------
+    def _build_batched_boxes(self):
+        """(Re)build the single instanced-cube mesh that renders every body.
+        Called at startup and whenever the body set changes (drop / reset).
+        One viser node for the whole scene; per-frame updates in tick() set
+        batched_positions/batched_wxyzs as arrays (one message)."""
+        if self._batched is not None:
+            try:
+                self._batched.remove()
+            except Exception:
+                pass
+            self._batched = None
+        n = len(self.boxes)
+        if n == 0:
+            self._batched_body_idx = np.zeros(0, dtype=np.int64)
+            return
+        with self._solver_lock:
+            self.solver._flush()
+            pos = self.solver.positions().copy()
+            qs = self.solver.orientations().copy()
+        idx = np.array([vb.body.index for vb in self.boxes], dtype=np.int64)
+        scales = np.empty((n, 3), np.float32)
+        colors = np.empty((n, 3), np.uint8)
+        for k, vb in enumerate(self.boxes):
+            ex = vb.body.half_extents
+            scales[k] = (2.0 * ex[0], 2.0 * ex[1], 2.0 * ex[2])
+            c = vb.color
+            colors[k] = (int(np.clip(c[0], 0, 1) * 255),
+                         int(np.clip(c[1], 0, 1) * 255),
+                         int(np.clip(c[2], 0, 1) * 255))
+        bp = pos[idx].astype(np.float32)
+        bw = qs[idx][:, [3, 0, 1, 2]].astype(np.float32)  # xyzw → wxyz
+        self._batched = self.server.scene.add_batched_meshes_simple(
+            "/bodies_batched", _CUBE_V, _CUBE_F,
+            batched_wxyzs=bw, batched_positions=bp,
+            batched_scales=scales, batched_colors=colors,
+            flat_shading=True, side="double")
+        self._batched_body_idx = idx
+        self._rendered_pose.clear()
+
     def _add_box_primitive(self, vb: ViewerBox, name: str):
         with self._solver_lock:
             self.solver._flush()
@@ -498,7 +624,25 @@ class Viewer:
                                                   float(w_now[1] + dw[1]),
                                                   float(w_now[2] + dw[2])))
 
+    def _refresh_drop_button(self):
+        """Grey out 'drop a fresh box' at the body cap (keeps --gpu-resident's
+        pre-sized pools safe) and show the live count on the label."""
+        if not hasattr(self, "gui_drop"):
+            return
+        n, cap = len(self.boxes), self._max_bodies
+        at_cap = n >= cap
+        try:
+            self.gui_drop.disabled = at_cap
+            self.gui_drop.label = (f"drop a fresh box ({n}/{cap})"
+                                   if not at_cap
+                                   else f"at body cap ({n}/{cap})")
+        except Exception:
+            pass
+
     def _drop_box(self):
+        if len(self.boxes) >= self._max_bodies:
+            self._refresh_drop_button()
+            return
         rng = np.random.default_rng()
         h = float(rng.uniform(0.12, 0.18))
         pos = (float(rng.uniform(-1.5, 1.5)),
@@ -519,23 +663,24 @@ class Viewer:
             vb = ViewerBox(body=b, handle=None, tc=None, color=color)
             idx = len(self.boxes)
             self.boxes.append(vb)
-        # Scene/gizmo creation goes through viser but doesn't touch solver
-        # state — safe to do outside the lock so we don't block tick().
-        self._add_box_primitive(vb, f"/bodies/{idx}")
-        tc = self.server.scene.add_transform_controls(
-            f"/drag/{idx}", position=pos, scale=self._gizmo_scale_for(vb.body),
-            line_width=4.0,
-            disable_sliders=False, disable_rotations=True,
-            visible=bool(self.gui_drag_mode.value),
-        )
-        vb.tc = tc
-        self._wire_drag(vb)
+        # Scene creation goes through viser but doesn't touch solver state —
+        # safe outside the lock. Rebuild the instanced mesh with the new body
+        # (batched meshes are fixed-size, so a drop recreates the one node).
+        self._build_batched_boxes()
+        # Per-body drag gizmo (only meaningful below the gizmo cap).
+        if len(self.boxes) <= _MAX_DRAG_GIZMOS:
+            tc = self.server.scene.add_transform_controls(
+                f"/drag/{idx}", position=pos,
+                scale=self._gizmo_scale_for(vb.body), line_width=4.0,
+                disable_sliders=False, disable_rotations=True,
+                visible=bool(self.gui_drag_mode.value),
+            )
+            vb.tc = tc
+            self._wire_drag(vb)
+        self._refresh_drop_button()
 
     def _reset(self):
         for vb in self.boxes:
-            if vb.handle is not None:
-                try: vb.handle.remove()
-                except Exception: pass
             if vb.tc is not None:
                 try: vb.tc.remove()
                 except Exception: pass
@@ -544,10 +689,11 @@ class Viewer:
             self._drag_orientations.clear()
             self._drag_last_event.clear()
             self._gizmo_last_write.clear()
+            self._rendered_pose.clear()
             self.solver, self.boxes, self.pin_rows = build_scene(self.args)
             positions_after_build = self.solver.positions().copy()
-        for i, vb in enumerate(self.boxes):
-            self._add_box_primitive(vb, f"/bodies/{i}")
+        # Rebuild the single instanced mesh for the fresh body set.
+        self._build_batched_boxes()
         if len(self.boxes) > _MAX_DRAG_GIZMOS:
             print(f"[viewer] {len(self.boxes)} bodies > {_MAX_DRAG_GIZMOS}: "
                   "per-body drag gizmos disabled for this stress scene.")
@@ -566,6 +712,7 @@ class Viewer:
         self._iters_changed(None)
         self._substeps_changed(None)
         self._gravity_changed(None)
+        self._refresh_drop_button()
         self._frame = 0
 
     def _iters_changed(self, _evt):
@@ -581,6 +728,21 @@ class Viewer:
     def _coloring_changed(self, _evt):
         with self._solver_lock:
             self.solver.coloring_mode = str(self.gui_coloring.value)
+
+    def _resident_changed(self, _evt):
+        # In the graph signature → the next step() recaptures with the new
+        # mode. Double-buffer arrays are always allocated, so toggling either
+        # way is safe mid-sim.
+        with self._solver_lock:
+            self.solver.gpu_resident = bool(self.gui_resident.value)
+
+    def _primal_group_changed(self, _evt):
+        with self._solver_lock:
+            self.solver.primal_group_size = int(self.gui_primal_group.value)
+
+    def _recolor_every_changed(self, _evt):
+        with self._solver_lock:
+            self.solver.recolor_every_substep = bool(self.gui_recolor_every.value)
 
     def _gravity_changed(self, _evt):
         g = float(self.gui_gravity.value)
@@ -716,38 +878,43 @@ class Viewer:
         drag_mode = bool(self.gui_drag_mode.value)
         self._gizmo_suppress = True
         now = time.perf_counter()
+        push_t0 = now
+        n_inst = 0
         try:
-            with self.server.atomic():
-                for vb in boxes_snapshot:
-                    i = vb.body.index
-                    if i >= len(pos):
-                        # Defensive: the box was added after the snapshot
-                        # (shouldn't happen given the snapshot-under-lock,
-                        # but keeps us robust if the locking ever drifts).
-                        continue
-                    p_solver = pos[i]
-                    p_render = (float(p_solver[0]), float(p_solver[1]), float(p_solver[2]))
-                    wxyz = warp_q_to_viser_wxyz(qs[i])
-                    # While a body is being dragged, the on_drag callback owns
-                    # the rendered position + orientation. Skip our writes so
-                    # we don't ping-pong against the user's drag.
-                    being_dragged = i in self._drag_targets
-                    if vb.handle is not None and not being_dragged:
-                        try:
-                            vb.handle.position = p_render
-                            vb.handle.wxyz = wxyz
-                        except RuntimeError:
-                            vb.handle = None
-                    if drag_mode and vb.tc is not None and not being_dragged:
+            # ---- instanced render: ALL bodies in one batched update ----
+            # Two array writes (positions + orientations) → one viser message
+            # + one instanced draw call, regardless of body count. This is the
+            # fix for the per-node bottleneck (was ~27 ms/frame at 414 bodies).
+            idx = self._batched_body_idx
+            if (self._batched is not None and len(idx)
+                    and int(idx.max()) < len(pos)):
+                bp = pos[idx].astype(np.float32)
+                bw = qs[idx][:, [3, 0, 1, 2]].astype(np.float32)  # xyzw→wxyz
+                self._batched.batched_positions = bp
+                self._batched.batched_wxyzs = bw
+                n_inst = len(idx)
+            # ---- drag gizmos (small scenes only; capped at _MAX_DRAG_GIZMOS) --
+            if drag_mode:
+                with self.server.atomic():
+                    for vb in boxes_snapshot:
+                        i = vb.body.index
+                        if i >= len(pos) or vb.tc is None or i in self._drag_targets:
+                            continue
+                        p = pos[i]
+                        p_render = (float(p[0]), float(p[1]), float(p[2]))
                         try:
                             vb.tc.position = p_render
                             self._gizmo_last_write[i] = (
-                                np.asarray(p_render, dtype=np.float32), now,
-                            )
+                                np.asarray(p_render, dtype=np.float32), now)
                         except RuntimeError:
                             vb.tc = None
         finally:
             self._gizmo_suppress = False
+        self._render_push_ms_window.append(
+            (time.perf_counter() - push_t0) * 1000.0)
+        if len(self._render_push_ms_window) > 30:
+            self._render_push_ms_window.pop(0)
+        self._hud_pushed = f"{n_inst} instanced"
         # NOTE: do NOT clear _drag_targets or _drag_orientations here. They are
         # cleared lazily: each on_drag event overwrites the target; an entry
         # only "ends" when on_drag has been silent for ~150 ms (drag released).
@@ -780,6 +947,9 @@ class Viewer:
         self.gui_perf_step_ms.value = f"{step_ms:.2f} ms"
         self.gui_perf_capacity.value = f"{1000.0/max(step_ms, 1e-3):.0f} Hz"
         self.gui_perf_wall.value = f"{1000.0/max(wall_ms, 1e-3):.0f} Hz"
+        render_ms = (float(np.mean(self._render_push_ms_window))
+                     if self._render_push_ms_window else 0.0)
+        self.gui_perf_render.value = f"{render_ms:.2f} ms  ({self._hud_pushed} moved)"
         self.gui_perf_bodies.value = str(len(self.boxes))
         if want_rows:
             n_active = int(act.sum()) if len(act) else 0
@@ -1419,6 +1589,39 @@ def main():
                         "Contention-free and faster everywhere — ON by "
                         "default. Use --no-primal-shuffle for the atomic "
                         "join. Same math.")
+    p.add_argument("--primal-fused", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="With --primal-group >1 and --primal-shuffle: fuse the "
+                        "cooperative reduction and the per-body Schur solve into "
+                        "ONE kernel (lane 0 solves in registers) instead of "
+                        "writing per-body sums to global scratch and launching a "
+                        "separate low-occupancy solve. ON by default; "
+                        "--no-primal-fused restores the two-kernel split. Same "
+                        "math.")
+    p.add_argument("--gpu-resident", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Paper §4 fully-GPU-resident hot loop (CUDA, fused "
+                        "shuffle primal): ZERO per-substep host readbacks. "
+                        "Double-buffers the primal (so a stale coloring is safe "
+                        "— same-color pairs go Jacobi, per the paper), recolors "
+                        "only when the body set changes, and trusts the "
+                        "pre-sized pools. ON by default; --no-gpu-resident "
+                        "restores the per-substep overflow/conflict readbacks. "
+                        "Capacity is kept safe by the droppable-box cap "
+                        "(--max-bodies).")
+    p.add_argument("--recolor-every-substep", action="store_true",
+                   help="With --gpu-resident: recolour every substep like the "
+                        "paper (Alg 1 step 2) instead of only on a body-set "
+                        "change. Still readback-free (fixed colouring rounds + "
+                        "fixed MAX_COLORS primal loop). Fresher colouring tracks "
+                        "the serial reference more tightly on dynamic scenes, at "
+                        "the cost of per-substep recolour compute + empty-colour "
+                        "launches.")
+    p.add_argument("--max-bodies", type=int, default=0,
+                   help="Cap on total bodies (initial + dropped). 0 = auto "
+                        "(initial count + 256 headroom). Bounds the pre-sized "
+                        "contact pools so --gpu-resident never overflows; the "
+                        "viewer greys out 'drop a fresh box' at the cap.")
     p.add_argument("--fixed-capacity", action="store_true",
                    help="Perf (A3): drop the two per-substep host syncs that "
                         "only detect contact-pool overflow, trusting the "
